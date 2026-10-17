@@ -62,7 +62,7 @@ not, each found by running the checker over this repository:
   sequence and a tuple's element type is the union of its fields; and a
   decoded message, because the reader knows its shape and the format's
   `Value` would only say it might be a list. The head of
-  [mind/std/src/list.dr](https://github.com/Custards1/dream/blob/main/mind/std/src/list.dr) says the same.
+  [mind/std/src/list.dr](https://github.com/dream-mindv2/std/blob/main/src/list.dr) says the same.
 
 The check to run after any change here: every `.dr` in the repository must
 check clean -- `std --test`, `dreams --test`, `lucid`, `mind`, the examples,

@@ -7,7 +7,7 @@
 // systems and a set of architectures, each empty for "any" -- and the VM
 // refuses to start a program on a machine it was not built for, rather than
 // letting it fail at the first `dlopen` with an error about a file it never
-// mentioned. dream/docs/bytecode-format.md has the bits; docs/build.md the design.
+// mentioned. dream/docs/bytecode-format.md has the bits; mind/std/docs/build.md the design.
 //
 // A target is decided in one of two ways. It can be said (`--target`), which
 // wins outright, including `--target any` to say "I know what I carry". Or it

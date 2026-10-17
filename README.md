@@ -33,7 +33,7 @@ hands them to it.
 
 [docs/language-spec.md](docs/language-spec.md) is the language, start to
 finish, as this compiler implements it. To learn it rather than look things
-up, read [Learn Dream](https://github.com/Custards1/dream/tree/main/learn).
+up, read [Learn Dream](https://github.com/dream-mindv2/learn).
 [docs/notes/](docs/notes) is the compiler's design log: macro expansion,
 parallel compiles and the unit cache, static types, deforestation, results,
 and the quadratics that decided how large a program it can take.

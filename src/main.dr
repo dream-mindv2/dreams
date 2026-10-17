@@ -298,7 +298,7 @@ let copy_payload! out path n =
 // `--depfile PATH` says which files a build read, in the form `gcc -MD`
 // writes, so that a build tool can tell when the image is out of date without
 // knowing how imports are resolved. It is what makes a Dream program a step
-// with discovered inputs (docs/build.md, "Discovered inputs"): editing a module
+// with discovered inputs (mind/std/docs/build.md, "Discovered inputs"): editing a module
 // rebuilds the images that import it and no others.
 
 /// A path as a make rule needs it: a space or a `#` would end or comment the

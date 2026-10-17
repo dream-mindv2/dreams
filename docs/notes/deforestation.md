@@ -153,7 +153,7 @@ a seed that must stay unforced.
 Shortcut fusion (`foldr`/`build`, as Haskell does it) remains the general
 answer if this ever needs to fuse arbitrary producers with arbitrary consumers.
 It was not taken: it costs a rewrite-rule mechanism plus a rewrite of
-[mind/std/src/list.dr](https://github.com/Custards1/dream/blob/main/mind/std/src/list.dr) into a shape nobody reading it would
+[mind/std/src/list.dr](https://github.com/dream-mindv2/std/blob/main/src/list.dr) into a shape nobody reading it would
 recognise, and it is poor at exactly what this codebase does most -- left folds
 and `zip`.
 

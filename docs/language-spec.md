@@ -10,7 +10,7 @@ diagnostic, that is what it prints. Fragments write `..` for code left out.
 
 It is a reference rather than a tutorial. For a tour, read the programs in
 [`examples/`](https://github.com/Custards1/dream/blob/main/examples/README.md) in order. For the library, see
-[builtins.md](https://github.com/dream-mindv2/dream/blob/main/docs/builtins.md) and [`mind/std`](https://github.com/Custards1/dream/blob/main/mind/std/README.md). For how
+[builtins.md](https://github.com/dream-mindv2/dream/blob/main/docs/builtins.md) and [`mind/std`](https://github.com/dream-mindv2/std/blob/main/README.md). For how
 the machine works, see the [VM's README](https://github.com/dream-mindv2/dream/blob/main/README.md).
 
 ## Contents
