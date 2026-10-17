@@ -67,6 +67,17 @@ mapping Lowering {
     invented_from = 0
     filled = %{}
     sharing = ()
+    // Inlining (see "inlining"): where the slots of a body being written out
+    // start in the frame it is written into; that frame, as `[function, slots
+    // so far]`, or `()` where nothing may be written out; the frames that grew,
+    // function -> slots; and the resolutions of the body being written out,
+    // which another module's part would not have.
+    slot_base = 0
+    frame = ()
+    grown = %{}
+    inline_refs = %{}
+    inline_binds = %{}
+    inline_depth = 0
 }
 
 let lowering : scope.Resolution -> ir.Program -> :integer -> Lowering;
@@ -167,12 +178,19 @@ let rec any_impure ks p = match ks {
 };
 
 /// What `scope` recorded for the name at this span.
-let lookup span l = scope.resolution (res l) (ctx l) (source l) span;
+let lookup span l =
+    match (Lowering.inline_refs l).[scope.ref_key (ctx l) (source l) (ast.span_start span) else ()] {
+        () => scope.resolution (res l) (ctx l) (source l) span,
+        found => found,
+    };
 
-/// The slot a binder at this span was given.
-let slot_at span l =
-    expand macros.with_some binding (scope.binding (res l) (ctx l) (source l) span)
-        (list.nth 1 binding);
+/// The slot a binder at this span was given, in the frame being lowered: a
+/// body written out where it is called has its slots moved past the caller's.
+let slot_at span l = {
+    let held = (Lowering.inline_binds l).[scope.ref_key (ctx l) (source l) (ast.span_start span) else ()];
+    let binding = if held == () { scope.binding (res l) (ctx l) (source l) span } else { held };
+    match binding { () => (), b => list.nth 1 b + Lowering.slot_base l }
+};
 
 // --- constants ----------------------------------------------------------------
 
@@ -253,7 +271,10 @@ let lower_apply callee args span l = {
         // array of fields made only to be copied out of.
         [scope.Meaning.builtin("_record_of"), [[:atom, id, _], [:bool, variant, _], [:array, fields, _]]] =>
             lower_record id variant fields l,
-        _ => lower_call found callee args span l,
+        _ => match inline_target found args l {
+            () => lower_call found callee args span l,
+            inl => lower_inline inl args l,
+        },
     }
 };
 
@@ -331,6 +352,169 @@ let bool_and a b l = binary :and a b l;
 let eq_const v k l = binary :eq v k l;
 
 // --- names ----------------------------------------------------------------------
+
+// --- inlining ---------------------------------------------------------------------
+//
+// `scope` worked out which functions are small enough to be written out where
+// they are called (see "inlining" there); this writes them out. At a saturated
+// call of one, outside any fused loop, the callee's body is lowered in place
+// of the call: in the callee's module and file, with its own resolutions,
+// and with its frame's slots moved past the end of the caller's, which grows
+// by that much (`grown`, read when the function records are linked).
+//
+// Its parameters are what the call's frame would have held. One the body
+// reads at most once, and that is not strict, is its argument written where
+// it is read -- in the caller's module and frame -- which is the wrapper
+// rewrite's reasoning: the argument was a suspension evaluated at most once,
+// and still is. So is one whose argument is a name or a literal however often
+// it is read, since reading a name twice reads one value twice (`trivial`). Any other is bound to its slot, lazily as the frame held it,
+// or strictly where the parameter was `!`, as entering the callee forced it.
+// An argument with an effect in it is not moved at all: the call is left as
+// it is.
+
+/// The part of the lowering state that says where a body is being lowered.
+let context_of l = [ctx l, source l, Lowering.slot_base l, Lowering.inline_refs l, Lowering.inline_binds l,
+                    subst l, Lowering.inline_depth l];
+
+/// `l`, lowering where `c` says.
+let restore_context c l = {
+    let [cx, src, base, refs, binds, sub, depth] = c;
+    l |> set_ctx cx |> set_source src |> Lowering.set_slot_base base |> Lowering.set_inline_refs refs
+      |> Lowering.set_inline_binds binds |> set_subst sub |> Lowering.set_inline_depth depth
+};
+
+/// Start lowering function `fi`'s frame.
+let enter_frame fi l = Lowering.set_frame [fi, scope.func_slots (scope.func_at (res l) fi)] l;
+
+/// Finish a frame: record how far it grew, and go back to `outer`.
+let leave_frame outer l = match Lowering.frame l {
+    [fi, size] if size > scope.func_slots (scope.func_at (res l) fi) =>
+        (l |> Lowering.set_grown ((Lowering.grown l).[fi => size]) |> Lowering.set_frame outer),
+    _ => Lowering.set_frame outer l,
+};
+
+/// Whether an argument has an effect in it: a name of an effect anywhere.
+let effectful e = match e {
+    [:name, n, _] => builtins.is_impure_name n,
+    [:field, obj, m, _] => builtins.is_impure_name m || effectful obj,
+    items if type_of items == :list => list.any effectful items,
+    _ => false,
+};
+
+/// Whether an argument can be written at every read of its parameter: a name
+/// or a literal, which reading twice reads one value twice -- a slot holds
+/// one suspension however often it is read, so nothing is done twice. A
+/// binding for it would cost a slot and, to the JIT, a binding it cannot write
+/// where it is read.
+let trivial e = match e {
+    [:name, _, _] => true,
+    [:field, [:name, _, _], _, _] => true,
+    [:int, _, _] => true, [:float, _, _] => true, [:str, _, _] => true, [:char, _, _] => true,
+    [:bool, _, _] => true, [:atom, _, _] => true, [:unit, _] => true,
+    _ => false,
+};
+
+/// How deep inlined bodies may nest: a body written out may call another.
+let inline_depth_limit = 4;
+
+/// Whether writing `inl` out with `args` needs no slot of the caller's frame:
+/// its body binds nothing, and every argument can be written where its
+/// parameter is read.
+///
+/// The ones that would need slots are left as calls. Slots added to a frame
+/// are allocated by every call of the function, whichever way it goes, and a
+/// frame cannot reuse them between two places a body was written out,
+/// because a suspension made in one holds the frame and may read the slots
+/// long after -- so a function with a dozen written out in it paid for all
+/// their slots on each call. Measured on a compiled JSON grammar: a fifth more
+/// allocated, and slower, for no fewer reductions.
+let frameless inl args = {
+    let params = scope.Inlinable.params inl;
+    let reads k = list.count (fn kv -> match list.nth 1 kv {
+        scope.Meaning.local(slot, _) => slot == k,
+        _ => false,
+    }) (scope.Inlinable.refs inl);
+    scope.Inlinable.slots inl <= list.length params
+    && list.all (fn [k, [p, a]] -> not (ast.param_strict p) && (reads k <= 1 || trivial a))
+                (list.enumerate (list.zip params args))
+};
+
+/// The `Inlinable` a call writes out, or `()` for a call to make.
+let inline_target found args l = {
+    let g = match found {
+        scope.Meaning.global(_, _, gi) => gi,
+        scope.Meaning.member(scope.Ref.dream(_), _, gi) => gi,
+        _ => (),
+    };
+    match [g, Lowering.frame l] {
+        [(), _] => (),
+        [_, ()] => (),
+        [gi, _] => match (scope.inlinables (res l)).[gi else ()] {
+            () => (),
+            inl => if list.length args == list.length (scope.Inlinable.params inl)
+                      && Lowering.inline_depth l < inline_depth_limit
+                      && not (list.any effectful args)
+                      && frameless inl args { inl } else { () },
+        },
+    }
+};
+
+/// The call of `inl` with `args`, written out: see "inlining".
+let lower_inline inl args l = {
+    let params = scope.Inlinable.params inl;
+    let [fi, base] = Lowering.frame l;
+    let caller = context_of l;
+    let reads k = list.count (fn kv -> match list.nth 1 kv {
+        scope.Meaning.local(slot, _) => slot == k,
+        _ => false,
+    }) (scope.Inlinable.refs inl);
+    let grown = Lowering.set_frame [fi, base + scope.Inlinable.slots inl] l;
+    // The arguments, each substituted for its parameter or bound to its slot,
+    // all in the caller's context.
+    let placed = list.fold (fn acc kp -> {
+        let [low, sub, bound] = acc;
+        let [k, [p, a]] = kp;
+        if not (ast.param_strict p) && (reads k <= 1 || trivial a) {
+            [low, sub.[base + k => [:in_context, a, caller]], bound]
+        } else {
+            let value = lower_expr a low;
+            let b = bind_value (base + k) (list.nth 1 value) (list.head value);
+            let marked = if ast.param_strict p { set_flag (list.nth 1 b) ir.f_strict (list.head b) } else { list.head b };
+            [marked, sub, list.append bound [list.nth 1 b]]
+        }
+    }) [grown, subst l, []] (list.enumerate (list.zip params args));
+    let [arranged, sub, bound] = placed;
+    let inside = restore_context [scope.Inlinable.ctx inl, scope.Inlinable.source inl, base,
+                                  map.from_pairs (scope.Inlinable.refs inl), map.from_pairs (scope.Inlinable.binds inl),
+                                  sub, Lowering.inline_depth l + 1] arranged;
+    let body = lower_expr (scope.Inlinable.body inl) inside;
+    let back = restore_context caller (list.head body);
+    match bound {
+        [] => [back, list.nth 1 body],
+        bs => node_block (list.append bs [list.nth 1 body]) back,
+    }
+};
+
+/// The inlinables a part's names reach, and the ones their bodies reach, as
+/// `[global, inlinable]` sorted: what its lowering reads of the table, and so
+/// what its key holds -- an edit to a body written out in a part re-lowers it.
+let reached_inlinables all r = {
+    let named ms = list.flat_map (fn m -> match m {
+        scope.Meaning.global(_, _, gi) if gi != () => [gi],
+        scope.Meaning.member(_, _, gi) if gi != () => [gi],
+        _ => [],
+    }) ms;
+    let rec close seen todo = match todo {
+        [] => seen,
+        [gi, ..rest] => if map.has gi seen { close seen rest }
+                        else { match all.[gi else ()] {
+                            () => close seen rest,
+                            inl => close (seen.[gi => inl])
+                                         (list.append (named (list.map (fn kv -> list.nth 1 kv) (scope.Inlinable.refs inl))) rest),
+                        } },
+    };
+    list.sort_on list.head (map.pairs (close (%{}) (named (map.values (scope.refs r)))))
+};
 
 // --- wrappers ---------------------------------------------------------------------
 //
@@ -515,6 +699,13 @@ let emit_name span l = emit_resolution (lookup span l) l;
 let emit_local slot l =
     match (subst l).[slot else ()] {
         () => emit (ir.node :local slot ir.no_node ir.no_node) l,
+        // An inlined call's argument, written where its parameter was read --
+        // lowered where it was written, in the caller's module and frame.
+        [:in_context, e, caller] => {
+            let here = context_of l;
+            let got = lower_expr e (restore_context caller l);
+            [restore_context here (list.head got), list.nth 1 got]
+        },
         e  => {
             let got = lower_expr e (set_subst (map.remove slot (subst l)) l);
             [set_subst (subst l) (list.head got), list.nth 1 got]
@@ -529,7 +720,7 @@ let emit_resolution_or found span l = emit_resolution found l;
 /// because a wrapper's call site emits a resolution it did not read off a name.
 let emit_resolution found l =
     match found {
-        scope.Meaning.local(slot, _) => emit_local slot l,
+        scope.Meaning.local(slot, _) => emit_local (slot + Lowering.slot_base l) l,
         scope.Meaning.capture(idx, _) => emit (ir.node :capture idx ir.no_node ir.no_node) l,
         scope.Meaning.global(_, _, g) => emit (ir.node :global g ir.no_node ir.no_node) l,
         scope.Meaning.builtin(name) => builtin_ref name l,
@@ -804,10 +995,10 @@ let rec lower_expr e l =
                 scope.Meaning.compiled(fi, _) => {
                     // A function of its own, so none of a fused loop's
                     // substitution applies in it (see `lower_function`).
-                    let inner = lower_expr body (set_subst %{} l);
+                    let inner = lower_expr body (enter_frame fi (set_subst %{} l));
                     let done = set_subst (subst l)
                                    (set_func_body fi (list.nth 1 inner)
-                                                  (mark_tail (list.nth 1 inner) (list.head inner)));
+                                                  (mark_tail (list.nth 1 inner) (leave_frame (Lowering.frame l) (list.head inner))));
                     // The placeholder carries the function it waits on. A
                     // bare `unit` would be shared with every other `unit` by
                     // the optimizer, and a program lowered in parts is
@@ -918,10 +1109,10 @@ let rec lower_function span op ps body l =
             // slot. What the function needs of the loop it captured, and a
             // loop whose substituted slot is captured is never fused
             // (`scope.captures_substituted`).
-            let inner = lower_body ps body (set_subst %{} l);
+            let inner = lower_body ps body (enter_frame fi (set_subst %{} l));
             let done = set_subst (subst l)
                            (set_func_body fi (list.nth 1 inner)
-                                          (mark_tail (list.nth 1 inner) (list.head inner)));
+                                          (mark_tail (list.nth 1 inner) (leave_frame (Lowering.frame l) (list.head inner))));
             let made = emit (ir.node op fi ir.no_node ir.no_node) done;
             // Suspending an effect is not performing one, so a thunk is a pure
             // value -- unless what it suspends is effectful, in which case
@@ -1178,7 +1369,8 @@ let local_node slot l = emit (ir.node :local slot ir.no_node ir.no_node) l;
 /// is how a pipeline written inside another one's stage still works.
 let lower_fused p l = {
     let outer = subst l;
-    let built = set_subst outer (fused_body p (set_subst (subst_of p) l));
+    let built = set_subst outer (fused_body p (set_subst (subst_of p) (Lowering.set_frame () l)))
+                |> Lowering.set_frame (Lowering.frame l);
     let inits = fused_inits (fuse.Plan.source p) built;
     let seeded =
         match fuse.Plan.seed p {
@@ -2383,7 +2575,10 @@ let link_funcs_from r bodies l from = {
          list.cons
              %{ :name => list.nth 1 named, :body => bodies.[fi else ir.no_node],
                  :arity => scope.func_arity f, :flags => flags,
-                 :slots => scope.func_slots f,
+                 :slots => match (Lowering.grown l0).[fi else 0] {
+                     more if more > scope.func_slots f => more,
+                     _ => scope.func_slots f,
+                 },
                  :n_captures => list.length (scope.func_captures f),
                  :captures_off => list.nth 1 placed,
                  :line => line, :col => col, :source => list.nth 1 pathed + 1 }
@@ -2491,9 +2686,9 @@ let lower_from r low bodies =
         let d = list.nth 2 b;
         let fi = list.nth 3 b;
         let got = lower_body (scope.decl_params d) (scope.decl_body d)
-                             (set_ctx (list.nth 0 b) (set_source src acc));
+                             (enter_frame fi (set_ctx (list.nth 0 b) (set_source src acc)));
         settle_body (set_func_body fi (list.nth 1 got)
-                                  (mark_tail (list.nth 1 got) (list.head got)))
+                                  (mark_tail (list.nth 1 got) (leave_frame (Lowering.frame acc) (list.head got))))
     }) (set_res r low) bodies;
 
 let lower_program : scope.Resolution -> Lowering;
@@ -2808,6 +3003,7 @@ let lower_part r numbered = {
        :bodies => list.sort_on (fn pair -> list.head pair) (map.pairs bodies),
        :ints => ir.pool_list (ir.ints p), :floats => ir.pool_list (ir.floats p),
        :strs => ir.pool_list (ir.strs p), :atoms => ir.pool_list (ir.atoms p),
+       :grown => map.pairs (Lowering.grown low),
        :notes => list.reverse notes }
 };
 
@@ -2834,6 +3030,7 @@ let lowering_key cache r slice = match cache {
     _ => match scope.unit_key r {
         () => (),
         walk => unit.key ["lower", walk, unit.digest (reached_wrappers (scope.wrappers r) r),
+                          unit.digest (reached_inlinables (scope.inlinables r) r),
                           unit.digest (places_key r slice)],
     },
 };
@@ -2879,8 +3076,10 @@ let link_parallel! ld r cache = {
         walked => {
             let wrappers = vm.share! (scope.wrappers rs);
             let where = vm.share! (places rs);
+            let inlinables = vm.share! (scope.inlinables rs);
             list.map (fn pr -> [(pr
                 |> scope.Resolution.set_wrappers wrappers
+                |> scope.Resolution.set_inlinables inlinables
                 |> scope.Resolution.set_places where), scope.part_bodies pr]) walked
         },
     };
@@ -3243,7 +3442,12 @@ let link_head r offsets parts = {
         list.fold (fn m2 fb -> m2.[list.head fb + fo => ((k + 1) * opt.part_base + list.nth 1 fb)])
                   m ((pa.[k]).[:bodies])
     }) %{} (list.range 0 (list.length parts));
-    let base = set_res r (lowering r (list.head pooled) 0);
+    // The frames inlining grew, under the program's function indices.
+    let grown = list.fold (fn m k -> {
+        let fo = list.head (oa.[k]);
+        list.fold (fn m2 fs -> m2.[list.head fs + fo => list.nth 1 fs]) m ((pa.[k]).[:grown else []])
+    }) %{} (list.range 0 (list.length parts));
+    let base = (set_res r (lowering r (list.head pooled) 0)) |> Lowering.set_grown grown;
     let fs = link_funcs r bodies base;
     let gs = link_globals r (list.head fs);
     let is = link_imports r (list.head gs);

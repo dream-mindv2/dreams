@@ -128,6 +128,9 @@ mapping Resolution {
     global_recs = []
     module_recs = []
     wrappers = %{}
+    // Global index -> `Inlinable`, for the functions lowering writes out where
+    // they are called. See "inlining".
+    inlinables = %{}
     roles = %{}
     result_roles = %{}
     result_slots = %{}
@@ -1192,6 +1195,10 @@ let bodies_count r = list.length (bodies_rev r);
 /// Global index -> `Wrapper` for every wrapper. See "wrappers".
 let wrappers : Resolution -> %{:integer => Wrapper};
 let wrappers r = Resolution.wrappers r;
+/// Global index -> `Inlinable` for every function small enough to be
+/// lowered where it is called. See "inlining".
+let inlinables : Resolution -> %{:integer => Inlinable};
+let inlinables r = Resolution.inlinables r;
 let defs : Resolution -> [[:any]];
 let defs r     = Resolution.defs r;
 
@@ -2924,7 +2931,20 @@ let finish_walk declared r0 s_pre walked bs candidates = {
              _ => g,
          }) fresh;
 
-    (walked |> Resolution.set_wrappers (fold (fn acc kv ->
+    // Which globals are small enough to be written out where they are called.
+    let inlined = fold (fn acc bc -> {
+        let [b, candidate] = bc;
+        match candidate {
+            Candidate.inline(found) => match global_index (env_at declared (list.nth 0 b)) (decl_name (list.nth 2 b)) {
+                () => acc,
+                gi => if map.has gi aliased { acc } else { acc.[gi => found] },
+            },
+            _ => acc,
+        }
+    }) (inlinables r0) (list.zip bs candidates);
+
+    (walked |> Resolution.set_inlinables inlined
+            |> Resolution.set_wrappers (fold (fn acc kv ->
                  acc.[(list.head kv) => (list.nth 1 kv)])
                        (wrappers r0) (map.pairs aliased))
                            |> Resolution.set_global_recs (list.append (list.append (r_global_recs r0) filled) (fused walked)))
@@ -3339,10 +3359,12 @@ union Inline {
 /// `arity` is how many the wrapper takes, which a call must pass exactly.
 struct Wrapper { target, plan : [Arg], arity : :integer }
 
-/// What a body can say about being a wrapper by itself (`wrapper_candidate`).
+/// What a body can say about being a wrapper by itself (`wrapper_candidate`),
+/// or about being small enough to inline.
 union Candidate {
     wrapper(found)
     rename(target)
+    inline(found)
 }
 
 let literal_expr e =
@@ -3522,7 +3544,7 @@ let plain_wrapper_of r mi source d = {
 let wrapper_candidate r b = {
     let [mi, source, d, _] = b;
     match wrapper_of r mi source d {
-        () => if not (list.is_empty (decl_params d)) { () }
+        () => if not (list.is_empty (decl_params d)) { inline_candidate r b }
               else {
                   let target = match decl_body d {
                       [:name, _, span]     => resolution r mi source span,
@@ -3577,6 +3599,101 @@ let op_wrapper params kind operands =
             if params_all_used plan (list.length params) { Wrapper.make (Inline.op kind) plan (list.length params) }
             else { () },
     };
+
+// --- inlining -------------------------------------------------------------------
+//
+// A wrapper's call is rewritten into the call it makes; a function a little
+// bigger than that -- a test, a comparison, a `match` on its argument -- still
+// cost a call and a frame at every use, and code made of small functions is
+// most of what a standard library is: `std.parse` spends a third of a parse
+// in four of them. So resolution also records which functions are small
+// enough to be written out where they are called, and lowering does that
+// (`lower_inline` in `lower`).
+//
+// What makes one inlinable is what makes writing it out the same program:
+//
+// - It is pure and not recursive, so nothing it does depends on where it
+//   runs and writing it out terminates.
+// - Its body holds no function of its own -- no lambda, no thunk, no local
+//   function, no `comp`, no `try` -- because those carry frames and captures
+//   numbered for its own frame. Everything it binds is a slot of its frame,
+//   and lowering moves those slots into the caller's.
+// - Nothing in it was planned for a span of its own -- no fused pipeline, no
+//   staged binding, no `let?` chain -- since those plans are kept per part
+//   and a call site in another module's part could not see them.
+// - It is small: `inline_limit` nodes of syntax.
+//
+// And because a body in one module may be written out in another module's
+// part, which knows only its own spans, an `Inlinable` carries what the
+// names in its body mean and where its binders put their values with it.
+
+/// A function lowering may write out where it is called: its parameters and
+/// body as written, the module and file they were resolved in, how many slots
+/// its frame has, and the resolutions of its names and binders, as
+/// `[key, value]` pairs of `refs` and `binds`.
+struct Inlinable {
+    params
+    body
+    ctx : :integer
+    source : :integer
+    slots : :integer
+    refs
+    binds
+}
+
+/// How many nodes of syntax an inlinable body may have.
+let inline_limit : :integer;
+let inline_limit = 48;
+
+/// Whether an expression is made only of what inlining can write out.
+let inline_shape : :any -> :bool;
+let rec inline_shape e = match e {
+    [:lambda, .._] => false,
+    [:thunk, .._] => false,
+    [:comp, .._] => false,
+    [:try, .._] => false,
+    [:expand, .._] => false,
+    [:let, _, params, _, _, _] if not (list.is_empty params) => false,
+    [:let, _, _, _, true, _] => false,
+    items if type_of items == :list => list.all inline_shape items,
+    _ => true,
+};
+
+/// How many nodes a piece of syntax has.
+let syntax_size : :any -> :integer;
+let rec syntax_size t = if type_of t == :list { list.fold (fn n x -> n + syntax_size x) 1 t } else { 0 };
+
+/// Every span start in a piece of syntax, and every span end: what its names
+/// and binders are filed under.
+let span_points : :any -> [[:integer, :integer]];
+let rec span_points t = match t {
+    [a, b] if type_of a == :integer && type_of b == :integer => [[a, b]],
+    items if type_of items == :list => list.flat_map span_points items,
+    _ => [],
+};
+
+/// What a body can be inlined as, or `()`.
+let inline_candidate : Resolution -> [:any] -> Candidate | :unit;
+let inline_candidate r b = {
+    let [mi, source, d, fi] = b;
+    let f = func_at r fi;
+    let body = decl_body d;
+    let patterned = list.any (fn p -> list.length p > 2 && list.nth 2 p != ()) (decl_params d);
+    if Function.recursive f || func_impure f || decl_rec d || patterned { () }
+    else if syntax_size body > inline_limit || not (inline_shape body) { () }
+    else {
+        let points = list.flat_map span_points [decl_params d, body];
+        let starts = list.unique (list.map (fn p -> ref_key mi source (list.head p)) points);
+        let ends = list.unique (list.map (fn p -> ref_key mi source (list.nth 1 p)) points);
+        let planned = list.any (fn k -> map.has k (fusions r) || map.has k (staged_table r)) starts
+                      || list.any (fn k -> map.has k (Resolution.result_slots r)) ends;
+        if planned { () }
+        else {
+            let held tbl = list.flat_map (fn k -> match tbl.[k else ()] { () => [], v => [[k, v]] }) starts;
+            Candidate.inline (Inlinable.make (decl_params d) body mi source (func_slots f) (held (refs r)) (held (binds r)))
+        }
+    }
+};
 
 // --- deforestation ------------------------------------------------------------
 //
