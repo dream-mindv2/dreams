@@ -25,6 +25,7 @@
 
 import std.progress;
 import std.list;
+import std.str;
 import std.path;
 
 import dreams.diag;
@@ -76,6 +77,9 @@ mapping Options {
     // The command line turns it on for a build and off for `--test`; a check
     // and an editor never prune, since what they are for is every diagnostic.
     prune = false
+    // `[from, to]` per `--remap-path-prefix FROM=TO`: how the source paths the
+    // image records are rewritten (`remap_sources`).
+    remap = []
 }
 
 /// The defaults: checked, shared, no payload.
@@ -85,7 +89,7 @@ let options = Options.new ();
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
 let scratch : Options;
-let scratch = Options.make false false [] false [] () false;
+let scratch = Options.make false false [] false [] () false [];
 
 // --- a build --------------------------------------------------------------------
 
@@ -504,7 +508,52 @@ let image b = {
         |> ir.Image.set_float_params (hints typecheck.Analysis.float_params)
         |> ir.Image.set_integer_params (hints typecheck.Analysis.integer_params)
         |> ir.Image.set_vm_options (vm_options (Build.loader b))
+        |> remap_sources (Options.remap o)
 };
+
+// --- reproducible paths -----------------------------------------------------------
+//
+// An image records the path of every source file -- each function's, each
+// module's, and the root's -- for the traces an error prints. They are the
+// paths the files were read from, so the same source built in two directories,
+// or on two machines whose standard library is in two places, makes two
+// different images. `--remap-path-prefix FROM=TO` (rustc's and GCC's flag)
+// rewrites them, which is what a build that must be reproduced elsewhere
+// passes: `mind attest` maps each package's root to its name.
+//
+// It is done here, on the finished image, rather than where the paths are
+// interned, because lowering is kept between builds (unit.dr) and a cached
+// lowering would carry whichever paths it was made with. And it rewrites
+// only the strings those records point at, in place, so the table keeps its
+// order and no absolute path is left behind in it. A string constant that is
+// exactly some source file's own path shares that entry and is rewritten
+// with it; that is the one thing the flag changes beyond the traces.
+
+/// The image with its source paths rewritten: the first `[from, to]` whose
+/// `from` begins a path replaces that beginning with `to`.
+let remap_sources : [[:string]] -> ir.Image -> ir.Image;
+let remap_sources pairs img =
+    match pairs {
+        [] => img,
+        _ => {
+            let rewrite s =
+                match list.filter (fn pair -> str.starts_with (list.head pair) s) pairs {
+                    [[from, to], .._] => to + str.slice (str.byte_length from) (str.byte_length s - str.byte_length from) s,
+                    _ => s,
+                };
+            // A function's `source` is an index plus one, zero for none; a
+            // module's and the root's are the index itself.
+            let used = list.concat [
+                list.flat_map (fn f -> match f.[:source else 0] { 0 => [], i => [i - 1] }) (ir.Image.funcs img),
+                list.map (fn m -> m.[:source else 0]) (ir.Image.modules img),
+                [ir.Image.source_name img],
+            ];
+            let marked = list.fold (fn m i -> m.[i => true]) (%{}) used;
+            ir.Image.set_strs (list.map (fn [i, s] -> if marked.[i else false] { rewrite s } else { s })
+                                        (list.enumerate (ir.Image.strs img)))
+                              img
+        },
+    };
 
 /// The root package's `[vm]` settings, as the image's `VMOP` records. The root
 /// package is the one the program's file is in, and only its settings count:

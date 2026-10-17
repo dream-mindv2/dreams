@@ -142,6 +142,7 @@ Where to look, and what to compile it as:
 | `--release`, `--debug-cfg` | define `release` or `debug` |
 | `--payload [NAME=]FILE` | carry a file's bytes in the image (`std.payload`) |
 | `--units DIR` | keep each module's parts between builds |
+| `--remap-path-prefix FROM=TO` | record source paths beginning with FROM as beginning with TO, so the image does not depend on where it was built (`compile.remap_sources`); `mind attest` passes one per package |
 | `--shebang [LINE]` | prefix the image with `#!` and make it executable |
 | `--depfile PATH` | write the files the build read as a make rule |
 | `--no-opt` | skip sharing; the image is the arena as lowered |

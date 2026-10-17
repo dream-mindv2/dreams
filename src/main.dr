@@ -168,7 +168,15 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
-    compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true);
+    compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true)
+                         (list.map remap_spec (o.[:remaps else []]));
+
+/// `FROM=TO` as `[from, to]`. The split is at the last `=`, since a path may
+/// hold one and a package name never does.
+let remap_spec text = match str.split_last "=" text {
+    () => [text, ""],
+    [from, to] => [from, to],
+};
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
@@ -200,7 +208,7 @@ let show_packages! ps = {
 
 /// The execution trees the program lowers to.
 let show_ir! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false);
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false []);
     let low = lower.lower_program r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
@@ -436,7 +444,7 @@ let build! l out shebang depfile specs said o = {
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false);
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false []);
     let lowered = lower.image (lower.lower_program r);
     let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
@@ -889,6 +897,8 @@ let rec parse_args args o =
         // this, which is the point: when an image misbehaves it answers
         // whether the pass that rewrote it is why.
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
+        ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,
+        ["--remap-path-prefix", spec, ..rest] => parse_args rest (append_opt :remaps spec o),
         ["--units"] => with_opt :error "--units needs a directory" o,
         ["--units", dir, ..rest] => parse_args rest (with_opt :units dir o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
@@ -952,6 +962,10 @@ let usage! () = {
         "                           each module exports",
         "  --release                define `release`",
         "  --no-opt                 emit the arena as lowered, unshared",
+        "  --remap-path-prefix FROM=TO",
+        "                           record source paths that begin with FROM as",
+        "                           beginning with TO, so the image does not depend on",
+        "                           where it was built; may be given more than once",
         "  --units DIR              keep each module's walk and lowering in DIR, and",
         "                           read them back while nothing they depend on moved",
         "  --debug-cfg              define `debug`",
@@ -1030,7 +1044,9 @@ let run! args = {
             match opt o :command {
                 :help => usage! (),
                 :version => {
-                    console.print! ("dreams " + version)
+                    // The digest names this compiler exactly, as its version
+                    // number cannot: it is what a reproduced build must match.
+                    console.print! ("dreams " + version + " (image sha256:" + vm.image_digest () + ")")
                     0
                 },
                 :repl => repl.start! (list.append (opt o :roots) (opt o :includes))
