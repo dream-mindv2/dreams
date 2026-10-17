@@ -3,6 +3,7 @@
 [package]
 name = "dreams"
 version = "0.1.0"
+repository = "https://github.com/dream-mindv2/dreams"
 description = "The Dream compiler: .dr source to .dream bytecode"
 
 [vm]
