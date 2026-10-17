@@ -1,0 +1,2 @@
+# Signed statements about this package, one per line. Written by `mind sign`, `rotate` and `revoke`.
+release ed25519:2de62faf1dbbe86af705d3e9123a0b3cc5fe7488ba4b9e7a7c43aa6e049f479e v0.1.0 sha256:9c2e301855e651ed579d575080bf893d76b54116cca519d73b0860650bda4e60 0a95391289985df417a4319475033ca6eeef441d52fdca4cdd7e63c03912c3bea368d3a0dd8c1f5484caa80459b9811d088952a483c3a2df76ef90f6509e630e
