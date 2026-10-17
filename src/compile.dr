@@ -530,7 +530,9 @@ let image b = {
 // with it; that is the one thing the flag changes beyond the traces.
 
 /// The image with its source paths rewritten: the first `[from, to]` whose
-/// `from` begins a path replaces that beginning with `to`.
+/// `from` begins a path replaces that beginning with `to`, and what is left
+/// is written with `/` -- so a Windows build, whose paths are `src\\main.dr`,
+/// records the same names as any other.
 let remap_sources : [[:string]] -> ir.Image -> ir.Image;
 let remap_sources pairs img =
     match pairs {
@@ -538,7 +540,8 @@ let remap_sources pairs img =
         _ => {
             let rewrite s =
                 match list.filter (fn pair -> str.starts_with (list.head pair) s) pairs {
-                    [[from, to], .._] => to + str.slice (str.byte_length from) (str.byte_length s - str.byte_length from) s,
+                    [[from, to], .._] => to + str.replace "\\" "/" (str.slice (str.byte_length from)
+                                                                              (str.byte_length s - str.byte_length from) s),
                     _ => s,
                 };
             // A function's `source` is an index plus one, zero for none; a
@@ -575,6 +578,16 @@ when test {
     import std.test;
 
     let tests = [
+        test.case "remapped source paths are relative and written with /, and nothing else changes"
+            $( {
+                   let img = ir.Image.new ()
+                       |> ir.Image.set_strs ["C:\\work\\app\\src\\main.dr", "C:\\work\\app\\x", "/home/u/std/src/list.dr"]
+                       |> ir.Image.set_funcs [%{ :source => 1 }, %{ :source => 0 }]
+                       |> ir.Image.set_modules [%{ :source => 2 }]
+                       |> ir.Image.set_source_name 0;
+                   test.eq! ["app/src/main.dr", "C:\\work\\app\\x", "std/src/list.dr"]
+                            (ir.Image.strs (remap_sources [["C:\\work\\app\\", "app/"], ["/home/u/", ""]] img))
+               } ),
         test.case "the defaults check and share"
             $( test.eq! [true, true, []]
                         [Options.types options, Options.optimize options, Options.payloads options] ),
