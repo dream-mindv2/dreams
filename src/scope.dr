@@ -2534,19 +2534,21 @@ let declare! l =
 let lend_shorthands s = {
     let supported = ["std.prelude.Result", "std.prelude.Option", "std.list", "std.array", "std.map"];
     let sources = filter (fn [_, e] -> list.contains (env_name e) supported) (map.pairs (envs s));
+    // What each library lends, `[target, prelude, its ref, [[target, name, global]]]`,
+    // worked out once: it is the library's alone. Asked inside the walk over
+    // the modules below, it sorted every library's names again for each of a
+    // program's modules -- a fifth of declaring a self-compile.
+    let offered = map (fn [target, te] -> {
+        let prelude = str.starts_with "std.prelude." (env_name te);
+        let lends n = (prelude || list.contains (global_kind te n) [:pure, :impure]) && n != "Result" && n != "Option";
+        [target, prelude, Ref.dream target, map (fn n -> [target, n, global_index te n]) (filter lends (exports te))]
+    }) sources;
     let es = fold (fn table [mi, e] -> {
-        let visible target = list.any (fn [_, ref] -> ref == Ref.dream target) (map.pairs (aliases e));
-        let candidates = fold (fn names [target, te] -> {
-            let prelude = str.starts_with "std.prelude." (env_name te);
-            if not prelude && not (visible target) && mi != target { names }
-            else {
-                fold (fn acc n -> {
-                    if not (list.contains (global_kind te n) [:pure, :impure]) && not prelude { acc }
-                    else if n == "Result" || n == "Option" { acc }
-                    else { acc.[n => list.append (acc.[n else []]) [[target, n, global_index te n]]] }
-                }) names (exports te)
-            }
-        }) %{} sources;
+        let refs = map.values (aliases e);
+        let candidates = fold (fn names [target, prelude, ref, members] -> {
+            if not prelude && not (list.contains ref refs) && mi != target { names }
+            else { fold (fn acc m -> acc.[(list.nth 1 m) => list.append (acc.[(list.nth 1 m) else []]) [m]]) names members }
+        }) %{} offered;
         let lent = fold (fn acc [n, choices] -> {
             if has_global acc n || only_of acc n != () || builtins.is_builtin n { acc }
             else { match choices {
@@ -2972,8 +2974,15 @@ let resolve! l = resolve_chosen! l %{} ();
 /// the bodies `keep` names, the rest answered by a stub (`pruned`), or every
 /// body for `keep` `()`.
 let resolve_chosen! : modules.Loader -> :map -> (%{:integer => :bool} | :unit) -> Resolution;
-let resolve_chosen! l selections keep = {
-    let [declared, stubbed] = pruned (declare! l) keep;
+let resolve_chosen! l selections keep = resolve_declared! l (declare! l) selections keep;
+
+/// `resolve_chosen!` with the program already declared. Declaring is a
+/// function of the loader alone, and a build walks twice -- before the members
+/// are chosen and after -- so it declares once and hands both walks the
+/// same state: declaring again was a serial 300 ms of a self-compile.
+let resolve_declared! : modules.Loader -> State -> :map -> (%{:integer => :bool} | :unit) -> Resolution;
+let resolve_declared! l d selections keep = {
+    let [declared, stubbed] = pruned d keep;
     let r0 = ((resolver (envs declared))
         |> Resolution.set_imports (s_imports declared)
         |> Resolution.set_module_recs (s_module_recs declared)
@@ -3044,6 +3053,14 @@ let invented_from r = Resolution.invented_from r;
 /// body's place in the whole program's queue.
 let part_bodies : Resolution -> [[:any]];
 let part_bodies r = Resolution.part_bodies r;
+
+/// What walking some bodies costs, near enough: the source they span. The
+/// same measure `lower.balanced` deals parts by.
+let slice_weight : [[:any]] -> :integer;
+let slice_weight slice = list.fold (fn n nb -> n + match decl_span (list.nth 2 (list.nth 1 nb)) {
+    [a, b, .._] if b > a => b - a,
+    _ => 1,
+}) 0 slice;
 
 /// Walk some bodies -- `[position, pending entry]` each -- from the shared
 /// starting state `walk_base` made: the part `merge_parts` combines.
@@ -3131,6 +3148,10 @@ let merge_parts declared r0 base walked = {
 let resolve_parts! : modules.Loader -> :any -> Resolution;
 let resolve_parts! l cache = resolve_parts_chosen! l cache %{} () ();
 
+/// `resolve_parts!` with the program already declared (`resolve_declared!`).
+let resolve_parts_declared! : modules.Loader -> State -> :any -> Resolution;
+let resolve_parts_declared! l d cache = resolve_parts_from! l d cache %{} () ();
+
 /// The same with the members each shorthand call was found to mean, given the
 /// walk made before they were known (`compile.resolve!`). A module where no
 /// call chose anything walks to exactly the part it walked then -- its walk
@@ -3139,8 +3160,13 @@ let resolve_parts! l cache = resolve_parts_chosen! l cache %{} () ();
 /// than walked again, and only the modules that chose are. `previous` is
 /// `()` for no earlier walk. `keep` is `resolve_chosen!`'s.
 let resolve_parts_chosen! : modules.Loader -> :any -> :map -> ([Resolution] | :unit) -> (%{:integer => :bool} | :unit) -> Resolution;
-let resolve_parts_chosen! l cache selections previous keep = {
-    let [declared, stubbed] = pruned (declare! l) keep;
+let resolve_parts_chosen! l cache selections previous keep =
+    resolve_parts_from! l (declare! l) cache selections previous keep;
+
+/// `resolve_parts_chosen!` with the program already declared.
+let resolve_parts_from! : modules.Loader -> State -> :any -> :map -> ([Resolution] | :unit) -> (%{:integer => :bool} | :unit) -> Resolution;
+let resolve_parts_from! l d cache selections previous keep = {
+    let [declared, stubbed] = pruned d keep;
     let r0 = ((resolver (envs declared))
         |> Resolution.set_imports (s_imports declared)
         |> Resolution.set_module_recs (s_module_recs declared)
@@ -3185,8 +3211,10 @@ let resolve_parts_chosen! l cache selections previous keep = {
     };
     let walking = list.concat (map (fn [slice, p] -> match p { Option.none => [slice], Option.some(_) => [] })
                                    (list.zip slices kept));
-    let running = strict! (map (fn slice -> walk_elsewhere! cache shared_l base (key_of slice) slice) walking);
-    let fresh = progress.join_all! "resolving" running;
+    // Heaviest first: started in the modules' order, the largest module's walk
+    // waited behind lighter ones, and it is the phase's critical path.
+    let fresh = progress.join_heaviest_first! "resolving" slice_weight
+                    (fn slice -> walk_elsewhere! cache shared_l base (key_of slice) slice) walking;
     stubbed_to (merge_parts declared seeded declared_base (in_order kept fresh)) stubbed
 };
 

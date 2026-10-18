@@ -130,17 +130,19 @@ mapping Build {
 /// member (`select!`), and the walk again with the choices (`rechoose!`).
 let resolve! : modules.Loader -> Options -> scope.Resolution;
 let resolve! l o = {
-    let initial = resolve_names! l o;
+    let d = scope.declare! l;
+    let initial = resolve_names! l d o;
     let keep = kept l o initial;
     let selected = select! l o initial keep;
-    rechoose! l o initial selected keep
+    rechoose! l d o initial selected keep
 };
 
 /// The first walk: every name resolved, a shorthand call to every member it
-/// may mean.
-let resolve_names! : modules.Loader -> Options -> scope.Resolution;
-let resolve_names! l o =
-    if parted o { scope.resolve_parts! l (Options.units o) } else { scope.resolve! l };
+/// may mean. `d` is the program declared (`scope.declare!`), which both walks
+/// start from.
+let resolve_names! : modules.Loader -> scope.State -> Options -> scope.Resolution;
+let resolve_names! l d o =
+    if parted o { scope.resolve_parts_declared! l d (Options.units o) } else { scope.resolve_declared! l d %{} () };
 
 /// Which member each shorthand call means, found from the types.
 ///
@@ -173,17 +175,17 @@ let select! l o initial keep =
 /// The walk again with the choices known and only the bodies `keep` names, or
 /// the selection as it is when there was nothing to choose and nothing to
 /// leave out, or choosing failed.
-let rechoose! : modules.Loader -> Options -> scope.Resolution -> scope.Resolution -> (%{:integer => :bool} | :unit) -> scope.Resolution;
-let rechoose! l o initial selected keep =
+let rechoose! : modules.Loader -> scope.State -> Options -> scope.Resolution -> scope.Resolution -> (%{:integer => :bool} | :unit) -> scope.Resolution;
+let rechoose! l d o initial selected keep =
     if diag.error_count (scope.r_diags selected) > 0 { selected }
     else if not (typecheck.has_overloads initial) && keep == () { selected }
     else if parted o {
         // A part walked before is kept only when nothing is left out: with a
         // body gone, every position after it has moved.
         let previous = if keep == () { scope.parts initial } else { () };
-        scope.resolve_parts_chosen! l (Options.units o) (scope.Resolution.selections selected) previous keep
+        scope.resolve_parts_from! l d (Options.units o) (scope.Resolution.selections selected) previous keep
     }
-    else { scope.resolve_chosen! l (scope.Resolution.selections selected) keep };
+    else { scope.resolve_declared! l d (scope.Resolution.selections selected) keep };
 
 // --- compiling what is reached ----------------------------------------------------
 //
@@ -374,9 +376,13 @@ let checked_in_parts! how cache ks r keep = {
         }) walked,
     };
     strict! work
-    let running = strict! (list.map (fn w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache })
-                                                              (list.nth 2 w) (list.head w) (list.nth 1 w)) work);
-    let said = list.concat (progress.join_all! (match how { :first => "checking", :select => "choosing", _ => "inferring" }) running);
+    // Heaviest first, as lowering's parts are (`lower.balanced`). Not cut up:
+    // a part checked whole is kept under the key the check after lowering
+    // reads back, and a piece of one would be a stranger to it.
+    let said = list.concat (progress.join_heaviest_first! (match how { :first => "checking", :select => "choosing", _ => "inferring" })
+        (fn w -> lower.slice_weight (list.nth 1 w))
+        (fn w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache }) (list.nth 2 w) (list.head w) (list.nth 1 w))
+        work);
     map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said)
 };
 

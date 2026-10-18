@@ -2829,12 +2829,25 @@ let part_elsewhere! !cache r slice = spawn! $( vm.share! (lower_unit! cache (low
 /// The line starts of the part's own files are in it as well, because a failed
 /// `match` reports its line (see "a failed match").
 let lowering_key : unit.Cache -> scope.Resolution -> [:any] -> :string | :unit;
+///
+/// A piece of a part (`balanced`) names its bodies as well, counted from the
+/// part's first: its walk and its files are the whole part's, so without them
+/// every piece of a module had one key, and the second read back the first's
+/// lowering -- an image whose functions had no bodies. A part lowered whole
+/// keeps the key it always had.
 let lowering_key cache r slice = match cache {
     () => (),
     _ => match scope.unit_key r {
         () => (),
-        walk => unit.key ["lower", walk, unit.digest (reached_wrappers (scope.wrappers r) r),
-                          unit.digest (places_key r slice)],
+        walk => {
+            let whole = scope.part_bodies r;
+            let base = [walk, unit.digest (reached_wrappers (scope.wrappers r) r), unit.digest (places_key r slice)];
+            if list.length slice == list.length whole { unit.key (list.cons "lower" base) }
+            else {
+                let from = match whole { [[p, .._], .._] => p, _ => 0 };
+                unit.key (list.cons "lower" (base + [unit.digest (map (fn nb -> list.head nb - from) slice)]))
+            }
+        },
     },
 };
 
@@ -2860,6 +2873,44 @@ let lower_unit! cache k r slice = match [cache, slice] {
     },
 };
 
+/// The parts a phase is dealt, `[resolution, bodies]` each, as `[resolution,
+/// bodies, weight]`, a part heavier than a `balance_pieces`th of the program
+/// cut into neighbouring runs of bodies that are not.
+///
+/// A part is a module, and modules differ: lowering a self-compile was 141
+/// parts averaging 30 ms and one of 870, so the phase took 870 ms on 24
+/// cores that could have done it in 170 (`dream/tools/timeline.py`, "The
+/// compiler as the program" in the supercompiler's notes). The pieces of a
+/// module are lowered against the module's walk, so they number their
+/// functions from the same offsets and differ only in which bodies they
+/// hold; linking takes each piece's arena and pools as it takes a part's. The
+/// cut depends on the program alone, never on the machine, so the image is
+/// the same wherever it is built. A body weighs the source it spans, which
+/// tracks what it costs to walk, lower and check well enough to deal by.
+let balanced : [[:any]] -> [[:any]];
+let balanced work = {
+    let weighed = list.map (fn w -> [list.head w, list.nth 1 w, slice_weight (list.nth 1 w)]) work;
+    let limit = list.fold (fn n w -> n + list.nth 2 w) 0 weighed / balance_pieces + 1;
+    list.concat (list.map (fn w -> {
+        let [r, slice, weight] = w;
+        if weight <= limit { [w] }
+        else { list.map (fn run -> [r, run, slice_weight run]) (list.chunks_weighed limit body_weight slice) }
+    }) weighed)
+};
+
+/// How many pieces of equal weight a program is dealt as, at most: twice the
+/// cores of the machines it is built on, near enough, without asking which.
+let balance_pieces : :integer;
+let balance_pieces = 48;
+
+/// A body's weight, `[position, pending entry]`: the length of the source its
+/// declaration spans (`scope.slice_weight`).
+let body_weight : [:any] -> :integer;
+let body_weight nb = scope.slice_weight [nb];
+
+let slice_weight : [[:any]] -> :integer;
+let slice_weight = scope.slice_weight;
+
 /// Lower the whole program in parts and link it: what `link!` does, in
 /// `part_count` processes. Each part comes back shared within itself.
 let link_parallel! : modules.Loader -> scope.Resolution -> :any -> Lowering;
@@ -2869,7 +2920,7 @@ let link_parallel! ld r cache = {
     // the part that walked it -- which is the only one that knows what its
     // names mean (`scope.parts`) -- with the wrappers of the whole program.
     // One resolved whole is dealt out here instead.
-    let work = match scope.parts rs {
+    let dealt = match scope.parts rs {
         () => {
             let all = scope.bodies rs;
             let numbered = list.zip (list.range 0 (list.length all)) all;
@@ -2886,9 +2937,10 @@ let link_parallel! ld r cache = {
     };
     // Dealt before any process starts: a slice left lazy would cross into its
     // child as a suspension holding every body, and be dealt there.
+    let work = balanced dealt;
     strict! work
-    let running = strict! (list.map (fn w -> part_elsewhere! cache (list.head w) (list.nth 1 w)) work);
-    let parts = progress.join_all! "lowering" running;
+    let parts = progress.join_heaviest_first! "lowering" (fn w -> list.nth 2 w)
+                    (fn w -> part_elsewhere! cache (list.head w) (list.nth 1 w)) work;
     let offsets = list.map (fn w -> scope.part_offsets (list.head w)) work;
     let head = link_head rs offsets parts;
     // Sharing across the parts starts now, in a process of its own, and runs

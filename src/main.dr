@@ -577,10 +577,11 @@ let show_time! o file = {
     let parted = compile.Options.optimize co;
     // Resolution is three steps when anything chose a member by its types,
     // and the `resolve` row is their sum; `resolve_rows!` below breaks it up.
-    let named = timed! (compile.resolve_names! l co);
+    let declared = scope.declare! l;
+    let named = timed! (compile.resolve_names! l declared co);
     let kept = timed! (compile.kept l co (value_of named));
     let selected = timed! (compile.select! l co (value_of named) (value_of kept));
-    let rechosen = timed! (compile.rechoose! l co (value_of named) (value_of selected) (value_of kept));
+    let rechosen = timed! (compile.rechoose! l declared co (value_of named) (value_of selected) (value_of kept));
     let resolved = [value_of rechosen, own_of named + own_of selected + own_of kept + own_of rechosen, 0];
     let r = value_of resolved;
     // Lowered in parts, a lowering holds a lazy `:image` as well: the parts

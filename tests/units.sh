@@ -7,6 +7,10 @@
 # changed. A key that missed any of them would read back a stale part, and the
 # two images would differ.
 set -u
+# What is tested is the unit cache, so not the cache of whole builds above it:
+# under `just`, `DREAMS_CACHE` names one, and a build it answers reads no unit
+# at all -- which a case below took for units not being refreshed.
+export DREAMS_CACHE=
 
 dream=${dream:-build-dream/bin/dream}
 image=${image:-build/dreams.dream}
