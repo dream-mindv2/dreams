@@ -63,6 +63,21 @@ done
 # takes, but that count moves with when the JIT gets to it.
 reductions() { "$dream" --no-jit --stats "$1" 2>&1 >/dev/null | sed -n 's/^; \([0-9]*\) reductions.*/\1/p'; }
 millis() { local s; s=$(date +%s%N); "$dream" "$1" >/dev/null 2>&1; echo $(( ($(date +%s%N) - s) / 1000000 )); }
+# The release build's question: the compiler, supercompiled, supercompiling
+# itself. A rewrite of the supercompiler's own code that goes wrong shows
+# only here -- compiling plainly, as above, never runs it -- and the seed is
+# exactly this build.
+if "$dream" "$image" --supercompile -L mind -L . -o "$tmp/sc1.dream" dreams/src/main.dr >"$tmp/b1" 2>&1 &&
+   "$dream" "$tmp/sc1.dream" --supercompile -L mind -L . -o "$tmp/sc2.dream" dreams/src/main.dr >"$tmp/b2" 2>&1 &&
+   cmp -s "$tmp/sc1.dream" "$tmp/sc2.dream"; then
+    echo "ok   the compiler, supercompiled, supercompiles itself to the same bytes"
+    pass=$((pass + 1))
+else
+    echo "FAIL the compiler, supercompiled, does not supercompile itself to the same bytes"
+    cat "$tmp/b1" "$tmp/b2" 2>/dev/null | grep -v '^compiled' | sed 's/^/    /' | head -8
+    fail=$((fail + 1))
+fi
+
 for src in dreams/tests/sc/*.dr; do
     name=$(basename "$src" .dr)
     expected="${src%.dr}.expected"

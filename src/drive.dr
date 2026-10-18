@@ -77,6 +77,9 @@ mapping View {
     head
     tail
     match_fail
+    // Each function that binds a slot in two places (`sc.reuses_slots`):
+    // neither driven nor written out anywhere.
+    reuses
 }
 
 let view : ir.Image -> View;
@@ -91,6 +94,7 @@ let view img = {
               (array.of_list (list.map (fn s -> strs.[s]) (ir.Image.atoms img)))
               (array.of_list (ir.Image.ints img))
               (id "_record_is") (id "_match_at") (id "_match_is_cons") (id "_match_head") (id "_match_tail") (id "_match_fail")
+              (array.of_list (list.map sc.reuses_slots (array.to_list bodies)))
 };
 
 /// How many nodes a term is.
@@ -363,6 +367,7 @@ let runnable v cx fi n = {
     f.[:arity else -1] == n && n > 0
         && not (ir.has_flag fl ir.fn_impure)
         && not (ir.has_flag fl ir.fn_thunk) && not (ir.has_flag fl ir.fn_global_value)
+        && not ((View.reuses v).[fi])
         && not (list.contains fi (Ctx.unfolding cx))
         && Ctx.depth cx < max_depth
         && (View.sizes v).[fi] <= max_size
@@ -1260,7 +1265,7 @@ let rec prune_new rd !memo t = match t {
 /// Function `fi` driven, with how many things were decided in it, if any,
 /// and the state carried on to the next.
 let driven : View -> St -> :integer -> [St, Option];
-let driven v !st fi = if ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_impure { [st, Option.none] } else {
+let driven v !st fi = if ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_impure || (View.reuses v).[fi] { [st, Option.none] } else {
     let [st2, body] = drive v (Ctx.new ()) (for_function st ((View.sizes v).[fi])) ((View.bodies v).[fi]);
     if St.folds st2 == 0 { [st2, Option.none] }
     else { [st2, Option.some [sc.fun_of ((View.funcs v).[fi]) (pruned (View.reading v) body), St.folds st2]] }

@@ -584,6 +584,42 @@ let same_stmt rd a b = match [a, b] {
     _ => false,
 };
 
+/// Whether a body binds one slot in two places. The resolver gives the
+/// branches of an `if` and the arms of a `match` the same slots, since only
+/// one of them runs in a call (scope.dr); but here a slot is a name, and a
+/// rewrite that moves a term from one branch to another, or remembers what a
+/// name was bound to, would read one binding as the other. Such a function
+/// is left as it is.
+let reuses_slots : Term -> :bool;
+let reuses_slots t = {
+    let rec walk t acc = {
+        let [seen, names, twice] = acc;
+        if twice || map.has t seen { acc }
+        else {
+            let here = [seen.[t => true], names, twice];
+            match t {
+                Term.prim(_, _, _, _, _, cs) => list.fold (fn a x -> walk x a) here cs,
+                Term.block(_, ss) => list.fold (fn a st -> {
+                    let [sn, nm, tw] = a;
+                    match st {
+                        Stmt.bind(n, _, x) => {
+                            let again = tw || (map.has n nm && nm.[n] != st);
+                            walk x [sn, nm.[n => st], again]
+                        },
+                        Stmt.expr(e) => walk e a,
+                    }
+                }) here ss,
+                Term.trying(_, body, e, h) => {
+                    let [sn, nm, tw] = walk h (walk body here);
+                    [sn, nm.[e => t], tw || (map.has e nm && nm.[e] != t)]
+                },
+                _ => here,
+            }
+        }
+    };
+    list.nth 2 (walk t [%{}, %{}, false])
+};
+
 /// A function's own names: its parameters `s0`.., its captures `c0`...
 let fun_of : :map -> Term -> Fun;
 let fun_of f body = Fun.make (list.map slot_name (list.range 0 (f.[:arity else 0])))

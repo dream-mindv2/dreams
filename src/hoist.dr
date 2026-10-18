@@ -75,7 +75,8 @@ let hoisted p fi wfi wgi = {
     let k = f.[:arity else 0];
     let gi = (Program.global_of p).[fi else -1];
     if gi < 0 || k == 0 || not (ir.has_flag fl ir.fn_rec) || ir.has_flag fl ir.fn_impure
-       || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0 { () }
+       || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0
+       || sc.reuses_slots (sc.body_of (Program.reading p) f) { () }
     else {
         let body = sc.body_of (Program.reading p) f;
         let graph = parts body;

@@ -436,3 +436,38 @@ until the next minimum is asked for. A value `compare` does not order
 totally -- a NaN, a map -- turns it back into a list sorted the program's
 way. The test has ties, pairs, a NaN, maps and an empty queue: as written
 2,974 ms, supercompiled 35 ms, the same output.
+
+## The compiler as the program: what sets a self-compile's time (2026-10-18)
+
+The goal is the compiler, supercompiled, compiling itself in well under its
+5.2 s. A first look:
+
+- The profile is flat: 686 M reductions, the hottest function 3.8%. There
+  is no quadratic left to find in it.
+- The supercompiled compiler was no faster, and allocated *more*: 10.6 GB
+  against 9.0, all of it in a few large functions (`infer` +424 MB,
+  `check_expr` +408 MB). Each slot a function has is in every frame it
+  makes, and the driver's unfoldings in each branch had given them more.
+- Plain `infer` already had 115 slots: every binding in a function had a
+  slot of its own. The branches of an `if` and the arms of a `match` now
+  share theirs (scope.dr), since only one runs in a call -- `infer` 22,
+  `check_expr` 18, `lower_expr` 12. A self-compile allocates 13% less, and
+  the JIT takes 663 functions rather than 365, being let in by the smaller
+  frames. The wall clock did not move, and neither did CPU: it is set by the
+  build's critical path, in parts, not by its sum ("Precompile experiment
+  lessons" says the same).
+- A function that binds a slot in two places is left alone by every pass
+  (`sc.reuses_slots`), because a slot is a name to the core, and a rewrite
+  that moves a term between branches would read one binding as the other.
+  Giving each binding a name of its own when the arena is read is the way to
+  let the passes back in.
+
+Two bugs this found, both in what a supercompiled compiler does when it
+supercompiles, which nothing tested -- the seed is that build, and it
+happened to work until the source changed under it. A shape rewrote the
+worker an earlier round had made (a set kept twice), so no worker is
+rewritten again (`rewritten_before`); and `_set_lookup` answered the rest of
+the list unevaluated, which `type_is` does not take for a list, so a
+lookup answered a list where a boolean belonged. `sc.sh` now builds the
+compiler supercompiled, has it supercompile itself, and holds the two to
+the same bytes.

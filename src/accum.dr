@@ -279,7 +279,8 @@ let rewritten p fi wfi wgi = {
     let k = f.[:arity else 0];
     let gi = (Program.global_of p).[fi else -1];
     if gi < 0 || k == 0 || not (ir.has_flag fl ir.fn_rec) || ir.has_flag fl ir.fn_impure
-       || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0 { () }
+       || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0
+       || sc.reuses_slots (sc.body_of (Program.reading p) f) || rewritten_before p (sc.body_of (Program.reading p) f) { () }
     else {
         let body = sc.body_of (Program.reading p) f;
         let site = Site.make p fi wfi wgi gi k body;
@@ -287,6 +288,26 @@ let rewritten p fi wfi wgi = {
                   fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site,
                   fn () -> memo_table site]
     }
+};
+
+/// Whether a body is one this pass wrote, in a round before the driver: it
+/// calls a builtin only this pass writes. Each shape keeps what it rewrote as
+/// written where it cannot answer -- the scan behind a set's lookup, the read
+/// behind a carried value -- so the same shape finds it again in its own
+/// worker, and a second rewrite of a rewrite went wrong three times (a
+/// carried value carried twice, a set kept twice). A worker is not rewritten
+/// again.
+let rewritten_before : Program -> Term -> :bool;
+let rewritten_before p body = {
+    let ids = Program.ids p;
+    let written = list.filter (fn b -> b >= 0) (list.map (fn n -> ids.[n else -1])
+        ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh",
+         "_memo_cells", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find",
+         "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop"]);
+    list.any (fn t -> match t {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => list.contains b written,
+        _ => false,
+    }) (list.head (hoist.parts body))
 };
 
 /// What every shape is asked about: the function, its worker's indices, its
