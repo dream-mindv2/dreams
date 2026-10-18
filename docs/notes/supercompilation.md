@@ -233,3 +233,44 @@ computation of a static argument computes it once.
 A builtin that walks a list is one reduction however long the list, so
 the indexed loop runs *more* reductions once it is linear, each constant
 time; that test is held to the clock instead (`indexed.ratio`).
+
+## Milestone 2, step 4: the obvious way is not the slow way (2026-10-18)
+
+The goal: code written the obvious way -- the way a first draft is written,
+and the way a review would flag -- runs at the speed of the version a review
+would ask for. `dreams/src/accum.dr` runs after `hoist` and rewrites three
+quadratic shapes, each a wrapper and a worker:
+
+- `go .. (acc + [x])` and `go .. (acc + piece)`: the accumulator is kept
+  newest first, a cons per step, and put in order once where the loop ends
+  (`_append_rev`, `_str_append_rev`). Every read of it must be where the loop
+  ends, or it would be put in order once per read.
+- `f rest + [x]`, naive reverse: an accumulator for what follows is
+  introduced, `f' args k = f args + k`, and the recursion becomes a tail call.
+- `list.contains x seen` with `seen` handed on as `x :: seen` or unchanged: a
+  set is carried beside the list. `_set_lookup` answers what the scan would --
+  forcing `x` only when there is something to compare it with, and each
+  element added unevaluated only when the scan would have reached it -- and
+  answers `()` when it cannot say, and then the scan as written runs.
+
+Each builtin these write means what the code it replaces means, the same
+values forced no further, and where it cannot be sure it says so and the
+code as written runs. That is the rule for every rewrite here: what the
+supercompiler cannot prove it leaves as it was written.
+
+At four times the size, the same VM, the JIT on:
+
+| `tests/sc/` | n | as written | supercompiled |
+|---|---|---|---|
+| appends | 16,000 | 2,687 ms | 22 ms |
+| reverse | 16,000 | 1,443 ms | 22 ms |
+| strings | 40,000 | 1,323 ms | 28 ms |
+| dedupe | 16,000 | 900 ms | 51 ms |
+
+Each doubles as written for twice the input four times over; supercompiled it
+is the VM's start-up.
+
+A worker's body is the original with its slots past the parameters moved up
+to make room (`hoist.shift_slots`), one substitution for the whole body. The
+first version renamed every binding afresh, which copies every node the body
+shares once per parent: the self-compile ran out of memory in `prune`.

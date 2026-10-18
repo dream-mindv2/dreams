@@ -1,0 +1,444 @@
+// Accumulators written the slow way, written again the fast way: the second
+// pass `--supercompile` runs before the driver, after `hoist`. See "Milestone
+// 2, step 4" in docs/notes/supercompilation.md.
+//
+// The point is that code written the obvious way is not slow. Three shapes
+// are the obvious way and are quadratic, because each step copies everything
+// before it:
+//
+// - **An accumulator grown at the end**, `go (acc + [x])` or `go (acc +
+//   piece)`: each `+` copies `acc`. Kept instead newest first, a cons per
+//   step, the accumulator is put in order once, where it is read
+//   (`_append_rev`, `_str_append_rev`). Its reads must all be where the loop
+//   ends -- a branch that does not call itself -- or keeping it backwards
+//   would put it in order once per read.
+// - **A result grown at the end**, `f rest + [x]`, naive reverse's shape: each
+//   level copies what the levels below made. An accumulator is introduced --
+//   `f' args k` is `f args + k` -- so each level puts its piece in front of
+//   what follows instead, and the recursion becomes a tail call.
+// - **A membership scan of a list grown by cons**, `list.contains x seen` with
+//   `seen` handed on as `x :: seen`, or unchanged: a scan per step. A set is
+//   carried beside the list (`_set_add`), and a lookup answers from it when it
+//   can say what the scan would (`_set_lookup`), forcing what the scan would
+//   force, and says it cannot otherwise -- and then the scan, as written,
+//   runs. The list is still built, so anything else that reads it reads what
+//   it always did.
+//
+// Each is a wrapper and a worker, as in `hoist`: the function keeps its name
+// and its callers, and calls a worker that carries what is kept the new way.
+
+import std.array;
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.builtins;
+import dreams.drive;
+import dreams.hoist;
+import dreams.ir;
+import dreams.sc;
+import dreams.sc.{Term, Stmt, Fun};
+
+/// What the pass reads of the program.
+mapping Program {
+    reading
+    funcs
+    globals
+    global_of
+    // The builtins it writes, by name, and `std.list.contains`'s global.
+    ids
+    contains
+}
+
+/// The image with its slow accumulators written again.
+let accum : ir.Image -> Result;
+let accum img = {
+    let rd = sc.read img;
+    let globals = array.of_list (ir.Image.globals img);
+    let strs = array.of_list (ir.Image.strs img);
+    let global_of = list.fold (fn m [gi, g] ->
+        if g.[:kind else -1] == ir.global_function && not (map.has (g.[:target]) m) { m.[g.[:target] => gi] } else { m })
+        %{} (list.enumerate (ir.Image.globals img));
+    let id name = match builtins.id name { () => -1, i => i };
+    let ids = list.fold (fn m n -> m.[n => id n]) %{}
+                        ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "to_string"];
+    let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids (global_named img strs "std.list" "contains");
+    let n_funcs = array.length (Program.funcs p);
+    let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
+        match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
+            [wrapper, worker, global] => [m.[fi => wrapper], list.cons worker added, list.cons global gs],
+            _ => [m, added, gs],
+        }) [%{}, [], []] (list.range 0 n_funcs);
+    if map.size changed == 0 { Result.ok img }
+    else { sc.patch img rd changed (list.reverse added_rev) (list.reverse globals_rev) }
+};
+
+/// The global through which `module.name` is called, or `-1`.
+let global_named : ir.Image -> #[:string] -> :string -> :string -> :integer;
+let global_named img strs module name = match list.find (fn m -> strs.[m.[:name else 0]] == module) (ir.Image.modules img) {
+    () => -1,
+    m => {
+        let from = m.[:globals_start else 0];
+        let gs = array.of_list (ir.Image.globals img);
+        match list.find (fn gi -> strs.[(gs.[gi]).[:name else 0]] == name) (list.range from (from + m.[:globals_count else 0])) {
+            () => -1,
+            gi => gi,
+        }
+    },
+};
+
+/// Function `fi` with the first shape that fits it written again: the
+/// wrapper, the worker (function `wfi`, global `wgi`) and its global, or `()`.
+let rewritten : Program -> :integer -> :integer -> :integer -> [Fun, Fun, :map] | :unit;
+let rewritten p fi wfi wgi = {
+    let f = (Program.funcs p).[fi];
+    let fl = f.[:flags else 0];
+    let k = f.[:arity else 0];
+    let gi = (Program.global_of p).[fi else -1];
+    if gi < 0 || k == 0 || not (ir.has_flag fl ir.fn_rec) || ir.has_flag fl ir.fn_impure
+       || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0 { () }
+    else {
+        let body = sc.body_of (Program.reading p) f;
+        let site = Site.make p fi wfi wgi gi k body;
+        first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site]
+    }
+};
+
+/// What every shape is asked about: the function, its worker's indices, its
+/// own global, its arity and its body.
+group Site { program, fi : :integer, wfi : :integer, wgi : :integer, gi : :integer, k : :integer, body }
+
+let first_of : [(:unit -> :any)] -> :any;
+let rec first_of tries = match tries {
+    [] => (),
+    [t, ..rest] => match t () { () => first_of rest, r => r },
+};
+
+// --- where a body ends ----------------------------------------------------------
+
+/// The terms a body can finish as -- its tail positions -- through blocks to
+/// their last statement, both branches of an `if`, each target of a switch.
+let leaves : Term -> [Term];
+let rec leaves t = match t {
+    Term.block(_, ss) => match list.reverse ss { [Stmt.expr(l), .._] => leaves l, _ => [t] },
+    Term.prim(:if, _, _, _, _, [_, y, z]) => list.append (leaves y) (leaves z),
+    Term.prim(op, _, _, _, _, [_, ..kids]) if op == :switch_atom || op == :switch_head =>
+        list.concat (list.map leaves (targets kids)),
+    _ => [t],
+};
+
+let targets : [Term] -> [Term];
+let rec targets kids = match kids {
+    [default] => [default],
+    [_, target, ..rest] => list.cons target (targets rest),
+    [] => [],
+};
+
+/// Everything a body evaluates that is not one of its leaves: conditions,
+/// switch subjects and keys, and each statement but a block's last. A strict
+/// read of a parameter as a statement is left out: it forces the parameter
+/// and decides nothing.
+let around : Term -> [Term];
+let rec around t = match t {
+    Term.block(_, ss) => match list.reverse ss {
+        [Stmt.expr(l), ..before] => list.append (list.concat (list.map (fn s -> match s {
+            Stmt.bind(_, _, x) => [x],
+            Stmt.expr(Term.var(_, fl)) if ir.has_flag fl ir.f_strict => [],
+            Stmt.expr(e) => [e],
+        }) before)) (around l),
+        _ => [],
+    },
+    Term.prim(:if, _, _, _, _, [x, y, z]) => list.cons x (list.append (around y) (around z)),
+    Term.prim(op, _, _, _, _, [subject, ..kids]) if op == :switch_atom || op == :switch_head =>
+        list.cons subject (list.append (keys kids) (list.concat (list.map around (targets kids)))),
+    _ => [],
+};
+
+let keys : [Term] -> [Term];
+let rec keys kids = match kids {
+    [_] => [],
+    [key, _, ..rest] => list.cons key (keys rest),
+    [] => [],
+};
+
+/// `t` with each leaf replaced by what `f` makes of it.
+let map_leaves : (Term -> Term) -> Term -> Term;
+let rec map_leaves f t = match t {
+    Term.block(fl, ss) => match list.reverse ss {
+        [Stmt.expr(l), ..before] => Term.block fl (list.reverse (list.cons (Stmt.expr (map_leaves f l)) before)),
+        _ => f t,
+    },
+    Term.prim(:if, fl, a, b, c, [x, y, z]) => Term.prim :if fl a b c [x, map_leaves f y, map_leaves f z],
+    Term.prim(op, fl, a, b, c, [subject, ..kids]) if op == :switch_atom || op == :switch_head =>
+        Term.prim op fl a b c (list.cons subject (map_targets f kids)),
+    _ => f t,
+};
+
+let map_targets : (Term -> Term) -> [Term] -> [Term];
+let rec map_targets f kids = match kids {
+    [default] => [map_leaves f default],
+    [key, target, ..rest] => list.cons key (list.cons (map_leaves f target) (map_targets f rest)),
+    [] => [],
+};
+
+// --- reading terms ----------------------------------------------------------------
+
+/// Whether `t` reads the name `n` anywhere, a closure's capture included.
+let reads : :string -> Term -> :bool;
+let reads n t = list.any (fn x -> match x {
+    Term.var(m, _) => m == n,
+    Term.lam(_, _, _, caps) => list.contains n caps,
+    _ => false,
+}) (list.head (hoist.parts t));
+
+/// Whether `t` calls or names global `gi` anywhere.
+let names : :integer -> Term -> :bool;
+let names gi t = list.any (fn x -> hoist.names_global gi x) (list.head (hoist.parts t));
+
+let is_var : :string -> Term -> :bool;
+let is_var n t = match t { Term.var(m, _) => m == n, _ => false };
+
+/// `[base, pieces]` of a left-nested `+`: `((base + p1) + p2) + ..`, the
+/// pieces in order. A term that is not an addition is its own base.
+let addends : Term -> [Term, [Term]];
+let rec addends t = match t {
+    Term.prim(:add, _, _, _, _, [x, y]) => {
+        let [base, pieces] = addends x;
+        [base, list.append pieces [y]]
+    },
+    _ => [t, []],
+};
+
+/// What kind of thing a piece added to an accumulator shows it is: `:list`
+/// for a list literal or a cell, `:string` for a string a program can only
+/// have made as one, `()` when the piece does not say.
+let kind_of : Program -> Term -> :atom | :unit;
+let kind_of p t = match t {
+    Term.prim(op, _, _, _, _, _) if op == :make_list || op == :cons => :list,
+    Term.prim(:const_str, _, _, _, _, _) => :string,
+    Term.prim(:str_interp, _, _, _, _, _) => :string,
+    Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), _]) if b == (Program.ids p).["to_string"] => :string,
+    _ => (),
+};
+
+/// The one kind every growth shows, the last piece of each deciding it (`a +
+/// b + ","` is a string whatever `b` is), or `()`.
+let agreed : Program -> [:any] -> :atom | :unit;
+let agreed p growths = match list.map (fn pieces -> kind_of p (list.last pieces)) growths {
+    [] => (),
+    [first, ..rest] => if first != () && list.all (fn x -> x == first) rest { first } else { () },
+};
+
+let builtin : Program -> :string -> [Term] -> Term;
+let builtin p name args = hoist.call_builtin ((Program.ids p).[name]) args;
+
+let call : :integer -> [Term] -> Term;
+let call gi args = Term.prim :apply 0 ir.no_node ir.no_node ir.no_node
+                             (list.cons (Term.prim :global 0 gi ir.no_node ir.no_node []) args);
+
+let self_args : Term -> [Term];
+let self_args t = match t { Term.prim(:apply, _, _, _, _, [_, ..args]) => args, _ => [] };
+
+let nil : Term;
+let nil = Term.prim :make_list 0 ir.no_node 0 ir.no_node [];
+
+let is_nil : Term -> :bool;
+let is_nil t = match t { Term.prim(:make_list, _, _, _, _, []) => true, _ => false };
+
+// --- the worker -------------------------------------------------------------------
+
+/// The wrapper and the worker: the worker is `body` (already rewritten, with
+/// the new parameter read as `new_name`, strict when `strict`) under its own
+/// names; the wrapper the function's strict reads and a call of the worker
+/// passing `start` for the new parameter.
+let built : Site -> :string -> :bool -> Term -> Term -> [Fun, Fun, :map];
+let built site new_name strict body start = {
+    let p = Site.program site;
+    let k = Site.k site;
+    let f = (Program.funcs p).[Site.fi site];
+    let param = sc.slot_name k;
+    let reads_new = if strict { [Stmt.expr (Term.var param ir.f_strict)] } else { [] };
+    // The body's own slots past its parameters move up one to make room for
+    // the new one (`hoist.shift_slots`), which takes the first of them.
+    let named = list.head (hoist.rewrite (fn x -> match x {
+        Term.var(n, fl) if n == new_name => Term.var param fl,
+        _ => (),
+    }) %{} (hoist.shift_slots k 1 body));
+    let worker_body = Term.block 0 (list.append reads_new [Stmt.expr named]);
+    let worker = sc.fun_of (f.[:arity => k + 1].[:n_captures => 0].[:captures_off => 0]
+                             .[:slots => f.[:slots else 0] + 1]) worker_body;
+    let params = list.map (fn j -> Term.var (sc.slot_name j) 0) (list.range 0 k);
+    let wrapper = sc.fun_of f (Term.block 0 (list.append (hoist.strict_reads (Site.body site))
+                                                        [Stmt.expr (call (Site.wgi site) (list.append params [start]))]));
+    [wrapper, worker, ((Program.globals p).[Site.gi site]).[:target => Site.wfi site]]
+};
+
+// --- an accumulator grown at the end ------------------------------------------------
+
+/// `go .. (acc + [x])`, for the first parameter that is grown so.
+let grown_accumulator : Site -> [Fun, Fun, :map] | :unit;
+let grown_accumulator site = first_of (list.map (fn j -> fn () -> grown_at site j) (list.range 0 (Site.k site)));
+
+let grown_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let grown_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let acc = sc.slot_name j;
+    let body = Site.body site;
+    let ls = leaves body;
+    let self_calls = list.filter (fn l -> hoist.self_call gi l) ls;
+    // Each call of itself passes `acc` on, or `acc` with pieces added.
+    let growth arg = match addends arg {
+        [base, pieces] if is_var acc base && not (list.is_empty pieces) && not (list.any (fn x -> reads acc x) pieces) => pieces,
+        _ => (),
+    };
+    let fits = list.all (fn l -> {
+        let args = self_args l;
+        let arg = list.nth j args;
+        (is_var acc arg || growth arg != ())
+            && list.all (fn [i, x] -> i == j || not (reads acc x)) (list.enumerate args)
+            && list.all (fn [i, x] -> not (names gi x)) (list.enumerate args)
+    }) self_calls
+    // Anywhere else the loop does not read `acc` but where it ends, and does
+    // not call itself but in a leaf.
+    && list.all (fn x -> not (reads acc x) && not (names gi x)) (around body)
+    && list.all (fn l -> hoist.self_call gi l || not (names gi l)) ls;
+    let growths = list.filter (fn g -> g != ()) (list.map (fn l -> growth (list.nth j (self_args l))) self_calls);
+    if not fits || list.is_empty growths { () }
+    else {
+        match agreed p growths {
+            () => (),
+            kind => {
+                let r = "acc_kept";
+                // Newest first: `acc + [a, b]` is `b :: a :: kept`.
+                let onto pieces = list.fold (fn rest piece -> match [kind, piece] {
+                    [:list, Term.prim(:make_list, _, _, _, _, xs)] => list.fold (fn rr x -> Term.prim :cons 0 ir.no_node ir.no_node ir.no_node [x, rr]) rest xs,
+                    [:list, _] => builtin p "_rev_onto" [piece, rest],
+                    _ => Term.prim :cons 0 ir.no_node ir.no_node ir.no_node [piece, rest],
+                }) (Term.var r 0) pieces;
+                let in_order = builtin p (if kind == :list { "_append_rev" } else { "_str_append_rev" }) [Term.var acc 0, Term.var r 0];
+                let leaf l = if hoist.self_call gi l {
+                    let args = self_args l;
+                    let arg = list.nth j args;
+                    let kept = match growth arg { () => Term.var r 0, pieces => onto pieces };
+                    // `acc` itself is handed on as it came: what was added is kept.
+                    let passed = list.map (fn [i, x] -> if i == j { Term.var acc 0 } else { x }) (list.enumerate args);
+                    call (Site.wgi site) (list.append passed [kept])
+                } else if reads acc l {
+                    // Where the loop ends, `acc` is what it was: put in order once.
+                    Term.block 0 [Stmt.bind "acc_whole" 0 in_order,
+                                  Stmt.expr (list.head (hoist.rewrite (fn x -> if is_var acc x { Term.var "acc_whole" 0 } else { () }) %{} l))]
+                } else { l };
+                built site r true (map_leaves leaf body) nil
+            },
+        }
+    }
+};
+
+// --- a result grown at the end -------------------------------------------------------
+
+/// `f rest + [x]`: an accumulator `k` for what follows, `f' args k = f args +
+/// k`, so each level conses its piece in front of the rest and calls itself
+/// last.
+let appended_result : Site -> [Fun, Fun, :map] | :unit;
+let appended_result site = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let body = Site.body site;
+    let ls = leaves body;
+    let appended l = match addends l {
+        [base, pieces] if hoist.self_call gi base && not (list.is_empty pieces) && not (list.any (fn x -> names gi x) pieces)
+                          && list.all (fn x -> not (names gi x)) (self_args base) => pieces,
+        _ => (),
+    };
+    let shapes = list.map (fn l -> if appended l != () { :appended }
+                                   else if hoist.self_call gi l && list.all (fn x -> not (names gi x)) (self_args l) { :tail }
+                                   else if not (names gi l) { :base }
+                                   else { () }) ls;
+    let growths = list.filter (fn g -> g != ()) (list.map appended ls);
+    if list.any (fn s -> s == ()) shapes || list.is_empty growths
+       || list.any (fn x -> names gi x) (around body) || agreed p growths != :list { () }
+    else {
+        let k = "rest_kept";
+        // Strict only when each step's piece is a literal, so forcing it at
+        // the step forces nothing the program would not.
+        let literal = list.all literal_pieces growths;
+        let onto pieces = list.fold (fn rest piece -> match piece {
+            Term.prim(:make_list, _, _, _, _, xs) => list.fold (fn rr x -> Term.prim :cons 0 ir.no_node ir.no_node ir.no_node [x, rr]) rest (list.reverse xs),
+            _ => Term.prim :add 0 ir.no_node ir.no_node ir.no_node [piece, rest],
+        }) (Term.var k 0) (list.reverse pieces);
+        let leaf l = match appended l {
+            () => if hoist.self_call gi l { call (Site.wgi site) (list.append (self_args l) [Term.var k 0]) }
+                  else if is_nil l { Term.var k 0 }
+                  else { Term.prim :add 0 ir.no_node ir.no_node ir.no_node [l, Term.var k 0] },
+            pieces => {
+                let [base, _] = addends l;
+                call (Site.wgi site) (list.append (self_args base) [onto pieces])
+            },
+        };
+        built site k literal (map_leaves leaf body) nil
+    }
+};
+
+/// Whether every piece is a list literal.
+let literal_pieces : :any -> :bool;
+let literal_pieces pieces = list.all (fn x -> match x { Term.prim(:make_list, _, _, _, _, _) => true, _ => false }) pieces;
+
+// --- a membership scan of a list grown by cons -------------------------------------
+
+/// `list.contains x seen`, `seen` handed on as `x :: seen` or as it was: a
+/// set carried beside it.
+let member_set : Site -> [Fun, Fun, :map] | :unit;
+let member_set site =
+    if Program.contains (Site.program site) < 0 { () }
+    else { first_of (list.map (fn j -> fn () -> member_at site j) (list.range 0 (Site.k site))) };
+
+let member_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let member_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let gc = Program.contains p;
+    let seen = sc.slot_name j;
+    let body = Site.body site;
+    let [terms, _] = hoist.parts body;
+    let scans = list.filter (fn t -> match t {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), _, xs]) => g == gc && is_var seen xs,
+        _ => false,
+    }) terms;
+    let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
+    let grown arg = match arg {
+        Term.prim(:cons, _, _, _, _, [e, rest]) if is_var seen rest && hoist.trivial_term e => e,
+        _ => (),
+    };
+    let fits = list.all (fn c -> {
+        let arg = list.nth j (self_args c);
+        is_var seen arg || grown arg != ()
+    }) self_calls && not (list.is_empty self_calls);
+    if list.is_empty scans || not fits { () }
+    else {
+        let s = "seen_set";
+        let rewritten_body = list.head (hoist.rewrite (fn t ->
+            if hoist.self_call gi t {
+                let args = self_args t;
+                let kept = match grown (list.nth j args) { () => Term.var s 0, e => builtin p "_set_add" [Term.var s 0, e] };
+                call (Site.wgi site) (list.append args [kept])
+            } else {
+                match t {
+                    Term.prim(:apply, fl, a, b, c, [Term.prim(:global, cf, g, ca, cb, cc), x, xs]) if g == gc && is_var seen xs => {
+                        let callee = Term.prim :global cf g ca cb cc;
+                        // The set's answer when it has one; the scan as
+                        // written when it has not.
+                        Term.block fl [Stmt.bind "seen_x" 0 x,
+                                       Stmt.bind "seen_says" ir.f_strict (builtin p "_set_lookup" [Term.var s 0, Term.var "seen_x" 0]),
+                                       Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node
+                                           [Term.prim :eq 0 ir.no_node ir.no_node ir.no_node
+                                                      [Term.var "seen_says" 0, Term.prim :unit 0 ir.no_node ir.no_node ir.no_node []],
+                                            Term.prim :apply fl a b c [callee, Term.var "seen_x" 0, xs],
+                                            Term.var "seen_says" 0])]
+                    },
+                    _ => (),
+                }
+            }) %{} body);
+        built site s false rewritten_body (builtin p "_set_of" [Term.var seen 0])
+    }
+};

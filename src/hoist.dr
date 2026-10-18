@@ -323,9 +323,14 @@ let split p fi wfi wgi gi k arrays invariants body = {
         () => worker_call p gi wgi k extra x,
         i => Term.var ("iv" + to_string i) 0,
     }) %{} body);
-    let st0 = drive.St.new ();
-    let [_, worker_body] = drive.rename st0 as_param named;
-    let worker = sc.fun_of (f.[:arity => k + m].[:n_captures => 0].[:captures_off => 0].[:slots => 0]) worker_body;
+    // The body's own slots past its parameters move up to make room for the
+    // new ones, which then take the names `as_param` gives them.
+    let worker_body = list.head (rewrite (fn x -> match x {
+        Term.var(n, fl) => match as_param.[n else ()] { () => (), to => Term.var to fl },
+        _ => (),
+    }) %{} (shift_slots k m named));
+    let worker = sc.fun_of (f.[:arity => k + m].[:n_captures => 0].[:captures_off => 0]
+                             .[:slots => f.[:slots else 0] + m]) worker_body;
     let lets = list.concat [list.map (fn [j, n] -> Stmt.bind n 0 (call_builtin (Program.indexed_id p) [Term.var (sc.slot_name j) 0])) arrays,
                             list.map (fn [i, iv] -> Stmt.bind ("iv" + to_string i) 0 iv) (list.enumerate invariants)];
     let call = Term.prim :apply 0 ir.no_node ir.no_node ir.no_node
@@ -352,6 +357,59 @@ let strict_reads : Term -> [Stmt];
 let strict_reads t = match t {
     Term.block(_, ss) => list.take_while strict_read ss,
     _ => [],
+};
+
+/// `t` with every slot at or past `from` moved up by `by`: a body made the
+/// worker's, whose `by` new parameters take the slots after the original's.
+/// One substitution for the whole body, so a term the body shares is shifted
+/// once and stays shared (`rewrite`'s memo) -- renaming each binding afresh
+/// would copy every shared node once per parent. Names that are not slots
+/// are the passes' own and are left alone.
+let shift_slots : :integer -> :integer -> Term -> Term;
+let shift_slots from by t = list.head (shift_with from by %{} t);
+
+let shifted_name : :integer -> :integer -> :string -> :string;
+let shifted_name from by n = match sc.fixed_slot n {
+    () => n,
+    k => if k >= from { sc.slot_name (k + by) } else { n },
+};
+
+let shift_with : :integer -> :integer -> :map -> Term -> [Term, :map];
+let rec shift_with from by memo t = match memo.[t else ()] {
+    () => {
+        let sh n = shifted_name from by n;
+        let [t2, m2] = match t {
+            Term.var(n, fl) => [Term.var (sh n) fl, memo],
+            Term.lam(op, fl, fi, caps) => [Term.lam op fl fi (list.map sh caps), memo],
+            Term.prim(op, fl, a, b, c, cs) => {
+                let [rev, m] = list.fold (fn [out, mm] x -> { let [x2, m3] = shift_with from by mm x; [list.cons x2 out, m3] }) [[], memo] cs;
+                [Term.prim op fl a b c (list.reverse rev), m]
+            },
+            Term.block(fl, ss) => {
+                let [rev, m] = list.fold (fn [out, mm] st -> match st {
+                    Stmt.bind(n, bf, x) => { let [x2, m3] = shift_with from by mm x; [list.cons (Stmt.bind (sh n) bf x2) out, m3] },
+                    Stmt.expr(e) => { let [e2, m3] = shift_with from by mm e; [list.cons (Stmt.expr e2) out, m3] },
+                }) [[], memo] ss;
+                [Term.block fl (list.reverse rev), m]
+            },
+            Term.trying(fl, body, e, h) => {
+                let [b2, m3] = shift_with from by memo body;
+                let [h2, m4] = shift_with from by m3 h;
+                [Term.trying fl b2 (sh e) h2, m4]
+            },
+            Term.absent => [t, memo],
+        };
+        [t2, m2.[t => t2]]
+    },
+    t2 => [t2, memo],
+};
+
+/// A term that costs nothing to read twice: a name or a constant.
+let trivial_term : Term -> :bool;
+let trivial_term t = match t {
+    Term.var(_, _) => true,
+    Term.prim(_, _, _, _, _, []) => true,
+    _ => false,
 };
 
 let call_builtin : :integer -> [Term] -> Term;

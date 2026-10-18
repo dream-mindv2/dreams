@@ -35,6 +35,7 @@ import dreams.lower;
 import dreams.modules;
 import dreams.package;
 import dreams.opt as optimizer;
+import dreams.accum;
 import dreams.drive;
 import dreams.hoist;
 import dreams.sc;
@@ -523,7 +524,7 @@ let finished b = match Options.supercompile (Build.options b) {
     // Loop invariants are hoisted out first (`dreams/src/hoist.dr`), so that
     // what the driver specialises is the loop that no longer recomputes them.
     :drive => Result.map (fn img -> finish b img)
-                         (Result.and_then drive.supercompile (hoist.hoist (shared_image b))),
+                         (hoist.hoist (shared_image b) |> Result.and_then accum.accum |> Result.and_then drive.supercompile),
     _ => Result.ok (finish b (shared_image b)),
 };
 

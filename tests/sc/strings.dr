@@ -1,0 +1,7 @@
+// A string grown a piece at a time, `acc + piece`: quadratic as written. The
+// supercompiler keeps the pieces and joins them once (dreams/src/accum.dr).
+import std.console;
+import std.list;
+import std.str;
+let rec csv !i n acc = if i >= n { acc } else { csv (i + 1) n (acc + to_string i + ",") };
+let main! = console.print! (to_string (str.byte_length (csv 0 40000 "")));

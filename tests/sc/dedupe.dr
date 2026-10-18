@@ -1,0 +1,8 @@
+// Dedupe by a list of what has been seen, `list.contains x seen`: quadratic
+// as written. The supercompiler carries a set beside the list and answers
+// from it where it can say what the scan would (dreams/src/accum.dr).
+import std.console;
+import std.list;
+import std.str;
+let rec dedupe seen xs = match xs { [] => [], [x, ..rest] => if list.contains x seen { dedupe seen rest } else { list.cons x (dedupe (list.cons x seen) rest) } };
+let main! = console.print! (to_string (len (dedupe [] (list.map (fn x -> x % (16000 / 2)) (list.range 0 16000)))));

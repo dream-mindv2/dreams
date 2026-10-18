@@ -1,0 +1,7 @@
+// Naive reverse, `rev rest + [x]`: quadratic as written. The supercompiler
+// introduces an accumulator and the recursion becomes a loop (dreams/src/accum.dr).
+import std.console;
+import std.list;
+import std.str;
+let rec rev xs = match xs { [] => [], [x, ..rest] => rev rest + [x] };
+let main! = console.print! (to_string (list.head (rev (list.range 0 16000))));

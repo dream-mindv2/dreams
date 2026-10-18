@@ -1,0 +1,8 @@
+// An accumulator grown at the end, `acc + [x]`: quadratic as written, a copy
+// of `acc` per step. The supercompiler keeps it newest first and puts it in
+// order once (dreams/src/accum.dr).
+import std.console;
+import std.list;
+import std.str;
+let rec squares !i n acc = if i >= n { acc } else { squares (i + 1) n (acc + [i * i]) };
+let main! = console.print! (to_string (list.sum (squares 0 16000 [])));

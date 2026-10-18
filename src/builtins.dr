@@ -117,6 +117,15 @@ let names = [
     // A list read into an array, anything else as it is: never written, put
     // by the supercompiler where a loop indexes a list (dreams/src/hoist.dr).
     "_indexed",
+    // What the supercompiler writes where a loop was written the slow way
+    // (dreams/src/accum.dr): an accumulator grown at the end, kept newest
+    // first and put in order once; and a membership set for `list.contains`.
+    "_append_rev",
+    "_rev_onto",
+    "_str_append_rev",
+    "_set_of",
+    "_set_add",
+    "_set_lookup",
 
 ];
 
@@ -219,6 +228,12 @@ let signatures = %{
     "_settled" => "value -> true, once the value is forced all the way down",
     "_forced" => "value -> true, once the value is forced to its outermost constructor",
     "_indexed" => "value -> an array of a list's elements, or the value itself when it is not a list",
+    "_append_rev" => "list -> list -> the first followed by the second reversed",
+    "_rev_onto" => "list -> list -> the first reversed in front of the second",
+    "_str_append_rev" => "string -> list -> the string followed by the list's strings, last first",
+    "_set_of" => "list -> a membership set of what is evaluated of it",
+    "_set_add" => "set -> value -> the set with the value",
+    "_set_lookup" => "set -> value -> whether it is a member, or () when the set cannot say",
 
 };
 
