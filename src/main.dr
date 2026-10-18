@@ -169,7 +169,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
     compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true)
-                         (list.map remap_spec (o.[:remaps else []]));
+                         (list.map remap_spec (o.[:remaps else []])) (opt o :sc_roundtrip == true);
 
 /// `FROM=TO` as `[from, to]`. The split is at the last `=`, since a path may
 /// hold one and a package name never does.
@@ -208,7 +208,7 @@ let show_packages! ps = {
 
 /// The execution trees the program lowers to.
 let show_ir! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false []);
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] false);
     let low = lower.lower_program r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
@@ -383,11 +383,16 @@ let build! l out shebang depfile specs said o = {
                 console.error! ("dreams: " + why)
                 1
             },
-            Result.ok(aimed) => {
+            Result.ok(aimed) => match compile.finished b {
+              Result.error(problems) => {
+                list.each! (fn p -> console.error! ("dreams: supercompiler: " + p)) problems
+                1
+              },
+              Result.ok(finished) => {
                 // Set here, on the image this command writes, and never in
                 // `compile.image`: a `comp` runs an image of the same program on the
                 // compiler's own VM, and a cross-build's target is not that machine.
-                let img = ir.Image.set_target_flags (target.flags aimed) (compile.image b);
+                let img = ir.Image.set_target_flags (target.flags aimed) finished;
                 let payload_bytes = list.sum sizes;
                 // The shebang goes in front of the image rather than into it: the VM
                 // skips a leading `#!` line when it loads a file, which is what makes
@@ -436,6 +441,7 @@ let build! l out shebang depfile specs said o = {
                         }
                     },
                 }
+              },
             },
         }
     }
@@ -444,7 +450,7 @@ let build! l out shebang depfile specs said o = {
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false []);
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] false);
     let lowered = lower.image (lower.lower_program r);
     let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
@@ -897,6 +903,7 @@ let rec parse_args args o =
         // this, which is the point: when an image misbehaves it answers
         // whether the pass that rewrote it is why.
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
+        ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :sc_roundtrip true o),
         ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,
         ["--remap-path-prefix", spec, ..rest] => parse_args rest (append_opt :remaps spec o),
         ["--units"] => with_opt :error "--units needs a directory" o,
@@ -962,6 +969,7 @@ let usage! () = {
         "                           each module exports",
         "  --release                define `release`",
         "  --no-opt                 emit the arena as lowered, unshared",
+        "  --sc-roundtrip           take the image through the supercompiler's core and back",
         "  --remap-path-prefix FROM=TO",
         "                           record source paths that begin with FROM as",
         "                           beginning with TO, so the image does not depend on",

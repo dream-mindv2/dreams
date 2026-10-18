@@ -35,6 +35,7 @@ import dreams.lower;
 import dreams.modules;
 import dreams.package;
 import dreams.opt as optimizer;
+import dreams.sc;
 import dreams.scope;
 import dreams.typecheck;
 import dreams.contract;
@@ -80,6 +81,11 @@ mapping Options {
     // `[from, to]` per `--remap-path-prefix FROM=TO`: how the source paths the
     // image records are rewritten (`remap_sources`).
     remap = []
+    // Take the finished image through the supercompiler's core and back
+    // (`dreams/src/sc.dr`, `--sc-roundtrip`), then share it again: milestone
+    // 1 of docs/notes/supercompilation.md, the translation with nothing done
+    // in between.
+    supercompile = false
 }
 
 /// The defaults: checked, shared, no payload.
@@ -89,7 +95,7 @@ let options = Options.new ();
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
 let scratch : Options;
-let scratch = Options.make false false [] false [] () false [];
+let scratch = Options.make false false [] false [] () false [] false;
 
 // --- a build --------------------------------------------------------------------
 
@@ -496,11 +502,36 @@ let param_masks img by_global = {
 /// been lowered and every `comp` settled, and two nodes that differ only in a
 /// flag are two nodes.
 let image : Build -> ir.Image;
-let image b = {
-    let o = Build.options b;
+let image b = match finished b {
+    Result.ok(img) => img,
+    Result.error(_) => finish b (shared_image b),
+};
+
+/// The image, or why the supercompiler could not translate it. Only the
+/// command line asks this, since only it can say so; everything else takes
+/// `image`, which falls back to the image as it was before the translation.
+///
+/// The supercompiler reads the arena as `lower` built it, before it is
+/// shared: shared, the arena is a graph, and the core is trees, so reading a
+/// shared arena unshares it first -- most of a self-compile's nodes many times
+/// over. What it writes is shared after.
+let finished : Build -> Result;
+let finished b =
+    if not (Options.supercompile (Build.options b)) { Result.ok (finish b (shared_image b)) }
+    else { Result.map (fn img -> finish b (optimizer.optimize img)) (sc.roundtrip (lower.image (lowered b))) };
+
+/// The arena, shared if the options say so.
+let shared_image : Build -> ir.Image;
+let shared_image b = {
     let arena = lower.image (lowered b);
-    let built = if not (Options.optimize o) { arena }
-                else { match Build.shared b { () => optimizer.optimize arena, done => done } };
+    if not (Options.optimize (Build.options b)) { arena }
+    else { match Build.shared b { () => optimizer.optimize arena, done => done } }
+};
+
+/// What the build adds to an arena to make it the image.
+let finish : Build -> ir.Image -> ir.Image;
+let finish b built = {
+    let o = Build.options b;
     let hints f = if Options.types o { param_masks built (f (Build.facts b)) } else { [] };
     built
         |> ir.Image.set_payloads (Options.payloads o)

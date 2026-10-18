@@ -203,7 +203,8 @@ mind test dreams            # all of the above, at once
 
 `tests/` holds the end-to-end suites: `compile.sh` builds a compiler from the
 seed and runs programs through it; `parts.sh`, `units.sh` and `target.sh` check
-parallel builds, the unit cache and targets; the Python suites cover macros,
+parallel builds, the unit cache and targets; `sc.sh` holds the
+supercompiler's translation to no change; the Python suites cover macros,
 optional and static types, contracts, primitives and modules. `tests/scale.py`
 generates programs of N declarations or modules, for finding what grows faster
 than it should.

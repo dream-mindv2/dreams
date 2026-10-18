@@ -1,0 +1,393 @@
+// Supercompilation: see docs/notes/supercompilation.md.
+//
+// This file is the core the supercompiler works on and the two translations
+// between it and the IR. A program's IR is a frame of numbered slots per
+// function, and a transformation that moves code between functions cannot
+// keep a slot's number; so here a slot is a name, and a binding says which
+// name it binds. Every operation that does not bind is one form, `prim`, that
+// keeps its operands as they were and its children as terms, so the
+// translation is faithful to the eighty-odd operations without modelling
+// each: what the supercompiler needs to understand it will match on by
+// operation, and everything else passes through.
+//
+// Milestone 1 is the round trip, IR to core and back with nothing between,
+// run over every program the suites compile (`--sc-roundtrip`).
+
+import std.array;
+import std.lazy;
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.ir;
+
+/// A term of the core.
+union Term {
+    /// A slot of the frame, or a capture of the closure, by name. Its flags
+    /// are the node's: a strict parameter is a read of it marked strict, at
+    /// the head of the body (`lower_body`), and that read is what forces it.
+    var(name : :string, flags : :integer)
+    /// Any operation that binds nothing: its opcode, flags and operand fields
+    /// as the IR had them, and the terms its child fields held, in the order
+    /// `layout` reads them.
+    prim(op : :atom, flags : :integer, a, b, c, children : [Term])
+    /// A block: its statements, the last its value.
+    block(flags : :integer, stmts : [Stmt])
+    /// `make_closure` or `make_thunk` of function `fi`, with the names of the
+    /// making frame its captures are taken from, in descriptor order.
+    lam(op : :atom, flags : :integer, fi : :integer, captures : [:string])
+    /// `try`: the body, the name the caught error is bound to, the handler.
+    trying(flags : :integer, body : Term, error : :string, handler : Term)
+    /// A child that is not there: an `if` with no `else`, a `get` with no
+    /// fallback.
+    absent
+}
+
+/// A block's statement.
+union Stmt {
+    bind(name : :string, flags : :integer, value : Term)
+    expr(term : Term)
+}
+
+/// A function of the core: the names of its parameters and captures, its
+/// body, and the record it came from, for every field the core does not touch.
+struct Fun {
+    params : [:string]
+    captures : [:string]
+    body : Term
+    record
+}
+
+// --- what an operation's fields are -------------------------------------------
+
+/// The opcodes whose children are a kids section at `b` of length `c`, with
+/// `a` an operand: the primitives (`DREAM_PRIMITIVES` in the VM).
+let primitives : [:atom];
+let primitives = [:str_chars, :error_new, :error_kind, :error_payload, :str_slice, :str_find, :str_byte,
+                  :str_le, :str_span, :str_upto, :char_code, :char_of_code, :to_float, :float_bytes,
+                  :float_of_bytes, :to_int, :parse_int, :parse_float, :to_existing_atom, :array_new,
+                  :array_to_list, :map_has, :map_remove, :map_pairs, :data_count, :data_at, :compare,
+                  :str_interp];
+
+/// The opcodes with two child fields, `a` and `b`.
+let binaries : [:atom];
+let binaries = [:add, :sub, :mul, :div, :mod, :eq, :ne, :lt, :le, :gt, :ge, :and, :or, :cons,
+                :band, :bor, :bxor, :shl, :shr, :ensure];
+
+/// Which of an operation's fields are children, as the VM's `node_children`
+/// says: `:leaf`, `:a`, `:ab`, `:abc` (the last optional), `:a_kids` (`a`,
+/// then `c` kids at `b`), `:kids_ab` (`b` kids at `a`), `:kids_ab2` (`2b`
+/// kids at `a`), `:a_kids2` (`a`, then `2c` kids at `b`), or `:kids_bc`.
+let layout : :atom -> :atom;
+let layout op = match op {
+    :field => :a, :force => :a, :neg => :a, :not => :a, :bnot => :a, :type_is => :a,
+    :list_tail => :a, :list_is_empty => :a,
+    :apply => :a_kids, :switch_head => :a_kids, :switch_atom => :a_kids,
+    :if => :abc, :get => :abc, :set => :abc,
+    :make_list => :kids_ab, :make_array => :kids_ab, :record_make => :kids_ab,
+    :set_many => :a_kids2,
+    :make_map => :kids_ab2,
+    o if list.contains o binaries => :ab,
+    o if list.contains o primitives => :kids_bc,
+    _ => :leaf,
+};
+
+// --- from the IR -------------------------------------------------------------
+
+/// The IR a translation reads: the arena as arrays.
+mapping Arena {
+    nodes
+    kids
+}
+
+/// The name of slot `k`, and of capture `i`.
+let slot_name : :integer -> :string;
+let slot_name k = "s" + to_string k;
+let capture_name : :integer -> :string;
+let capture_name i = "c" + to_string i;
+
+let node_of : Arena -> :integer -> ir.Node;
+let node_of ar i = (Arena.nodes ar).[i];
+let kids_of : Arena -> :integer -> :integer -> [:integer];
+let kids_of ar off n = list.map (fn k -> (Arena.kids ar).[off + k]) (list.range 0 n);
+
+/// Node `i` as a term.
+let term_of : Arena -> :integer -> Term;
+let rec term_of ar i =
+    if i == ir.no_node { Term.absent }
+    else {
+        let n = node_of ar i;
+        let op = ir.node_op n;
+        let [fl, a, b, c] = [ir.node_flags n, ir.node_a n, ir.node_b n, ir.node_c n];
+        let t x = term_of ar x;
+        match op {
+            :local => Term.var (slot_name a) fl,
+            :capture => Term.var (capture_name a) fl,
+            :block => Term.block fl (list.map (fn k -> stmt_of ar k) (kids_of ar a b)),
+            :make_closure => Term.lam op fl a [],
+            :make_thunk => Term.lam op fl a [],
+            :try => Term.trying fl (t a) (slot_name c) (t b),
+            _ => Term.prim op fl a b c (match layout op {
+                :leaf => [],
+                :a => [t a],
+                :ab => [t a, t b],
+                :abc => [t a, t b, t c],
+                :a_kids => list.cons (t a) (list.map t (kids_of ar b c)),
+                :kids_ab => list.map t (kids_of ar a b),
+                :kids_ab2 => list.map t (kids_of ar a (2 * b)),
+                :a_kids2 => list.cons (t a) (list.map t (kids_of ar b (2 * c))),
+                :kids_bc => list.map t (kids_of ar b c),
+            }),
+        }
+    };
+
+let stmt_of : Arena -> :integer -> Stmt;
+let stmt_of ar i = {
+    let n = node_of ar i;
+    match ir.node_op n {
+        :bind => Stmt.bind (slot_name (ir.node_a n)) (ir.node_flags n) (term_of ar (ir.node_b n)),
+        _ => Stmt.expr (term_of ar i),
+    }
+};
+
+/// A closure's or a thunk's captures, as names of the frame that makes it:
+/// what its function's capture descriptors name there.
+let capture_terms : Arena -> :map -> [:string];
+let capture_terms ar f =
+    list.map (fn d -> if d >= ir.cap_from_capture { capture_name (d - ir.cap_from_capture) }
+                      else { slot_name d })
+             (kids_of ar (f.[:captures_off else 0]) (f.[:n_captures else 0]));
+
+/// Fill each `lam`'s capture terms from its function's descriptors.
+let with_captures : Arena -> #[:map] -> Term -> Term;
+let rec with_captures ar funcs t = {
+    let w x = with_captures ar funcs x;
+    match t {
+        Term.lam(op, fl, fi, _) => Term.lam op fl fi (capture_terms ar (funcs.[fi])),
+        Term.prim(op, fl, a, b, c, cs) => Term.prim op fl a b c (list.map w cs),
+        Term.block(fl, ss) => Term.block fl (list.map (fn s -> match s {
+            Stmt.bind(n, f2, v) => Stmt.bind n f2 (w v),
+            Stmt.expr(e) => Stmt.expr (w e),
+        }) ss),
+        Term.trying(fl, body, e, h) => Term.trying fl (w body) e (w h),
+        other => other,
+    }
+};
+
+/// Every function of an image, in the core.
+let from_image : ir.Image -> [Fun];
+let from_image img = {
+    let ar = Arena.make (array.of_list (ir.Image.nodes img)) (array.of_list (ir.Image.kids img));
+    let funcs = array.of_list (ir.Image.funcs img);
+    list.map (fn f -> {
+        let arity = f.[:arity else 0];
+        Fun.make (list.map slot_name (list.range 0 arity))
+                 (list.map capture_name (list.range 0 (f.[:n_captures else 0])))
+                 (with_captures ar funcs (term_of ar (f.[:body else ir.no_node])))
+                 f
+    }) (ir.Image.funcs img)
+};
+
+// --- to the IR ---------------------------------------------------------------
+
+/// Where emitting is: the program being built; what each of the function's
+/// names stands for (`[:slot, k]` or `[:capture, i]`) and its next free slot;
+/// the capture descriptors of every function made so far, by index; and
+/// what went wrong, which is a fault of the core handed in and fails the
+/// translation (`to_image`).
+mapping Emit {
+    prog
+    names = %{}
+    next = 0
+    descriptors = %{}
+    problems = []
+}
+
+let problem : :string -> Emit -> Emit;
+let problem p !e = settle (Emit.set_problems (list.cons p (Emit.problems e)) e);
+
+/// The state with every field forced as far as its outermost constructor.
+///
+/// It is threaded through every node of the program, and a setter stores its
+/// value unforced: unforced, the arena after the last node is a suspension
+/// of the push before it, and so on back to the first, and forcing it at the
+/// end overflowed the stack on a self-compile. Each function that takes the
+/// state takes it strictly, so each forces the step before it.
+let settle : Emit -> Emit;
+let settle e =
+    if lazy.forced (Emit.prog e) && lazy.forced (Emit.names e) && lazy.forced (Emit.next e)
+       && lazy.forced (Emit.descriptors e) && lazy.forced (Emit.problems e) { e }
+    else { e };
+
+/// What `name` stands for, giving it the next slot if it has none: a binding
+/// is the first a name is seen.
+let place : Emit -> :string -> [Emit, [:any]];
+let place !e name = match (Emit.names e).[name else ()] {
+    () => {
+        let k = Emit.next e;
+        [settle (e |> Emit.set_names ((Emit.names e).[name => [:slot, k]]) |> Emit.set_next (k + 1)), [:slot, k]]
+    },
+    at => [e, at],
+};
+
+/// The slot `name` is, giving it one if it has none. A name a binding binds
+/// is never a capture: a closure's captures are read, not rebound.
+let slot : Emit -> :string -> [Emit, :integer];
+let slot !e name = {
+    let [e2, at] = place e name;
+    match at {
+        [:slot, k] => [e2, k],
+        _ => [problem ("a binding rebinds the capture " + name) e2, 0],
+    }
+};
+
+let push : Emit -> ir.Node -> [Emit, :integer];
+let push !e n = {
+    let [p, i] = ir.push_node n (Emit.prog e);
+    [settle (Emit.set_prog p e), i]
+};
+
+let push_kids : Emit -> [:any] -> [Emit, :integer];
+let push_kids !e xs = {
+    let [p, off] = ir.push_kids xs (Emit.prog e);
+    [settle (Emit.set_prog p e), off]
+};
+
+/// Several terms as nodes, in order.
+let emit_all : Emit -> [Term] -> [Emit, [:integer | :atom]];
+let emit_all !e ts = {
+    let [e2, rev] = list.fold (fn [ex, is] t -> {
+        let [ex2, i] = emit ex t;
+        [ex2, list.cons i is]
+    }) [e, []] ts;
+    [e2, list.reverse rev]
+};
+
+/// The capture descriptor a name of the making frame is.
+let descriptor : Emit -> :string -> [Emit, :integer];
+let descriptor !e name = {
+    let [e2, at] = place e name;
+    match at {
+        [:slot, k] => [e2, ir.encode_capture false k],
+        [:capture, i] => [e2, ir.encode_capture true i],
+    }
+};
+
+/// A term as nodes: the index of the node it is.
+let emit : Emit -> Term -> [Emit, :integer | :atom];
+let rec emit !e t = match t {
+    Term.absent => [e, ir.no_node],
+    Term.var(name, fl) => {
+        let [e2, at] = place e name;
+        match at {
+            [:slot, k] => push e2 (ir.with_flags fl (ir.node :local k ir.no_node ir.no_node)),
+            [:capture, i] => push e2 (ir.with_flags fl (ir.node :capture i ir.no_node ir.no_node)),
+        }
+    },
+    Term.block(fl, ss) => {
+        let [e2, rev] = list.fold (fn [ex, is] s -> match s {
+            // The name is given its slot before its value is emitted, which
+            // is the order `lower` numbers them in.
+            Stmt.bind(name, f2, v) => {
+                let [ex2, k] = slot ex name;
+                let [ex3, vi] = emit ex2 v;
+                let [ex4, bi] = push ex3 (ir.with_flags f2 (ir.node :bind k vi ir.no_node));
+                [ex4, list.cons bi is]
+            },
+            Stmt.expr(x) => {
+                let [ex2, xi] = emit ex x;
+                [ex2, list.cons xi is]
+            },
+        }) [e, []] ss;
+        let [e3, off] = push_kids e2 (list.reverse rev);
+        push e3 (ir.with_flags fl (ir.node :block off (list.length ss) ir.no_node))
+    },
+    Term.lam(op, fl, fi, cs) => {
+        // The descriptors belong to the function, not to the place it is made;
+        // a function made in two places must capture the same slots in both.
+        let [e2, rev] = list.fold (fn [ex, ds] c -> {
+            let [ex2, d] = descriptor ex c;
+            [ex2, list.cons d ds]
+        }) [e, []] cs;
+        let ds = list.reverse rev;
+        let known = (Emit.descriptors e2).[fi else ds];
+        let e3 = if known != ds { problem ("function " + to_string fi + " is made capturing different slots") e2 }
+                 else { settle (Emit.set_descriptors ((Emit.descriptors e2).[fi => ds]) e2) };
+        push e3 (ir.with_flags fl (ir.node op fi ir.no_node ir.no_node))
+    },
+    Term.trying(fl, body, err, h) => {
+        let [e2, bi] = emit e body;
+        let [e3, k] = slot e2 err;
+        let [e4, hi] = emit e3 h;
+        push e4 (ir.with_flags fl (ir.node :try bi hi k))
+    },
+    Term.prim(op, fl, a, b, c, cs) => {
+        let [e2, is] = emit_all e cs;
+        let n x y z = ir.with_flags fl (ir.node op x y z);
+        match layout op {
+            :leaf => push e2 (n a b c),
+            :a => push e2 (n (list.nth 0 is) b c),
+            :ab => push e2 (n (list.nth 0 is) (list.nth 1 is) c),
+            :abc => push e2 (n (list.nth 0 is) (list.nth 1 is) (list.nth 2 is)),
+            :kids_bc => {
+                let [e3, off] = push_kids e2 is;
+                push e3 (n a off c)
+            },
+            // The rest keep a kids section: `a` and the kids after it, or
+            // the kids alone at `a`.
+            l if l == :kids_ab || l == :kids_ab2 => {
+                let [e3, off] = push_kids e2 is;
+                push e3 (n off b c)
+            },
+            _ => {
+                let [e3, off] = push_kids e2 (list.drop 1 is);
+                push e3 (n (list.head is) off c)
+            },
+        }
+    },
+};
+
+/// One function's body, from its own names: its parameters are its first
+/// slots, its captures what they always were, and the rest are given slots
+/// as they are first seen. Answers the body's node and the frame's size.
+let emit_fun : Emit -> Fun -> [Emit, [:integer | :atom, :integer]];
+let emit_fun !e f = {
+    let params = list.fold (fn m [k, n] -> m.[n => [:slot, k]]) %{} (list.enumerate (Fun.params f));
+    let names = list.fold (fn m [i, n] -> m.[n => [:capture, i]]) params (list.enumerate (Fun.captures f));
+    let inside = settle (e |> Emit.set_names names |> Emit.set_next (list.length (Fun.params f)));
+    let [after, body] = emit inside (Fun.body f);
+    let had = (Fun.record f).[:slots else 0];
+    [after, [body, if Emit.next after > had { Emit.next after } else { had }]]
+};
+
+/// The image with every function's body, frame and captures written from
+/// the core, into an arena of its own. Everything else -- the constant
+/// pools, the globals, function and global indices -- is the image's as it
+/// was, since no node of the core names a node of the old arena.
+let to_image : ir.Image -> [Fun] -> Result;
+let to_image img funs = {
+    let [emitted, rev] = list.fold (fn [e, out] f -> {
+        let [e2, done] = emit_fun e f;
+        [e2, list.cons done out]
+    }) [Emit.make ir.program %{} 0 %{} [], []] funs;
+    let fresh = list.zip (list.range 0 (list.length funs)) (list.zip funs (list.reverse rev));
+    let [final, recs] = list.fold (fn [e, out] [fi, [f, [body, slots]]] -> {
+        let r = Fun.record f;
+        let ds = (Emit.descriptors e).[fi else []];
+        let [e2, off] = push_kids e ds;
+        [e2, list.cons (r.[:body => body].[:slots => slots].[:captures_off => off]
+                         .[:n_captures => list.length (Fun.captures f)]) out]
+    }) [emitted, []] fresh;
+    match Emit.problems final {
+        [] => {
+            let arena = ir.finish (Emit.prog final);
+            Result.ok (img |> ir.Image.set_nodes (ir.Image.nodes arena) |> ir.Image.set_kids (ir.Image.kids arena)
+                           |> ir.Image.set_funcs (list.reverse recs))
+        },
+        ps => Result.error (list.reverse ps),
+    }
+};
+
+/// The image through the core and back, with nothing done in between.
+let roundtrip : ir.Image -> Result;
+let roundtrip img = to_image img (from_image img);
