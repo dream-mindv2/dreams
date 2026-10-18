@@ -1,0 +1,13 @@
+import std.console;
+import std.list;
+
+// A queue as a list grown at the end, as breadth-first code writes one: each
+// `+` copies the queue. The supercompiler keeps what is added beside it and
+// turns it around when the front runs out.
+let bfs : [:integer] -> :integer -> :integer -> :integer;
+let rec bfs q !seen limit = match q {
+    [] => seen,
+    [x, ..rest] => if x >= limit { bfs rest (seen + 1) limit } else { bfs (rest + [2 * x + 1, 2 * x + 2]) (seen + 1) limit },
+};
+
+let main! () = console.print! (to_string (bfs [0] 0 6000));

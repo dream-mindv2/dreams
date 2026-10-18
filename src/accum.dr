@@ -24,6 +24,15 @@
 //   runs. The list is still built, so anything else that reads it reads what
 //   it always did.
 //
+// - **A count of a list that does not change**, `count x xs` for each `x`
+//   of a loop over something else, `xs` handed on as it was: a scan each.
+//   The list is counted once, every value at a time, into a map (`_tally`),
+//   and each count is a lookup (`tallied`).
+// - **A queue grown at the end**, `go (rest + [x, y])` with the head taken
+//   off each step: each `+` copies the queue. What is added is kept newest
+//   first beside it and turned around once when the front runs out, the
+//   queue of two lists (`queue`).
+//
 // And one that is worse than quadratic: **tree recursion**, `fib (n - 1) +
 // fib (n - 2)`, the same smaller calls made again under each call. Its
 // values are kept in a lazy table, one cell for each, so each is made once
@@ -53,8 +62,10 @@ mapping Program {
     // The builtins it writes, by name, and `std.list.contains`'s global.
     ids
     contains
-    // `std.list.append`'s global, which is `+` by another name.
+    // `std.list.append`'s global, which is `+` by another name, and
+    // `std.list.last`'s.
     append
+    last
     // Where the small integers are in the image's pool: a count written as a
     // constant names its pool entry, not its value.
     small_ints
@@ -64,6 +75,11 @@ mapping Program {
     scans
     // The image's integer pool, to read a constant a term names.
     ints
+    // Each function that counts the occurrences of a value in a list -- the
+    // scan `std`'s fusion writes for `length (filter (== x) xs)`, or a
+    // function that starts one at nothing -- as `[list, value, count]`, its
+    // parameters' positions, the count `-1` when it starts at nothing.
+    tallies
 }
 
 /// The image with its slow accumulators written again.
@@ -79,16 +95,27 @@ let accum img0 = {
     let id name = match builtins.id name { () => -1, i => i };
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
-                         "_memo_cells"];
+                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
-                         (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append") small %{}
-                         (array.of_list (ir.Image.ints img));
+                         (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
+                         (global_named img strs "std.list" "last") small %{}
+                         (array.of_list (ir.Image.ints img)) %{};
     let ints = Program.ints p;
     let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
         () => m,
         shape => m.[gi => shape],
     }) %{} (list.filter (fn [_, g] -> g.[:kind else -1] == ir.global_function) (list.enumerate (ir.Image.globals img)));
     let p = Program.set_scans scans p;
+    let functions = list.filter (fn [_, g] -> g.[:kind else -1] == ir.global_function) (list.enumerate (ir.Image.globals img));
+    let counting = list.fold (fn m [gi, g] -> match tally_shape p ints g.[:target else -1] gi {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions;
+    let counting = list.fold (fn m [gi, g] -> match tally_start p ints counting g.[:target else -1] {
+        () => m,
+        shape => m.[gi => shape],
+    }) counting functions;
+    let p = Program.set_tallies counting p;
     let n_funcs = array.length (Program.funcs p);
     let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
         match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
@@ -188,7 +215,7 @@ let rewritten p fi wfi wgi = {
         let body = sc.body_of (Program.reading p) f;
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
-                  fn () -> memo_table site]
+                  fn () -> tallied site, fn () -> queue site, fn () -> memo_table site]
     }
 };
 
@@ -335,6 +362,9 @@ let call gi args = Term.prim :apply 0 ir.no_node ir.no_node ir.no_node
 let self_args : Term -> [Term];
 let self_args t = match t { Term.prim(:apply, _, _, _, _, [_, ..args]) => args, _ => [] };
 
+let op_and : Term -> Term -> Term;
+let op_and x y = Term.prim :and 0 ir.no_node ir.no_node ir.no_node [x, y];
+
 let nil : Term;
 let nil = Term.prim :make_list 0 ir.no_node 0 ir.no_node [];
 
@@ -399,6 +429,15 @@ let grown_at site j = {
     }) %{} (Site.body site));
     let counted = reads "acc_count" measured;
     let body = if counted { measured } else { Site.body site };
+    // `list.last acc` the same way, as the last element carried beside it --
+    // which a piece says only when it is written out, `acc + [x]`.
+    let lasted = list.head (hoist.rewrite (fn x -> match x {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), Term.var(n, _)]) if g == Program.last p && g >= 0 && n == acc =>
+            Term.var "acc_last" 0,
+        _ => (),
+    }) %{} body);
+    let last_read = reads "acc_last" lasted;
+    let body = if last_read { lasted } else { body };
     let ls = leaves body;
     let self_calls = list.filter (fn l -> hoist.self_call gi l) ls;
     // Each call of itself passes `acc` on, or `acc` with pieces added.
@@ -418,7 +457,7 @@ let grown_at site j = {
     && list.all (fn x -> not (reads acc x) && not (names gi x)) (around body)
     && list.all (fn l -> hoist.self_call gi l || not (names gi l)) ls;
     let growths = list.filter (fn g -> g != ()) (list.map (fn l -> growth (list.nth j (self_args l))) self_calls);
-    if not fits || list.is_empty growths { () }
+    if not fits || list.is_empty growths || (last_read && list.any (fn g -> last_of g == ()) growths) { () }
     else {
         match agreed p growths {
             () => (),
@@ -442,19 +481,34 @@ let grown_at site j = {
                         pieces => [list.fold (fn n piece -> Term.prim :add 0 ir.no_node ir.no_node ir.no_node [n, piece_length p piece])
                                              (Term.var "acc_count" 0) pieces],
                     };
-                    call (Site.wgi site) (list.concat [passed, [kept], if counted { count } else { [] }])
+                    let last = match growth arg {
+                        () => [Term.var "acc_last" 0],
+                        pieces => [match last_of pieces { () => Term.var "acc_last" 0, [] => Term.var "acc_last" 0, [x] => x }],
+                    };
+                    call (Site.wgi site) (list.concat [passed, [kept], if counted { count } else { [] }, if last_read { last } else { [] }])
                 } else if reads acc l {
                     // Where the loop ends, `acc` is what it was: put in order once.
                     Term.block 0 [Stmt.bind "acc_whole" 0 in_order,
                                   Stmt.expr (list.head (hoist.rewrite (fn x -> if is_var acc x { Term.var "acc_whole" 0 } else { () }) %{} l))]
                 } else { l };
-                let news = list.append [[r, true, nil]]
-                                       (if counted { [["acc_count", false, builtin p "len" [Term.var acc 0]]] } else { [] });
+                let news = list.concat [[[r, true, nil]],
+                                        if counted { [["acc_count", false, builtin p "len" [Term.var acc 0]]] } else { [] },
+                                        if last_read { [["acc_last", false, call (Program.last p) [Term.var acc 0]]] } else { [] }];
                 built_with site news [] (map_leaves leaf body)
             },
         }
     }
 };
+
+/// The last element pieces added in order end with, when each is written
+/// out: `[x]` when one of them is not empty, `[]` when none adds anything,
+/// `()` when a piece that is not written out leaves it unknown.
+let last_of : [Term] | :unit -> [Term] | :unit;
+let last_of pieces = if pieces == () { () } else { list.fold (fn known piece -> match piece {
+    Term.prim(:make_list, _, _, _, _, []) => known,
+    Term.prim(:make_list, _, _, _, _, xs) if known != () => [list.last xs],
+    _ => (),
+}) [] pieces };
 
 /// How many elements a piece adds: a literal's own count, else its length.
 let piece_length : Program -> Term -> Term;
@@ -811,4 +865,270 @@ let memo_built site dims m place = {
                                Stmt.expr (read (Term.var "memo_table" 0) at at)];
     let wrapper = sc.fun_of f (place (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [op :and fits (op :le cells limit), tabled, m]));
     [wrapper, cell, ()]
+};
+
+// --- a queue grown at the end ---------------------------------------------------------
+
+/// `go (rest + [x, y])`, where `rest` is what is left of parameter `j` with
+/// its head taken off: a queue, as breadth-first code writes one. What each
+/// step adds is kept beside it newest first (`queue_back`), and the queue is
+/// what was left followed by that, turned around. The worker turns it around
+/// when what was left runs out -- each element is turned around once -- and
+/// otherwise takes the head off what was left, as written.
+///
+/// It is exact only while the queue is read as nothing but a queue: tested
+/// for a cell, its head and its rest taken, and handed on as it was, as its
+/// rest, or as its rest with pieces written out added; or not handed on, and
+/// something new handed on instead. The pieces must be written out so that
+/// turning them around forces no more than reading the queue would.
+let queue : Site -> [Fun, Fun, :map] | :unit;
+let queue site = first_of (list.map (fn j -> fn () -> queue_at site j) (list.range 0 (Site.k site)));
+
+/// Whether the body forces `q` before it does anything else, past the reads
+/// of strict parameters, which force nothing but themselves.
+let queue_first : :string -> Term -> :bool;
+let rec queue_first q t = match t {
+    Term.block(_, ss) => match list.drop_while (fn st -> match st {
+        Stmt.expr(Term.var(m, fl)) => m != q && ir.has_flag fl ir.f_strict,
+        _ => false,
+    }) ss {
+        [Stmt.bind(_, fl, Term.var(m, _)), .._] => m == q && ir.has_flag fl ir.f_strict,
+        [Stmt.expr(Term.var(m, fl)), .._] => m == q && ir.has_flag fl ir.f_strict,
+        [Stmt.expr(inner)] => queue_first q inner,
+        _ => false,
+    },
+    _ => false,
+};
+
+let queue_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let queue_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let q = sc.slot_name j;
+    let body = Site.body site;
+    let [terms, stmts] = hoist.parts body;
+    let ids = Program.ids p;
+    // The names the queue is read by: the parameter and what is bound to it,
+    // and the names its rest is bound to.
+    let aliases = list.cons q (list.concat (list.map (fn s -> match s {
+        Stmt.bind(n, _, Term.var(m, _)) if m == q => [n],
+        _ => [],
+    }) stmts));
+    let is_alias t = match t { Term.var(n, _) => list.contains n aliases, _ => false };
+    let rests = list.concat (list.map (fn s -> match s {
+        Stmt.bind(n, _, Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x])) if b == ids.["_match_tail"] && is_alias x => [n],
+        Stmt.bind(n, _, Term.prim(:list_tail, _, _, _, _, [x])) if is_alias x => [n],
+        _ => [],
+    }) stmts);
+    let is_rest t = match t { Term.var(n, _) => list.contains n rests, _ => false };
+    let queued t = is_alias t || is_rest t;
+    // How a call of itself hands the queue on: `[rest, pieces]`, `[rest]`,
+    // `[:same]`, `[:new]`, or `()` when the queue is read some other way.
+    let handed arg = match addends p arg {
+        [base, []] if is_rest base => [base],
+        [base, []] if is_alias base => [:same],
+        [base, pieces] if is_rest base && literal_pieces pieces => [base, pieces],
+        _ => if list.any (fn n -> reads n arg) (list.append aliases rests) { () } else { [:new] },
+    };
+    let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
+    let hands = list.map (fn c -> handed (list.nth j (self_args c))) self_calls;
+    // Every other read of the queue is as a queue.
+    let read_as_queue = list.all (fn t -> match t {
+        Term.lam(_, _, _, caps) => not (list.any (fn n -> list.contains n caps) (list.append aliases rests)),
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x])
+            if is_alias x && (b == ids.["_match_is_cons"] || b == ids.["_match_head"] || b == ids.["_match_tail"]) => true,
+        Term.prim(op, _, _, _, _, [x]) if is_alias x && (op == :type_is || op == :list_is_empty || op == :list_tail) => true,
+        Term.prim(:get, _, _, _, _, [x, Term.prim(:const_int, _, i, _, _, _), Term.absent]) if is_alias x && (Program.ints p).[i] == 0 => true,
+        // A `match` that fails names what it was handed. It fails only on
+        // what is not a list, which the queue never is while anything is
+        // kept beside it, and otherwise the front is the queue.
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x, ..rest])
+            if b == ids.["_match_fail"] && is_alias x => not (list.any queued rest),
+        _ if hoist.self_call gi t => list.all (fn [i, x] -> i == j || not (queued x)) (list.enumerate (self_args t)),
+        // `rest + pieces` handed on is read by the call it is handed to.
+        Term.prim(:add, _, _, _, _, [x, _]) if is_rest x => true,
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), x, _]) if g == Program.append p && is_rest x => true,
+        Term.prim(_, _, _, _, _, cs) => not (list.any queued cs),
+        Term.trying(_, x, _, h) => not (queued x || queued h),
+        _ => true,
+    }) terms && list.all (fn s -> match s {
+        Stmt.bind(n, _, x) if queued x => list.contains n aliases,
+        Stmt.expr(Term.var(_, fl)) if ir.has_flag fl ir.f_strict => true,
+        Stmt.expr(x) => not (queued x) || is_alias x,
+        _ => true,
+    }) stmts;
+    // The queue is forced before anything else is done, as `match` does.
+    let forced_first = queue_first q body;
+    let grows = list.any (fn h -> match h { [_, _] => true, _ => false }) hands;
+    if not forced_first || not read_as_queue || not grows || list.any (fn h -> h == ()) hands { () }
+    else {
+        // What is kept beside the queue past the turn: nothing, once it has
+        // become the front.
+        let back = Term.var "queue_kept" 0;
+        let front = Term.var "queue_front" 0;
+        let onto pieces = list.fold (fn rest piece -> match piece {
+            Term.prim(:make_list, _, _, _, _, xs) => list.fold (fn rr x -> Term.prim :cons 0 ir.no_node ir.no_node ir.no_node [x, rr]) rest xs,
+            _ => rest,
+        }) back pieces;
+        let passed c = {
+            let args = self_args c;
+            let [arg_q, arg_back] = match handed (list.nth j args) {
+                [:same] => [front, back],
+                [:new] => [list.nth j args, nil],
+                [r] => [r, back],
+                [r, pieces] => [r, onto pieces],
+            };
+            call (Site.wgi site) (list.append (list.map (fn [i, x] -> if i == j { arg_q } else { x }) (list.enumerate args)) [arg_back])
+        };
+        let renamed = list.head (hoist.rewrite (fn t -> match t {
+            Term.var(n, fl) if n == q => Term.var "queue_front" fl,
+            _ if hoist.self_call gi t => passed t,
+            _ => (),
+        }) %{} body);
+        let empty x = Term.prim :list_is_empty 0 ir.no_node ir.no_node ir.no_node [x];
+        let cond c y z = Term.prim :if 0 ir.no_node ir.no_node ir.no_node [c, y, z];
+        // What was left, unless it ran out and something was added: then
+        // what was added, turned around.
+        let came = Term.var "queue_back" 0;
+        let turns = op_and (Term.prim :not 0 ir.no_node ir.no_node ir.no_node [empty came]) (empty (Term.var q 0));
+        built site "queue_back" true
+              (Term.block 0 [Stmt.bind "queue_turns" ir.f_strict turns,
+                             Stmt.bind "queue_front" ir.f_strict
+                                 (cond (Term.var "queue_turns" 0) (builtin p "_append_rev" [nil, came]) (Term.var q 0)),
+                             Stmt.bind "queue_kept" ir.f_strict (cond (Term.var "queue_turns" 0) nil came),
+                             Stmt.expr renamed]) nil
+    }
+};
+
+// --- counting a list that does not change -----------------------------------------------
+
+/// Whether function `fi`, called through global `gi`, counts a value in a
+/// list: `if empty xs { n } else if xs.[0] == x { self (tail xs) .. (n + 1) .. x }
+/// else { self (tail xs) .. n .. x }`, everything else handed on as it was.
+/// `[list, value, count]`, its parameters' positions, or `()`.
+let tally_shape : Program -> #[:integer] -> :integer -> :integer -> [:integer, :integer, :integer] | :unit;
+let tally_shape p ints fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let k = f.[:arity else 0];
+        let position n = list.find_index (fn j -> sc.slot_name j == n) (list.range 0 k);
+        let head_of l t = match t {
+            Term.prim(:get, _, _, _, _, [Term.var(n, _), Term.prim(:const_int, _, i, _, _, _), Term.absent]) => n == l && ints.[i] == 0,
+            _ => false,
+        };
+        // Past a strict read of the count, which is how a strict count is kept.
+        let past_force t = match unwrap t {
+            Term.block(_, [Stmt.expr(Term.prim(:force, _, _, _, _, [Term.var(_, _)])), Stmt.expr(e)]) => unwrap e,
+            Term.block(_, [Stmt.expr(Term.var(_, fl)), Stmt.expr(e)]) if ir.has_flag fl ir.f_strict => unwrap e,
+            u => u,
+        };
+        match unwrap (sc.body_of (Program.reading p) f) {
+            Term.prim(:if, _, _, _, _, [Term.prim(:list_is_empty, _, _, _, _, [Term.var(l, _)]), Term.var(n, _), rest]) => match past_force rest {
+                Term.prim(:if, _, _, _, _, [Term.prim(:eq, _, _, _, _, [a, b]), found, missed]) => {
+                    let x = match [a, b] {
+                        [y, Term.var(m, _)] if head_of l y => m,
+                        [Term.var(m, _), y] if head_of l y => m,
+                        _ => (),
+                    };
+                    let [li, xi, ni] = [position l, position x, position n];
+                    // The step: the rest of the list, the count one more or
+                    // the same, everything else as it was.
+                    let step t more = match unwrap t {
+                        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) if g == gi && list.length args == k =>
+                            list.all (fn [j, arg] -> if j == li { match arg {
+                                Term.prim(:list_tail, _, _, _, _, [Term.var(m, _)]) => m == l,
+                                _ => false,
+                            } } else if j == ni { if more { match arg {
+                                Term.prim(:add, _, _, _, _, [Term.var(m, _), Term.prim(:const_int, _, i, _, _, _)]) => m == n && ints.[i] == 1,
+                                _ => false,
+                            } } else { is_var n arg } } else { is_var (sc.slot_name j) arg }) (list.enumerate args),
+                        _ => false,
+                    };
+                    if x != () && li >= 0 && xi >= 0 && ni >= 0 && step found true && step missed false { [li, xi, ni] } else { () }
+                },
+                _ => (),
+            },
+            _ => (),
+        }
+    };
+
+/// Whether function `fi` starts a count at nothing: its body a call of a
+/// counting function, handing it two of its parameters as the list and the
+/// value, zero as the count, and constants for the rest.
+let tally_start : Program -> #[:integer] -> :map -> :integer -> [:integer, :integer, :integer] | :unit;
+let tally_start p ints counting fi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let k = f.[:arity else 0];
+        let position t = match t {
+            Term.var(n, _) => list.find_index (fn j -> sc.slot_name j == n) (list.range 0 k),
+            _ => -1,
+        };
+        match unwrap (sc.body_of (Program.reading p) f) {
+            Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match counting.[g else ()] {
+                [li, xi, ni] => {
+                    let [l, x] = [position (list.nth li args), position (list.nth xi args)];
+                    let zero = match list.nth ni args { Term.prim(:const_int, _, i, _, _, _) => ints.[i] == 0, _ => false };
+                    let rest_constant = list.all (fn [j, arg] -> j == li || j == xi || j == ni || match arg {
+                        Term.prim(_, _, _, _, _, []) => true,
+                        _ => false,
+                    }) (list.enumerate args);
+                    if l >= 0 && x >= 0 && zero && rest_constant && f.[:n_captures else 0] == 0 { [l, x, -1] } else { () }
+                },
+                _ => (),
+            },
+            _ => (),
+        }
+    };
+
+/// A loop that counts values in parameter `j`, a list it hands on as it
+/// was: the list's tally carried beside it, made the first time a count
+/// needs it, and each count a lookup in it -- or the count as written, when
+/// the tally cannot say.
+let tallied : Site -> [Fun, Fun, :map] | :unit;
+let tallied site =
+    if map.size (Program.tallies (Site.program site)) == 0 { () }
+    else {
+        let p = Site.program site;
+        match hoist.statics p (Site.gi site) (Site.k site) (hoist.parts (Site.body site)) {
+            () => (),
+            statics => first_of (list.map (fn j -> fn () -> tallied_at site j) statics),
+        }
+    };
+
+let tallied_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let tallied_at site j = {
+    let p = Site.program site;
+    let xs = sc.slot_name j;
+    let counted t = match t {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match (Program.tallies p).[g else ()] {
+            [li, xi, ni] if is_var xs (list.nth li args) => [list.nth xi args, if ni < 0 { () } else { list.nth ni args }],
+            _ => (),
+        },
+        _ => (),
+    };
+    let [terms, _] = hoist.parts (Site.body site);
+    if not (list.any (fn t -> counted t != ()) terms) { () }
+    else {
+        let tally = Term.var "tally_of" 0;
+        let rewritten_body = list.head (hoist.rewrite (fn t ->
+            if hoist.self_call (Site.gi site) t { call (Site.wgi site) (list.append (self_args t) [tally]) }
+            else {
+                match counted t {
+                    () => (),
+                    [x, from] => {
+                        let says = Term.var "tally_says" 0;
+                        let found = match from { () => says, n => Term.prim :add 0 ir.no_node ir.no_node ir.no_node [n, says] };
+                        Term.block (drive.flags_of t) [
+                            Stmt.bind "tally_says" ir.f_strict (builtin p "_tally_lookup" [tally, Term.var xs 0, x]),
+                            Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node
+                                [Term.prim :eq 0 ir.no_node ir.no_node ir.no_node [says, Term.prim :unit 0 ir.no_node ir.no_node ir.no_node []],
+                                 t, found])]
+                    },
+                }
+            }) %{} (Site.body site));
+        built site "tally_of" false rewritten_body (builtin p "_tally" [Term.var xs 0])
+    }
 };

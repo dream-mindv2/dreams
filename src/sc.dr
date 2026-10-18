@@ -636,10 +636,17 @@ let patch img rd changed added globals = {
             let new_kids = list.map (fn i -> (ir.kids p).[i]) (list.range (array.length kids) (ir.kid_count p));
             let funcs_out = list.append (list.map record (list.range 0 (n_funcs + list.length added)))
                                         (list.map (fn c -> list.nth 1 c) (list.reverse clones_rev));
-            Result.ok (img |> ir.Image.set_nodes (list.append (ir.Image.nodes img) new_nodes)
-                           |> ir.Image.set_kids (list.append (ir.Image.kids img) new_kids)
-                           |> ir.Image.set_funcs funcs_out
-                           |> ir.Image.set_globals (list.append (ir.Image.globals img) globals))
+            let out = img |> ir.Image.set_nodes (list.append (ir.Image.nodes img) new_nodes)
+                          |> ir.Image.set_kids (list.append (ir.Image.kids img) new_kids)
+                          |> ir.Image.set_funcs funcs_out
+                          |> ir.Image.set_globals (list.append (ir.Image.globals img) globals);
+            // Settled before it is handed on: unsettled, what is written is
+            // a suspension of this patch, and that holds the emitter and the
+            // reading of the whole arena -- each pass's, with five passes
+            // chained, which put a self-compile past a process's heap.
+            if lazy.settled (ir.Image.nodes out) && lazy.settled (ir.Image.kids out)
+               && lazy.settled (ir.Image.funcs out) && lazy.settled (ir.Image.globals out) { Result.ok out }
+            else { Result.ok out }
         },
         ps => Result.error (list.reverse ps),
     }

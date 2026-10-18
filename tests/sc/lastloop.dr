@@ -1,0 +1,13 @@
+import std.console;
+import std.list;
+
+// A list grown at the end whose last element is read on every step: the
+// copy and the walk to the end are each a pass. The last element is carried
+// beside the list instead.
+let grow : :integer -> [:integer] -> :integer -> [:integer];
+let rec grow i acc n = if i == n { acc } else {
+    let top = list.last acc;
+    grow (i + 1) (acc + [if (i * 37) % 101 > top % 101 { i } else { top }]) n
+};
+
+let main! () = console.print! (to_string (list.last (grow 1 [0] 8000)));

@@ -323,3 +323,34 @@ thunk of its body, which is what a top-level value already is
 cells, 34 reductions each, and a cell is a thunk of a function body, which
 the interpreter runs and the JIT does not take. `tests/sc/memo` went from 35
 to 7 ms, the builder having been most of a small table's cost.
+
+## Milestone 2, step 6: naive programs, timed at n and 2n (2026-10-18)
+
+A corpus of programs written the way someone new writes them, each run as
+written and supercompiled at n and 2n, is what finds the next shape: a
+quadratic shows itself as four times the time for twice the input, and the
+outputs must agree. What it found, and what each became:
+
+| program | as written, n → 2n | supercompiled | what changed |
+|---|---|---|---|
+| `paths`: `match [r, c]` with `paths (r - 1) c + paths r (c - 1)` | 42 ms → timeout | 9 ms | the driver reads the tail of a list written out (`[r, c]`), so the match is `r == 0`, `c == 0`, and the table for tree recursion applies |
+| `lastloop`: `list.last acc` every step of `acc + [x]` | 1,995 → 5,814 ms | 22 → 23 ms | the last element carried beside the accumulator, as its count is |
+| `queue`: `bfs (rest + [a, b])` | 185 → 741 ms | 37 → 36 ms | the queue of two lists: what is added kept newest first, turned around when the front runs out (`queue`) |
+| `countdup`: `filter (fn x -> count x xs == 1) xs` | 110 → 319 ms | 24 → 24 ms | the list counted once into a map (`_tally`), each count a lookup (`tallied`) |
+| `nth`: `list.nth i xs` in an index loop | 54 → 183 ms | 24 → 25 ms | already: `hoist` reads the list as an array |
+| `wordfreq`: counts in an association list | 3,719 ms → timeout | the same | not yet: an association list wants to be a map |
+
+Each is exact in the way the others are. The queue is turned around only
+when the program would read past what was left, and only pieces written out
+are kept, so turning them forces nothing; a tally answers only for values a
+map holds exactly as `==` compares them, and forces the list's first cell,
+its head and the value before the rest, in the scan's order.
+
+A trap on the way: compiling the compiler with `--supercompile` failed one
+time in three, past the 1 GB process heap. Each pass handed on an image whose
+new nodes were suspensions of its patch, holding the pass's emitter and its
+reading of the whole arena (`sc.patch` now settles what it returns); and the
+image's bytes were first forced inside the write, so emitting ran inside a
+native's force. With both, 1.08 GB live at the largest collection went to
+0.85 GB and eight builds in a row passed. That margin is thin; the
+supercompiler's own live set is next.

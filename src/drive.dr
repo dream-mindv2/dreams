@@ -383,6 +383,7 @@ let decide v cx t = match t {
     },
     Term.prim(:list_tail, _, _, _, _, [x]) => match known v cx x {
         Term.prim(:cons, _, _, _, _, [_, rest]) => rest,
+        Term.prim(:make_list, fl, a, b, c, [_, ..rest]) => Term.prim :make_list fl a b c rest,
         _ => (),
     },
     _ => (),
@@ -412,8 +413,11 @@ let decide_builtin v cx id args = match args {
         Term.prim(:cons, _, _, _, _, [first, _]) => first,
         _ => (),
     },
+    // The rest of a list written out is the rest written out: `match [r, c]`
+    // reads `c` as the head of the tail, and only this makes it `c`.
     [x] if id == View.tail v => match known v cx x {
         Term.prim(:cons, _, _, _, _, [_, rest]) => rest,
+        Term.prim(:make_list, fl, a, b, c, [_, ..rest]) => Term.prim :make_list fl a b c rest,
         _ => (),
     },
     _ => (),

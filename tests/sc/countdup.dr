@@ -1,0 +1,15 @@
+import std.console;
+import std.list;
+
+// The elements that occur once, each counted by a scan of the whole list.
+// The list is counted once instead, every value at a time, into a map.
+let count : :integer -> [:integer] -> :integer;
+let count x xs = list.length (list.filter (fn y -> y == x) xs);
+
+let main! () = {
+    let xs = list.map (fn i -> (i * 7) % 4001) (list.range 0 8000);
+    console.print! (to_string (list.length (list.filter (fn x -> count x xs == 1) xs)))
+    // A list of things a map cannot hold counts as written.
+    let ys = [[1], [2], [1]];
+    console.print! (to_string (list.filter (fn y -> list.length (list.filter (fn z -> z == y) ys) == 2) ys))
+};

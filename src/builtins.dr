@@ -128,6 +128,8 @@ let names = [
     "_set_lookup",
     "_set_refresh",
     "_memo_cells",
+    "_tally",
+    "_tally_lookup",
 
 ];
 
@@ -238,6 +240,8 @@ let signatures = %{
     "_set_lookup" => "set -> value -> whether it is a member, or () when the set cannot say",
     "_set_refresh" => "set -> list -> the set, built again from the list when it has been evaluated since",
     "_memo_cells" => "integer -> function -> an array of that many cells, cell i the call of the function on i, suspended",
+    "_tally" => "list -> each element to how often it occurs, or () when one cannot be counted by hashing",
+    "_tally_lookup" => "tally -> list -> value -> how often the value occurs in the list, or () when the tally cannot say",
 
 };
 

@@ -419,6 +419,12 @@ let build! l out shebang depfile specs said stats kept o = {
                                 () => emit.to_binary img,
                                 line => line + "\n" + emit.to_binary img,
                             };
+                // Made here, where a collection can run. Left to the write,
+                // the whole of emitting ran inside a native's force of its
+                // argument, which nothing can collect under, so the process
+                // was held to everything it had allocated rather than to what
+                // was live: a supercompiled self-compile went past the cap.
+                strict! bytes
                 match try! { io.open! out :write } catch e { () } {
                     () => {
                         console.error! ("dreams: cannot write " + out)

@@ -1,0 +1,13 @@
+import std.console;
+
+// Grid paths with the base cases as patterns: `match [r, c]` builds the
+// list it matches, which the driver reads as `r` and `c` before the table
+// for the tree recursion is made.
+let paths : :integer -> :integer -> :integer;
+let rec paths r c = match [r, c] {
+    [0, _] => 1,
+    [_, 0] => 1,
+    _ => paths (r - 1) c + paths r (c - 1),
+};
+
+let main! () = console.print! (to_string (paths 12 12));
