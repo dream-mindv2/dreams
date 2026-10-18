@@ -209,3 +209,27 @@ What it took:
   slower and allocate 15% more, none of it in any function's profile: a
   process the build spawns copies the frame of what it is handed, and a body
   written out into an impure function that spawns makes that frame larger.
+
+## Milestone 2, step 3: loop invariants and the data structure (2026-10-17)
+
+Before the driver, `--supercompile` hoists (`dreams/src/hoist.dr`). A
+self-recursive function that passes a parameter on unchanged at every call of
+itself has a *static* parameter, and anything pure it computes from static
+parameters alone is computed once, in a wrapper, bound lazily there and
+handed to a worker as a parameter -- the same value, shared, done when it was
+first needed. The same reasoning picks the data structure: a static list
+the loop only indexes and measures, and measures first (the test of its first
+`if`), is read into an array once by `_indexed` -- a builtin no program
+writes, which answers anything not a list as it was -- and every `.[i]` and
+`len` reads the array. The spine was forced by that first `len` anyway, so
+nothing is evaluated that was not.
+
+`tests/sc/indexed.dr`, a loop over positions reading a list: 491 ms as
+written, 26 ms hoisted; doubling `n` quadruples the first and leaves the
+second where it was (n = 12000: 7.7 s against 31 ms). `tests/sc/results.dr`
+lost 99% of its reductions to the same pass: the loop that repeats a
+computation of a static argument computes it once.
+
+A builtin that walks a list is one reduction however long the list, so
+the indexed loop runs *more* reductions once it is linear, each constant
+time; that test is held to the clock instead (`indexed.ratio`).

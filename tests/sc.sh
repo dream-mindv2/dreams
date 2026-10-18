@@ -55,25 +55,33 @@ done
 # same. Each is held to its recorded output, and to a fraction of the
 # reductions it runs as written -- half, or what its `.ratio` says as `N D`
 # -- counted with the JIT off, where the count is the same from run to run.
+# A `.ratio` of `N D time` holds it to wall time instead: a builtin that walks
+# a list is one reduction however long the list, so a loop made linear by
+# reading the list as an array (tests/sc/indexed.dr) runs more reductions,
+# each of them constant time, and only the clock sees it.
 # With the JIT on the gain is larger, since what is left is a loop the JIT
 # takes, but that count moves with when the JIT gets to it.
 reductions() { "$dream" --no-jit --stats "$1" 2>&1 >/dev/null | sed -n 's/^; \([0-9]*\) reductions.*/\1/p'; }
+millis() { local s; s=$(date +%s%N); "$dream" "$1" >/dev/null 2>&1; echo $(( ($(date +%s%N) - s) / 1000000 )); }
 for src in dreams/tests/sc/*.dr; do
     name=$(basename "$src" .dr)
     expected="${src%.dr}.expected"
     if "$dream" "$image" -L mind -o "$tmp/plain.dream" "$src" >"$tmp/b1" 2>&1 &&
        "$dream" "$image" --supercompile -L mind -o "$tmp/sc.dream" "$src" >"$tmp/b2" 2>&1 &&
        "$dream" "$tmp/sc.dream" >"$tmp/run" 2>&1 && diff -q "$expected" "$tmp/run" >/dev/null; then
-        plain=$(reductions "$tmp/plain.dream")
-        driven=$(reductions "$tmp/sc.dream")
-        ratio="1 2"
+        ratio="1 2 reductions"
         [ -f "${src%.dr}.ratio" ] && ratio=$(cat "${src%.dr}.ratio")
-        set -- $ratio
+        set -- $ratio reductions
+        if [ "$3" = time ]; then
+            plain=$(millis "$tmp/plain.dream"); driven=$(millis "$tmp/sc.dream"); unit="ms"
+        else
+            plain=$(reductions "$tmp/plain.dream"); driven=$(reductions "$tmp/sc.dream"); unit="reductions"
+        fi
         if [ "$((driven * $2))" -le "$((plain * $1))" ]; then
-            echo "ok   $name: $plain -> $driven reductions"
+            echo "ok   $name: $plain -> $driven $unit"
             pass=$((pass + 1))
         else
-            echo "FAIL $name: $plain -> $driven reductions, more than $1/$2"
+            echo "FAIL $name: $plain -> $driven $unit, more than $1/$2"
             fail=$((fail + 1))
         fi
     else

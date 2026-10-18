@@ -1,0 +1,14 @@
+// A loop over positions that reads a list it is handed by position and
+// measures it in its test: quadratic as written, since `len` and `.[i]` each
+// walk the list. The supercompiler reads the list into an array once, before
+// the loop, and computes its length once (dreams/src/hoist.dr).
+import std.console;
+import std.list;
+
+let rec count_big !i !acc xs =
+    if i >= len xs { acc }
+    else { count_big (i + 1) (if xs.[i] > 500 { acc + 1 } else { acc }) xs };
+
+let rec repeat !k !total xs = if k == 0 { total } else { repeat (k - 1) (total + count_big 0 0 xs) xs };
+
+let main! = console.print! (to_string (repeat 20 0 (list.range 0 3000)));

@@ -36,6 +36,7 @@ import dreams.modules;
 import dreams.package;
 import dreams.opt as optimizer;
 import dreams.drive;
+import dreams.hoist;
 import dreams.sc;
 import dreams.scope;
 import dreams.typecheck;
@@ -519,7 +520,10 @@ let finished b = match Options.supercompile (Build.options b) {
     :roundtrip => Result.map (fn img -> finish b img) (sc.roundtrip (shared_image b)),
     // The driver reads the shared arena and writes only what it changed,
     // after it (`sc.patch`), so there is nothing to unshare or share again.
-    :drive => Result.map (fn img -> finish b img) (drive.supercompile (shared_image b)),
+    // Loop invariants are hoisted out first (`dreams/src/hoist.dr`), so that
+    // what the driver specialises is the loop that no longer recomputes them.
+    :drive => Result.map (fn img -> finish b img)
+                         (Result.and_then drive.supercompile (hoist.hoist (shared_image b))),
     _ => Result.ok (finish b (shared_image b)),
 };
 

@@ -1,0 +1,397 @@
+// Loop invariants, and the data structure they are read through: the pass
+// `--supercompile` runs before the driver. See "Milestone 2, step 3" in
+// docs/notes/supercompilation.md.
+//
+// A self-recursive function that hands a parameter on unchanged at every
+// call of itself has a *static* parameter, and whatever it computes from
+// static parameters alone it computes again at every step: `len xs` in the
+// test of a loop over `i` is a walk of `xs` per step, and the loop is
+// quadratic for a reason that is not in what it does. Such a computation is
+// moved into a wrapper, bound lazily there, and handed to the loop -- now a
+// worker with a parameter more -- so it is done once, when it is first
+// needed, which is when it was done before. Pure and lazy, it means what it
+// meant; the only difference is that it is shared.
+//
+// The same reasoning picks the data structure. A static parameter that the
+// loop only indexes (`xs.[i]`) and measures (`len xs`) is read by position,
+// and a list read by position is a walk per read: the loop over `i` is
+// quadratic again. When the loop measures it before anything else -- the
+// test of its first `if` -- its whole spine is forced first anyway, so
+// reading it into an array changes nothing about what is evaluated, and the
+// wrapper does that once (`_indexed`, which answers anything that is not a
+// list as it was: what is not known to be a list keeps what it was written
+// as). Every read is then constant time.
+
+import std.array;
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.builtins;
+import dreams.drive;
+import dreams.ir;
+import dreams.sc;
+import dreams.sc.{Term, Stmt, Fun};
+
+/// What the pass reads of the program.
+mapping Program {
+    reading
+    funcs
+    globals
+    // The global through which each function is called, by function.
+    global_of
+    len_id
+    indexed_id
+}
+
+/// The image with its loop invariants hoisted out of the loops that compute
+/// them, and the static lists those loops index read as arrays.
+let hoist : ir.Image -> Result;
+let hoist img = {
+    let rd = sc.read img;
+    let globals = array.of_list (ir.Image.globals img);
+    let global_of = list.fold (fn m [gi, g] ->
+        if g.[:kind else -1] == ir.global_function && not (map.has (g.[:target]) m) { m.[g.[:target] => gi] } else { m })
+        %{} (list.enumerate (ir.Image.globals img));
+    let id name = match builtins.id name { () => -1, i => i };
+    let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of (id "len") (id "_indexed");
+    let n_funcs = array.length (Program.funcs p);
+    let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi -> match hoisted p fi (n_funcs + list.length added)
+                                                                                                   (array.length globals + list.length gs) {
+        [wrapper, worker, global] => [m.[fi => wrapper], list.cons worker added, list.cons global gs],
+        _ => [m, added, gs],
+    }) [%{}, [], []] (list.range 0 n_funcs);
+    if map.size changed == 0 { Result.ok img }
+    else { sc.patch img rd changed (list.reverse added_rev) (list.reverse globals_rev) }
+};
+
+/// Function `fi` with what it can hoist hoisted: the wrapper it becomes, the
+/// worker it calls (function `wfi` through global `wgi`) and that global, or
+/// `()`.
+let hoisted : Program -> :integer -> :integer -> :integer -> [Fun, Fun, :map] | :unit;
+let hoisted p fi wfi wgi = {
+    let f = (Program.funcs p).[fi];
+    let fl = f.[:flags else 0];
+    let k = f.[:arity else 0];
+    let gi = (Program.global_of p).[fi else -1];
+    if gi < 0 || k == 0 || not (ir.has_flag fl ir.fn_rec) || ir.has_flag fl ir.fn_impure
+       || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0 { () }
+    else {
+        let body = sc.body_of (Program.reading p) f;
+        let graph = parts body;
+        match statics p gi k graph {
+            () => (),
+            stat => {
+                let indexed = list.filter (fn j -> indexable p gi body graph j) stat;
+                // Each static list read by position is read as an array, through
+                // a name of its own; then every computation of static names alone
+                // -- the array's length is one -- is a candidate.
+                let arrays = list.map (fn j -> [j, "ix" + to_string j]) indexed;
+                let converted = replace_reads p arrays body;
+                let names = list.concat [list.map sc.slot_name stat, list.map (fn a -> list.nth 1 a) arrays];
+                let invariants = invariants_in p gi names converted;
+                if list.is_empty arrays && list.is_empty invariants { () }
+                else { split p fi wfi wgi gi k arrays invariants converted }
+            },
+        }
+    }
+};
+
+// --- the body as a graph ----------------------------------------------------------
+
+/// Every distinct term in `t`, each once however many parents share it, and
+/// every statement of every block: what the questions below are asked of, a
+/// term at a time, so that none of them walks a shared node twice.
+let parts : Term -> [[Term], [Stmt]];
+let parts t = {
+    let [terms, stmts, _] = gather t [[], [], %{}];
+    [terms, stmts]
+};
+
+let gather : Term -> [[Term], [Stmt], :map] -> [[Term], [Stmt], :map];
+let rec gather t acc = {
+    let [terms, stmts, seen] = acc;
+    if map.has t seen { acc }
+    else {
+        let here = [list.cons t terms, stmts, seen.[t => true]];
+        match t {
+            Term.prim(_, _, _, _, _, cs) => list.fold (fn a x -> gather x a) here cs,
+            Term.block(_, ss) => list.fold (fn a s -> {
+                let [ts, sts, sn] = a;
+                let a2 = [ts, list.cons s sts, sn];
+                match s { Stmt.bind(_, _, x) => gather x a2, Stmt.expr(e) => gather e a2 }
+            }) here ss,
+            Term.trying(_, body, _, h) => gather h (gather body here),
+            _ => here,
+        }
+    }
+};
+
+// --- which parameters are static ---------------------------------------------------
+
+/// The parameters every call of the function by itself passes on as they
+/// were, or `()` when the function is used some other way than called by its
+/// own global (handed on as a value, say), or rebinds a parameter.
+let statics : Program -> :integer -> :integer -> [[Term], [Stmt]] -> [:integer] | :unit;
+let statics p gi k graph = {
+    let [terms, stmts] = graph;
+    let self_calls = list.filter (fn t -> self_call gi t) terms;
+    let escapes = list.any (fn t -> match t {
+        Term.prim(:apply, _, _, _, _, [_, ..args]) => list.any (fn x -> names_global gi x) args,
+        Term.prim(_, _, _, _, _, cs) => list.any (fn x -> names_global gi x) cs,
+        _ => false,
+    }) terms;
+    let rebinds = list.any (fn s -> match s { Stmt.bind(n, _, _) => param_name k n, _ => false }) stmts
+                  || list.any (fn t -> match t { Term.trying(_, _, e, _) => param_name k e, _ => false }) terms;
+    let saturated = list.all (fn t -> match t { Term.prim(_, _, _, _, _, [_, ..args]) => list.length args == k, _ => false }) self_calls;
+    if escapes || rebinds || not saturated || list.is_empty self_calls { () }
+    else {
+        list.filter (fn j -> list.all (fn t -> match t {
+            Term.prim(_, _, _, _, _, [_, ..args]) => match list.nth j args { Term.var(n, _) => n == sc.slot_name j, _ => false },
+            _ => false,
+        }) self_calls) (list.range 0 k)
+    }
+};
+
+let self_call : :integer -> Term -> :bool;
+let self_call gi t = match t {
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), .._]) => g == gi,
+    _ => false,
+};
+
+let names_global : :integer -> Term -> :bool;
+let names_global gi t = match t { Term.prim(:global, _, g, _, _, _) => g == gi, _ => false };
+
+let param_name : :integer -> :string -> :bool;
+let param_name k n = list.any (fn j -> sc.slot_name j == n) (list.range 0 k);
+
+// --- reading a list as an array -----------------------------------------------------
+
+/// Whether static parameter `j` is only indexed and measured, and measured
+/// before anything else is done: the test of the body's first `if`.
+let indexable : Program -> :integer -> Term -> [[Term], [Stmt]] -> :integer -> :bool;
+let indexable p gi body graph j = {
+    let name = sc.slot_name j;
+    only_read_by_position p gi name graph && measures_first p name body
+};
+
+/// Whether every read of `name` is the container of a `get`, the argument of
+/// `len`, or `name` passed on where it was by a call of itself; a strict read
+/// of it as a statement forces the list, which the worker still has.
+let only_read_by_position : Program -> :integer -> :string -> [[Term], [Stmt]] -> :bool;
+let only_read_by_position p gi name graph = {
+    let [terms, stmts] = graph;
+    let is_name x = match x { Term.var(n, _) => n == name, _ => false };
+    let terms_ok = list.all (fn t -> match t {
+        Term.lam(_, _, _, caps) => not (list.contains name caps),
+        Term.prim(:get, _, _, _, _, [_, ..rest]) => not (list.any is_name rest),
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x]) if b == Program.len_id p => true,
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) if g == gi =>
+            list.all (fn [k, x] -> not (is_name x) || sc.slot_name k == name) (list.enumerate args),
+        Term.prim(_, _, _, _, _, cs) => not (list.any is_name cs),
+        Term.trying(_, body, _, h) => not (is_name body || is_name h),
+        _ => true,
+    }) terms;
+    let stmts_ok = list.all (fn s -> match s {
+        Stmt.bind(_, _, x) => not (is_name x),
+        Stmt.expr(_) => true,
+    }) stmts;
+    terms_ok && stmts_ok
+};
+
+/// Whether the body measures `name` before it does anything else: past its
+/// strict parameters, the condition of its first `if` forces `len name`.
+let measures_first : Program -> :string -> Term -> :bool;
+let rec measures_first p name t = match t {
+    Term.block(_, ss) => match list.drop_while strict_read ss {
+        [Stmt.expr(e)] => measures_first p name e,
+        _ => false,
+    },
+    Term.prim(:if, _, _, _, _, [c, _, _]) => forces_len p name c,
+    _ => false,
+};
+
+let strict_read : Stmt -> :bool;
+let strict_read s = match s { Stmt.expr(Term.var(_, fl)) => ir.has_flag fl ir.f_strict, _ => false };
+
+/// Whether evaluating `t` forces `len name`.
+let forces_len : Program -> :string -> Term -> :bool;
+let rec forces_len p name t = match t {
+    Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), Term.var(n, _)]) => n == name && b == Program.len_id p,
+    Term.prim(op, _, _, _, _, [x, y]) if list.contains op strict_binaries => forces_len p name x || forces_len p name y,
+    Term.prim(op, _, _, _, _, [x, _]) if op == :and || op == :or => forces_len p name x,
+    Term.prim(:not, _, _, _, _, [x]) => forces_len p name x,
+    _ => false,
+};
+
+let strict_binaries : [:atom];
+let strict_binaries = [:add, :sub, :mul, :div, :mod, :eq, :ne, :lt, :le, :gt, :ge];
+
+/// `t` with each read of a static list that is read as an array -- the
+/// container of a `get`, the argument of `len` -- reading the array instead.
+/// A call of itself still passes the list: the worker takes both.
+let replace_reads : Program -> [[:integer, :string]] -> Term -> Term;
+let replace_reads p arrays t =
+    if list.is_empty arrays { t }
+    else { list.head (rewrite (fn x -> array_read p arrays x) %{} t) };
+
+let array_read : Program -> [[:integer, :string]] -> Term -> Term | :unit;
+let array_read p arrays t = {
+    let swap n = match list.find (fn a -> sc.slot_name (list.head a) == n) arrays { () => (), a => list.nth 1 a };
+    match t {
+        Term.prim(:get, fl, a, b, c, [Term.var(n, vf), ..rest]) if swap n != () =>
+            Term.prim :get fl a b c (list.cons (Term.var (swap n) vf) rest),
+        Term.prim(:apply, fl, a, b, c, [Term.prim(:builtin, bf, bid, ba, bb, bc), Term.var(n, vf)])
+            if bid == Program.len_id p && swap n != () =>
+            Term.prim :apply fl a b c [Term.prim :builtin bf bid ba bb bc, Term.var (swap n) vf],
+        _ => (),
+    }
+};
+
+// --- what is invariant ------------------------------------------------------------
+
+/// The largest computations in `t` that read only `names` and constants:
+/// each a call or a read of a container (anything cheaper is not worth a
+/// parameter), pure, with no closure in it, nothing bound inside it, and no
+/// call of the function itself.
+let invariants_in : Program -> :integer -> [:string] -> Term -> [Term];
+let invariants_in p gi names t = list.reverse (list.head (collect p gi names t [[], %{}]));
+
+let collect : Program -> :integer -> [:string] -> Term -> [[Term], :map] -> [[Term], :map];
+let rec collect p gi names t acc = {
+    let [found, seen] = acc;
+    if map.has t seen { acc }
+    else {
+        let seen2 = seen.[t => true];
+        if invariant gi names t { [list.cons t found, seen2] }
+        else {
+            match t {
+                Term.prim(_, _, _, _, _, cs) => list.fold (fn a x -> collect p gi names x a) [found, seen2] cs,
+                Term.block(_, ss) => list.fold (fn a s -> match s {
+                    Stmt.bind(_, _, x) => collect p gi names x a,
+                    Stmt.expr(e) => collect p gi names e a,
+                }) [found, seen2] ss,
+                Term.trying(_, body, _, h) => collect p gi names h (collect p gi names body [found, seen2]),
+                _ => [found, seen2],
+            }
+        }
+    }
+};
+
+let invariant : :integer -> [:string] -> Term -> :bool;
+let invariant gi names t = match t {
+    Term.prim(_, fl, _, _, _, _) => not (ir.has_flag fl ir.f_impure) && costly t && reads_only gi names t,
+    _ => false,
+};
+
+/// Whether a term does something worth doing once: calls a function or a
+/// builtin, or reads a container.
+let costly : Term -> :bool;
+let rec costly t = match t {
+    Term.prim(op, _, _, _, _, cs) => op == :apply || op == :get || list.any costly cs,
+    _ => false,
+};
+
+/// Whether `t` reads no name but `names`, binds, captures and effects
+/// nothing, and does not call the function itself.
+let reads_only : :integer -> [:string] -> Term -> :bool;
+let rec reads_only gi names t = match t {
+    Term.var(n, _) => list.contains n names,
+    Term.prim(:global, _, g, _, _, _) => g != gi,
+    Term.prim(_, fl, _, _, _, cs) => not (ir.has_flag fl ir.f_impure) && list.all (fn x -> reads_only gi names x) cs,
+    Term.absent => true,
+    _ => false,
+};
+
+// --- the wrapper and the worker -----------------------------------------------------
+
+/// The wrapper -- the function's own strict reads, each invariant and each
+/// array bound lazily, and a call of the worker -- and the worker: the body
+/// with every invariant a parameter, every call of itself a call of the
+/// worker passing them on.
+let split : Program -> :integer -> :integer -> :integer -> :integer -> :integer -> [[:integer, :string]] -> [Term] -> Term -> [Fun, Fun, :map];
+let split p fi wfi wgi gi k arrays invariants body = {
+    let f = (Program.funcs p).[fi];
+    let extra = list.concat [list.map (fn a -> list.nth 1 a) arrays,
+                             list.map (fn [i, _] -> "iv" + to_string i) (list.enumerate invariants)];
+    let m = list.length extra;
+    let as_param = list.fold (fn mp [i, n] -> mp.[n => sc.slot_name (k + i)]) %{} (list.enumerate extra);
+    // The invariants become names, and the calls of itself calls of the worker.
+    // Found again by identity: an invariant is a term of `body` itself.
+    let index = list.fold (fn mp [i, iv] -> mp.[iv => i]) %{} (list.enumerate invariants);
+    let named = list.head (rewrite (fn x -> match index.[x else ()] {
+        () => worker_call p gi wgi k extra x,
+        i => Term.var ("iv" + to_string i) 0,
+    }) %{} body);
+    let st0 = drive.St.new ();
+    let [_, worker_body] = drive.rename st0 as_param named;
+    let worker = sc.fun_of (f.[:arity => k + m].[:n_captures => 0].[:captures_off => 0].[:slots => 0]) worker_body;
+    let lets = list.concat [list.map (fn [j, n] -> Stmt.bind n 0 (call_builtin (Program.indexed_id p) [Term.var (sc.slot_name j) 0])) arrays,
+                            list.map (fn [i, iv] -> Stmt.bind ("iv" + to_string i) 0 iv) (list.enumerate invariants)];
+    let call = Term.prim :apply 0 ir.no_node ir.no_node ir.no_node
+                         (list.cons (Term.prim :global 0 wgi ir.no_node ir.no_node [])
+                                    (list.append (list.map (fn j -> Term.var (sc.slot_name j) 0) (list.range 0 k))
+                                                 (list.map (fn n -> Term.var n 0) extra)));
+    let wrapper = sc.fun_of f (Term.block 0 (list.concat [strict_reads body, lets, [Stmt.expr call]]));
+    let g = (Program.globals p).[gi];
+    [wrapper, worker, g.[:target => wfi]]
+};
+
+/// A call of the function by itself as a call of the worker, with what was
+/// hoisted passed on; anything else is not rewritten here.
+let worker_call : Program -> :integer -> :integer -> :integer -> [:string] -> Term -> Term | :unit;
+let worker_call p gi wgi k extra t = match t {
+    Term.prim(:apply, fl, a, b, c, [Term.prim(:global, gf, g, ga, gb, gc), ..args]) if g == gi =>
+        Term.prim :apply fl a b c (list.cons (Term.prim :global gf wgi ga gb gc)
+                                             (list.append args (list.map (fn n -> Term.var n 0) extra))),
+    _ => (),
+};
+
+/// The statements a body begins with that force its strict parameters.
+let strict_reads : Term -> [Stmt];
+let strict_reads t = match t {
+    Term.block(_, ss) => list.take_while strict_read ss,
+    _ => [],
+};
+
+let call_builtin : :integer -> [Term] -> Term;
+let call_builtin id args = Term.prim :apply 0 ir.no_node ir.no_node ir.no_node
+                                     (list.cons (Term.prim :builtin 0 id ir.no_node ir.no_node []) args);
+
+/// `t` with `f` applied wherever it answers something, top down, each shared
+/// term rewritten once: `[t2, memo]`.
+let rewrite : (Term -> Term | :unit) -> :map -> Term -> [Term, :map];
+let rec rewrite f memo t = match memo.[t else ()] {
+    () => {
+        let [t2, memo2] = match f t {
+            () => match t {
+                Term.prim(op, fl, a, b, c, cs) => {
+                    let [cs2, m2] = rewrite_all f memo cs;
+                    [Term.prim op fl a b c cs2, m2]
+                },
+                Term.block(fl, ss) => {
+                    let [ss2, m2] = list.fold (fn [out, m] s -> match s {
+                        Stmt.bind(n, bf, x) => { let [x2, m3] = rewrite f m x; [list.cons (Stmt.bind n bf x2) out, m3] },
+                        Stmt.expr(e) => { let [e2, m3] = rewrite f m e; [list.cons (Stmt.expr e2) out, m3] },
+                    }) [[], memo] ss;
+                    [Term.block fl (list.reverse ss2), m2]
+                },
+                Term.trying(fl, body, e, h) => {
+                    let [b2, m2] = rewrite f memo body;
+                    let [h2, m3] = rewrite f m2 h;
+                    [Term.trying fl b2 e h2, m3]
+                },
+                _ => [t, memo],
+            },
+            r => [r, memo],
+        };
+        [t2, memo2.[t => t2]]
+    },
+    t2 => [t2, memo],
+};
+
+let rewrite_all : (Term -> Term | :unit) -> :map -> [Term] -> [[Term], :map];
+let rewrite_all f memo ts = {
+    let [rev, m] = list.fold (fn [out, m] x -> { let [x2, m2] = rewrite f m x; [list.cons x2 out, m2] }) [[], memo] ts;
+    [list.reverse rev, m]
+};
