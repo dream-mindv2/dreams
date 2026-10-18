@@ -1,0 +1,13 @@
+import std.console;
+import std.list;
+
+// Running aggregates, each recomputed from the start of the list. The
+// aggregate of a prefix one longer is the aggregate carried on by one more
+// element -- the aggregate's own fold run on that one element -- so each is
+// carried from one step to the next.
+let main! () = {
+    let xs = list.map (fn i -> (i * 7919) % 10007) (list.range 0 6000);
+    console.print! (to_string (list.sum (list.map (fn i -> list.maximum (list.take (i + 1) xs)) (list.range 0 6000))))
+    console.print! (to_string (list.sum (list.map (fn i -> list.sum (list.take i xs)) (list.range 0 6000))))
+    console.print! (to_string (list.map (fn i -> list.minimum (list.take i [3, 1, 2])) (list.range 0 5)))
+};

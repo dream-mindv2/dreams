@@ -369,3 +369,35 @@ It also showed a cost every short program paid: a run that ended while the
 JIT was compiling a function that had just got hot waited for LLVM to
 finish, 50 ms on a 7 ms program. `dream_main` now ends without waiting, once
 the processes are gone, as `os.exit!` does.
+
+## Milestone 2, step 7: a second corpus (2026-10-18)
+
+Eight more programs written the slow way. Four were already linear --
+`contains` on an unchanging list (`twosum`), a string grown in a fold, a
+count per letter, and a matrix of lists read by position, which is cubic as
+any product is -- and two became linear:
+
+| program | as written, n → 2n | supercompiled | what changed |
+|---|---|---|---|
+| `revloop`: `list.head (list.reverse acc)` per step, `acc` grown at the front | 44 → 145 ms | 10 → 10 ms | the oldest element carried beside the list: a cons changes it only on an empty list (`consed_last`) |
+| `prefixmax`: `maximum (take (i + 1) xs)`, `sum (take i xs)` for each `i` | 2,154 ms (test) | 25 ms | the aggregate carried from step to step (`prefix_folded`) |
+
+`prefix_folded` knows nothing about maxima or sums. A fold that answers its
+accumulator on an empty list and steps by the list's tail (`fold_shape`) is
+carried on by one element by running it on that element alone from the
+accumulator so far, so any aggregate made by one -- handed the list whole,
+as a fused `sum`, or the head as the accumulator and the tail as the list,
+as `maximum` -- is carried that way. The rest past the prefix comes from
+`_list_drop`, once, where the length carried is not this step's.
+
+Two traps. A rewrite that calls a `std` function the program never reached
+calls the stub every unreached declaration shares, which divides by zero
+(`global_named` now answers `-1` for one). And the shapes that also extend
+their calls of themselves rewrote the reads first only by accident: a read
+inside a call's own arguments was rebuilt from the call's original
+arguments and left as written. Each now replaces the reads in one pass and
+extends the calls in another.
+
+Still quadratic: a join by key (`list.find (fn c -> key c == o) customers`
+per order), which wants an index built as the scans go, as the membership
+set is; and a priority queue sorted again each step, which wants a heap.

@@ -28,6 +28,14 @@
 //   of a loop over something else, `xs` handed on as it was: a scan each.
 //   The list is counted once, every value at a time, into a map (`_tally`),
 //   and each count is a lookup (`tallied`).
+// - **The oldest of a list grown at the front**, `list.head (list.reverse
+//   acc)` with `acc` handed on as `x :: acc`: a copy each step for one
+//   element that does not change. It is carried beside the list
+//   (`consed_last`).
+// - **An aggregate of a growing prefix**, `maximum (take (i + 1) xs)` for
+//   each `i`: each folds the prefix again. The fold of the prefix one longer
+//   is the fold of the prefix carried on by one more element, which is the
+//   aggregate's own loop run on that one element (`prefix_folded`).
 // - **A queue grown at the end**, `go (rest + [x, y])` with the head taken
 //   off each step: each `+` copies the queue. What is added is kept newest
 //   first beside it and turned around once when the front runs out, the
@@ -63,9 +71,12 @@ mapping Program {
     ids
     contains
     // `std.list.append`'s global, which is `+` by another name, and
-    // `std.list.last`'s.
+    // `std.list.last`'s, and `reverse_from`'s, which `reverse` is, and
+    // `take`'s.
     append
     last
+    reverse_from
+    take
     // Where the small integers are in the image's pool: a count written as a
     // constant names its pool entry, not its value.
     small_ints
@@ -80,6 +91,14 @@ mapping Program {
     // function that starts one at nothing -- as `[list, value, count]`, its
     // parameters' positions, the count `-1` when it starts at nothing.
     tallies
+    // Each function of one list that folds it, as `[form, loop's global,
+    // the loop's arguments, list position, accumulator position]`: `:whole`
+    // when it hands the loop the list, `:headed` when it hands it the head
+    // as the accumulator and the tail as the list (`maximum`). And the
+    // folds themselves, as `[list, accumulator]`, by global: one called on a
+    // prefix directly is an aggregate of it too.
+    aggregates
+    folds
 }
 
 /// The image with its slow accumulators written again.
@@ -95,11 +114,12 @@ let accum img0 = {
     let id name = match builtins.id name { () => -1, i => i };
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
-                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup"];
+                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
                          (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
-                         (global_named img strs "std.list" "last") small %{}
-                         (array.of_list (ir.Image.ints img)) %{};
+                         (global_named img strs "std.list" "last") (global_named img strs "std.list" "reverse_from")
+                         (global_named img strs "std.list" "take") small %{}
+                         (array.of_list (ir.Image.ints img)) %{} %{} %{};
     let ints = Program.ints p;
     let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
         () => m,
@@ -116,6 +136,15 @@ let accum img0 = {
         shape => m.[gi => shape],
     }) counting functions;
     let p = Program.set_tallies counting p;
+    let folds = list.fold (fn m [gi, g] -> match fold_shape p (g.[:target else -1]) gi {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions;
+    let p = Program.set_folds folds p;
+    let p = Program.set_aggregates (list.fold (fn m [gi, g] -> match aggregate_shape p folds (g.[:target else -1]) {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions) p;
     let n_funcs = array.length (Program.funcs p);
     let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
         match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
@@ -192,16 +221,24 @@ let rec unwrap t = match t {
     _ => t,
 };
 
-/// The global through which `module.name` is called, or `-1`.
+/// The global through which `module.name` is called, or `-1` -- also when
+/// the program never reaches it: then the global is the stub every
+/// unreached declaration shares (`<unreached>`, scope.dr), and a rewrite
+/// that called it would call that.
 let global_named : ir.Image -> #[:string] -> :string -> :string -> :integer;
 let global_named img strs module name = match list.find (fn m -> strs.[m.[:name else 0]] == module) (ir.Image.modules img) {
     () => -1,
     m => {
         let from = m.[:globals_start else 0];
         let gs = array.of_list (ir.Image.globals img);
+        let funcs = array.of_list (ir.Image.funcs img);
+        let reached gi = match (gs.[gi]).[:target else -1] {
+            t if t >= 0 && t < array.length funcs => strs.[(funcs.[t]).[:name else 0]] != "<unreached>",
+            _ => false,
+        };
         match list.find (fn gi -> strs.[(gs.[gi]).[:name else 0]] == name) (list.range from (from + m.[:globals_count else 0])) {
             () => -1,
-            gi => gi,
+            gi => if reached gi { gi } else { -1 },
         }
     },
 };
@@ -220,7 +257,8 @@ let rewritten p fi wfi wgi = {
         let body = sc.body_of (Program.reading p) f;
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
-                  fn () -> tallied site, fn () -> queue site, fn () -> memo_table site]
+                  fn () -> tallied site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> queue site,
+                  fn () -> memo_table site]
     }
 };
 
@@ -1134,8 +1172,8 @@ let tallied_at site j = {
     if not (list.any (fn t -> counted t != ()) terms) { () }
     else {
         let tally = Term.var "tally_of" 0;
-        let rewritten_body = list.head (hoist.rewrite (fn t ->
-            if hoist.self_call (Site.gi site) t { call (Site.wgi site) (list.append (self_args t) [tally]) }
+        let counts_read = list.head (hoist.rewrite (fn t ->
+            if hoist.self_call (Site.gi site) t { () }
             else {
                 match counted t {
                     () => (),
@@ -1150,6 +1188,275 @@ let tallied_at site j = {
                     },
                 }
             }) %{} (Site.body site));
+        // The calls of itself after the counts, so that a count in a call's
+        // own arguments is read from the tally too.
+        let rewritten_body = list.head (hoist.rewrite (fn t ->
+            if hoist.self_call (Site.gi site) t { call (Site.wgi site) (list.append (self_args t) [tally]) }
+            else { () }) %{} counts_read);
         built site "tally_of" false rewritten_body (builtin p "_tally" [Term.var xs 0])
+    }
+};
+
+// --- the oldest of a list grown at the front ---------------------------------------------
+
+/// `list.head (list.reverse acc)` -- `reverse_from [] acc` read at 0 -- for
+/// parameter `j`, handed on as `x :: acc` or as it was: the last element is
+/// carried beside it, since a cons changes it only on an empty list. Where
+/// `acc` is empty the read is left as written, which fails as `head` does.
+let consed_last : Site -> [Fun, Fun, :map] | :unit;
+let consed_last site =
+    if Program.reverse_from (Site.program site) < 0 { () }
+    else { first_of (list.map (fn j -> fn () -> consed_last_at site j) (list.range 0 (Site.k site))) };
+
+let consed_last_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let consed_last_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let acc = sc.slot_name j;
+    let body = Site.body site;
+    let [terms, _] = hoist.parts body;
+    let oldest t = match t {
+        Term.prim(:get, _, _, _, _, [Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), start, Term.var(n, _)]),
+                                     Term.prim(:const_int, _, i, _, _, _), Term.absent]) =>
+            g == Program.reverse_from p && n == acc && is_nil start && (Program.ints p).[i] == 0,
+        _ => false,
+    };
+    let consed arg = match arg {
+        Term.prim(:cons, _, _, _, _, [e, rest]) if is_var acc rest => e,
+        _ => (),
+    };
+    let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
+    let grows = list.any (fn c -> consed (list.nth j (self_args c)) != ()) self_calls;
+    // Carried already, by a round before: the read left as written is the
+    // one on an empty list.
+    let carried_already = list.any (fn t -> match t {
+        Term.prim(:if, _, _, _, _, [Term.prim(:list_is_empty, _, _, _, _, [Term.var(n, _)]), y, _]) => n == acc && oldest y,
+        _ => false,
+    }) terms;
+    if not (list.any oldest terms) || not grows || carried_already { () }
+    else {
+        let carried = Term.var "acc_oldest" 0;
+        // The oldest of a list as the program reads it, `reverse_from` being
+        // reached: read only where the list is not empty.
+        let oldest_of x = Term.prim :get 0 ir.no_node ir.no_node ir.no_node
+            [call (Program.reverse_from p) [nil, x], Term.prim :const_int 0 ((Program.small_ints p).[0]) ir.no_node ir.no_node [], Term.absent];
+        let empty x = Term.prim :list_is_empty 0 ir.no_node ir.no_node ir.no_node [x];
+        let cond c y z = Term.prim :if 0 ir.no_node ir.no_node ir.no_node [c, y, z];
+        // The reads first, the calls of itself after, so that a read in a
+        // call's own arguments is replaced too.
+        let read = list.head (hoist.rewrite (fn t ->
+            if oldest t { cond (empty (Term.var acc 0)) t carried } else { () }) %{} body);
+        let rewritten_body = list.head (hoist.rewrite (fn t ->
+            if hoist.self_call gi t {
+                let arg = list.nth j (self_args t);
+                let next = match consed arg {
+                    () => if is_var acc arg { carried } else { oldest_of arg },
+                    e => cond (empty (Term.var acc 0)) e carried,
+                };
+                call (Site.wgi site) (list.append (self_args t) [next])
+            } else { () }) %{} read);
+        built site "acc_oldest" false rewritten_body (oldest_of (Term.var acc 0))
+    }
+};
+
+// --- an aggregate of a growing prefix --------------------------------------------------
+
+/// A body past the reads of strict parameters it starts with.
+let past_strict : Term -> Term;
+let rec past_strict t = match t {
+    Term.block(_, ss) => match list.drop_while (fn st -> match st {
+        Stmt.expr(Term.var(_, fl)) => ir.has_flag fl ir.f_strict,
+        _ => false,
+    }) ss {
+        [Stmt.expr(inner)] => past_strict inner,
+        _ => t,
+    },
+    _ => t,
+};
+
+/// Whether function `fi`, called through global `gi`, is a left fold of a
+/// list: on an empty list it answers its accumulator, and otherwise it calls
+/// itself on the list's tail with every parameter but the accumulator as it
+/// was. Then running it on `[x]` from an accumulator is one step of the fold.
+/// `[list, accumulator]`, their positions, or `()`.
+let fold_shape : Program -> :integer -> :integer -> [:integer, :integer] | :unit;
+let fold_shape p fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let k = f.[:arity else 0];
+        let position n = list.find_index (fn j -> sc.slot_name j == n) (list.range 0 k);
+        if not (ir.has_flag (f.[:flags else 0]) ir.fn_rec) || ir.has_flag (f.[:flags else 0]) ir.fn_impure || f.[:n_captures else 0] > 0 { () }
+        else {
+            match past_strict (sc.body_of (Program.reading p) f) {
+                Term.prim(:if, _, _, _, _, [Term.prim(:list_is_empty, _, _, _, _, [Term.var(l, _)]), answer, rest]) => {
+                    let a = match unwrap answer { Term.var(n, _) => n, _ => "" };
+                    let [li, ai] = [position l, position a];
+                    let [terms, _] = hoist.parts rest;
+                    let calls = list.filter (fn t -> hoist.self_call gi t) terms;
+                    let stepping = list.all (fn c -> {
+                        let args = self_args c;
+                        list.length args == k && list.all (fn [j, arg] ->
+                            if j == li { match arg { Term.prim(:list_tail, _, _, _, _, [Term.var(m, _)]) => m == l, _ => false } }
+                            else { j == ai || is_var (sc.slot_name j) arg }) (list.enumerate args)
+                    }) calls;
+                    // It ends only where it answers the accumulator: every
+                    // other leaf is a call of itself.
+                    let ends = list.all (fn t -> hoist.self_call gi t) (leaves rest);
+                    if li >= 0 && ai >= 0 && li != ai && not (list.is_empty calls) && stepping && ends { [li, ai] } else { () }
+                },
+                _ => (),
+            }
+        }
+    };
+
+/// Whether function `fi` is an aggregate of one list made by a fold: it
+/// hands the fold its list whole, or its head as the accumulator and its
+/// tail as the list, and everything else it hands the fold reads nothing of
+/// its own -- so the same call can be written anywhere.
+let aggregate_shape : Program -> :map -> :integer -> [:atom, :integer, [Term], :integer, :integer] | :unit;
+let aggregate_shape p folds fi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let own = sc.slot_name 0;
+        let closed t = list.all (fn x -> match x {
+            Term.var(_, _) => false,
+            Term.lam(_, _, _, caps) => list.is_empty caps,
+            _ => true,
+        }) (list.head (hoist.parts t));
+        let others args li ai = list.all (fn [j, arg] -> j == li || j == ai || closed arg) (list.enumerate args);
+        if f.[:arity else 0] != 1 || f.[:n_captures else 0] > 0 || ir.has_flag (f.[:flags else 0]) ir.fn_impure { () }
+        else {
+            match unwrap (past_strict (sc.body_of (Program.reading p) f)) {
+                Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match folds.[g else ()] {
+                    [li, ai] if is_var own (list.nth li args) && closed (list.nth ai args) && others args li ai => [:whole, g, args, li, ai],
+                    _ => (),
+                },
+                Term.prim(:if, _, _, _, _, [Term.prim(:list_is_empty, _, _, _, _, [Term.var(n, _)]), _, rest]) if n == own =>
+                    match unwrap rest {
+                        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match folds.[g else ()] {
+                            [li, ai] => {
+                                let tail_ok = match list.nth li args { Term.prim(:list_tail, _, _, _, _, [Term.var(m, _)]) => m == own, _ => false };
+                                let head_ok = match list.nth ai args {
+                                    Term.prim(:get, _, _, _, _, [Term.var(m, _), Term.prim(:const_int, _, i, _, _, _), Term.absent]) =>
+                                        m == own && (Program.ints p).[i] == 0,
+                                    _ => false,
+                                };
+                                if tail_ok && head_ok && others args li ai { [:headed, g, args, li, ai] } else { () }
+                            },
+                            _ => (),
+                        },
+                        _ => (),
+                    },
+                _ => (),
+            }
+        }
+    };
+
+/// A loop over `i`, stepping by one, that asks an aggregate of `take (i + c)
+/// xs` with `xs` handed on as it was: the aggregate carried from one step to
+/// the next, as the length it stands for, its value, and the rest of `xs`
+/// past it. Where the length carried is not this step's -- the first step,
+/// or a prefix too short to step from -- the aggregate is asked as written.
+let prefix_folded : Site -> [Fun, Fun, :map] | :unit;
+let prefix_folded site = {
+    let p = Site.program site;
+    if Program.take p < 0 || map.size (Program.aggregates p) == 0 { () }
+    else {
+        let gi = Site.gi site;
+        let k = Site.k site;
+        let [terms, _] = hoist.parts (Site.body site);
+        let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
+        let stepped j = not (list.is_empty self_calls) && list.all (fn c -> match list.nth j (self_args c) {
+            Term.prim(:add, _, _, _, _, [Term.var(n, _), Term.prim(:const_int, _, i, _, _, _)]) => n == sc.slot_name j && (Program.ints p).[i] == 1,
+            _ => false,
+        }) self_calls;
+        let kept j = list.all (fn c -> is_var (sc.slot_name j) (list.nth j (self_args c))) self_calls;
+        let prefix i xs arg = match arg {
+            Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, tk, _, _, _), n, Term.var(l, _)])
+                if tk == Program.take p && l == sc.slot_name xs && match n {
+                    Term.var(m, _) => m == sc.slot_name i,
+                    Term.prim(:add, _, _, _, _, [Term.var(m, _), Term.prim(:const_int, _, _, _, _, _)]) => m == sc.slot_name i,
+                    _ => false,
+                } => n,
+            _ => (),
+        };
+        let closed x = list.all (fn y -> match y {
+            Term.var(_, _) => false,
+            Term.lam(_, _, _, caps) => list.is_empty caps,
+            _ => true,
+        }) (list.head (hoist.parts x));
+        // `[term, the aggregate, n]` for each read of one: an aggregate of a
+        // prefix, or a fold called on one directly.
+        let asked i xs t = match t {
+            Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) if map.has g (Program.folds p) => {
+                let [li, ai] = (Program.folds p).[g];
+                match prefix i xs (list.nth li args) {
+                    () => (),
+                    n if list.all (fn [j, a] -> j == li || closed a) (list.enumerate args) =>
+                        [t, [:whole, g, args, li, ai], n, Term.var (sc.slot_name xs) 0],
+                    _ => (),
+                }
+            },
+            Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _),
+                                           Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, tk, _, _, _), n, Term.var(l, _)])]) =>
+                match (Program.aggregates p).[g else ()] {
+                    () => (),
+                    shape if tk == Program.take p && l == sc.slot_name xs && match n {
+                        Term.var(m, _) => m == sc.slot_name i,
+                        Term.prim(:add, _, _, _, _, [Term.var(m, _), Term.prim(:const_int, _, _, _, _, _)]) => m == sc.slot_name i,
+                        _ => false,
+                    } => [t, shape, n, Term.var (sc.slot_name xs) 0],
+                    _ => (),
+                },
+            _ => (),
+        };
+        let found = list.concat (list.map (fn i -> list.concat (list.map (fn xs ->
+            match list.find (fn t -> asked i xs t != ()) terms { () => [], t => [asked i xs t] })
+            (list.filter (fn xs -> xs != i && kept xs) (list.range 0 k))))
+            (list.filter stepped (list.range 0 k)));
+        // Carried already, by a round before.
+        let done = list.any (fn t -> match t {
+            Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => b == (Program.ids p).["_list_drop"],
+            _ => false,
+        }) terms;
+        match if done { [] } else { found } {
+            [] => (),
+            [[t, [form, loop, args, li, ai], n, xs], .._] => {
+                let int v = Term.prim :const_int 0 ((Program.small_ints p).[v]) ir.no_node ir.no_node [];
+                let op o x y = Term.prim o 0 ir.no_node ir.no_node ir.no_node [x, y];
+                let cond c y z = Term.prim :if 0 ir.no_node ir.no_node ir.no_node [c, y, z];
+                let [carried_n, carried, rest] = [Term.var "pfx_n" 0, Term.var "pfx_state" 0, Term.var "pfx_rest" 0];
+                let [hit, here, after] = [Term.var "pfx_hit" 0, Term.var "pfx_here" 0, Term.var "pfx_after" 0];
+                let unknown = op :sub (int 0) (int 1);
+                let empty x = Term.prim :list_is_empty 0 ir.no_node ir.no_node ir.no_node [x];
+                // One more step of the fold: its loop on the next element
+                // alone, from the aggregate so far.
+                let next_element = Term.prim :get 0 ir.no_node ir.no_node ir.no_node [after, int 0, Term.absent];
+                let stepped_once = call loop (list.map (fn [j, arg] -> if j == li { Term.prim :make_list 0 ir.no_node 1 ir.no_node [next_element] }
+                                                                   else if j == ai { here } else { arg }) (list.enumerate args));
+                // A prefix the fold can step from: any for a fold handed the
+                // whole list, one with a head for one handed the head.
+                let from = if form == :headed { int 1 } else { int 0 };
+                let steps = op :ge n from;
+                let lets = [Stmt.bind "pfx_hit" 0 (op :eq carried_n n),
+                            Stmt.bind "pfx_here" 0 (cond hit carried t),
+                            Stmt.bind "pfx_after" 0 (cond hit rest (builtin p "_list_drop" [n, xs]))];
+                // The reads first, the calls of itself after, so that a read
+                // in a call's own arguments is replaced too.
+                let read = list.head (hoist.rewrite (fn x -> if x == t { here } else { () }) %{} (Site.body site));
+                let body = list.head (hoist.rewrite (fn x ->
+                    if hoist.self_call gi x {
+                        call (Site.wgi site) (list.append (self_args x) [
+                            cond steps (op :add n (int 1)) unknown,
+                            cond (op :and steps (Term.prim :not 0 ir.no_node ir.no_node ir.no_node [empty after])) stepped_once here,
+                            cond (empty after) after (Term.prim :list_tail 0 ir.no_node ir.no_node ir.no_node [after])])
+                    } else { () }) %{} read);
+                built_with site [["pfx_n", false, unknown], ["pfx_state", false, Term.prim :unit 0 ir.no_node ir.no_node ir.no_node []],
+                                 ["pfx_rest", false, nil]] []
+                           (Term.block 0 (list.append lets [Stmt.expr body]))
+            },
+        }
     }
 };

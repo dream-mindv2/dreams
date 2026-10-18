@@ -1,0 +1,13 @@
+import std.console;
+import std.list;
+
+// A list built at the front and reversed on every step to read its oldest
+// element, which never changes once there is one. It is carried beside the
+// list instead; on an empty list the read is left as written.
+let walk : :integer -> [:integer] -> :integer -> :integer;
+let rec walk i acc !total = if i == 0 { total } else {
+    let oldest = list.head (list.reverse acc);
+    walk (i - 1) (list.cons i acc) (total + oldest)
+};
+
+let main! () = console.print! (to_string (walk 8000 [7] 0));
