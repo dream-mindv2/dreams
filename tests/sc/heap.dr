@@ -1,0 +1,35 @@
+import std.console;
+import std.list;
+
+// A priority queue as a list sorted again on every step: the smallest taken
+// off, something added at the end. The queue is a heap instead, whose
+// smallest is the sort's head and whose pop is its tail -- in a stable
+// sort's order, so ties come out as the sort would put them.
+let drain : [:any] -> :integer -> [:any] -> [:any];
+let rec drain q !k out = if k == 0 || list.is_empty q { list.reverse out } else {
+    let sorted = list.sort q;
+    let m = list.head sorted;
+    drain (list.append (list.tail sorted) [next m]) (k - 1) (list.cons m out)
+};
+
+// What a popped element brings back: a number grows, a pair keeps its tag.
+let next : :any -> :any;
+let next m = match type_of m {
+    :integer => m * 3 % 1000003,
+    :list => [list.head m + 7, list.nth 1 m],
+    _ => m,
+};
+
+let not_a_number : :float -> :float;
+let not_a_number z = z / z;
+
+let main! () = {
+    let xs = list.map (fn i -> (i * 7919) % 100003 + 1) (list.range 0 6000);
+    console.print! (to_string (list.sum (drain xs 6000 [])))
+    // Ties: pairs of a priority and the order they came in.
+    console.print! (to_string (drain [[2, "a"], [1, "b"], [2, "c"], [1, "d"]] 8 []))
+    // What `compare` does not order totally is sorted as written.
+    console.print! (to_string (drain [3.0, not_a_number 0.0, 1.0] 4 []))
+    console.print! (to_string (drain [%{:a => 2}, %{:a => 1}] 3 []))
+    console.print! (to_string (drain [] 3 []))
+};

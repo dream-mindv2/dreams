@@ -422,3 +422,17 @@ compile is large on purpose, so `[vm] max_heap` joins `nursery_max` as a
 setting a manifest makes and the image carries (`VMOP` key 2), applied
 unless `--max-heap` or `DREAM_MAX_HEAP` says otherwise, and the compiler's
 manifest asks for 4 GB. Its live set is still to be made smaller.
+
+The last of the corpus: a priority queue sorted again on every step,
+`drain (list.tail (list.sort q) + [x])`. A queue read only by being sorted --
+tested for emptiness, its sort's head read, its sort's tail handed on with
+pieces added -- is carried as a heap (`heaped`, `_heap_*`): a leftist heap
+ordered by `compare` and then by the order the sort would have met each
+element, which is a stable sort's order, so ties come out as `list.sort`
+puts them. It starts as the list it was made from, so testing it for
+emptiness forces only a first cell, and it is built where the sort would have
+been forced, forcing every element as the sort does; pieces wait unread
+until the next minimum is asked for. A value `compare` does not order
+totally -- a NaN, a map -- turns it back into a list sorted the program's
+way. The test has ties, pairs, a NaN, maps and an empty queue: as written
+2,974 ms, supercompiled 35 ms, the same output.

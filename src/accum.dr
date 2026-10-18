@@ -40,6 +40,10 @@
 //   each `i`: each folds the prefix again. The fold of the prefix one longer
 //   is the fold of the prefix carried on by one more element, which is the
 //   aggregate's own loop run on that one element (`prefix_folded`).
+// - **A priority queue sorted again on every step**, `go (list.tail (list.sort
+//   q) + [x])` with the smallest taken off: a sort each step. The queue is
+//   a heap instead, whose smallest is the sort's head and whose pop is its
+//   tail (`heaped`).
 // - **A queue grown at the end**, `go (rest + [x, y])` with the head taken
 //   off each step: each `+` copies the queue. What is added is kept newest
 //   first beside it and turned around once when the front runs out, the
@@ -76,11 +80,12 @@ mapping Program {
     contains
     // `std.list.append`'s global, which is `+` by another name, and
     // `std.list.last`'s, and `reverse_from`'s, which `reverse` is, and
-    // `take`'s.
+    // `take`'s, and `sort`'s.
     append
     last
     reverse_from
     take
+    sort
     // Where the small integers are in the image's pool: a count written as a
     // constant names its pool entry, not its value.
     small_ints
@@ -127,11 +132,12 @@ let accum img0 = {
     let id name = match builtins.id name { () => -1, i => i };
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
-                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find"];
+                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find",
+                         "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
                          (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
                          (global_named img strs "std.list" "last") (global_named img strs "std.list" "reverse_from")
-                         (global_named img strs "std.list" "take") small %{}
+                         (global_named img strs "std.list" "take") (global_named img strs "std.list" "sort") small %{}
                          (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{};
     let ints = Program.ints p;
     let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
@@ -278,7 +284,7 @@ let rewritten p fi wfi wgi = {
         let body = sc.body_of (Program.reading p) f;
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
-                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> queue site,
+                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site,
                   fn () -> memo_table site]
     }
 };
@@ -1706,3 +1712,99 @@ let searcher_shape p fi =
             }
         }
     };
+
+// --- a priority queue sorted on every step --------------------------------------------------
+
+/// Parameter `j`, a list read only by being sorted -- tested for emptiness,
+/// sorted, the sort's head read and its tail handed on, perhaps with pieces
+/// added -- carried as a heap (`_heap_of`) instead. Its smallest is the head
+/// `list.sort` would answer and its pop the tail, in the order a stable sort
+/// gives; each step is a pop and a push rather than a sort.
+let heaped : Site -> [Fun, Fun, :map] | :unit;
+let heaped site =
+    if Program.sort (Site.program site) < 0 { () }
+    else { first_of (list.map (fn j -> fn () -> heaped_at site j) (list.range 0 (Site.k site))) };
+
+let heaped_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let heaped_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let q = sc.slot_name j;
+    let body = Site.body site;
+    let [terms, stmts] = hoist.parts body;
+    let sort_of t = match t {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), Term.var(n, _)]) => g == Program.sort p && n == q,
+        _ => false,
+    };
+    // The names the sort is bound to, lazily.
+    let sorts = list.concat (list.map (fn s -> match s {
+        Stmt.bind(n, fl, x) if sort_of x && not (ir.has_flag fl ir.f_strict) => [n],
+        _ => [],
+    }) stmts);
+    let sorted t = sort_of t || match t { Term.var(n, _) => list.contains n sorts, _ => false };
+    let is_q t = is_var q t;
+    let mentions t = reads q t || list.any (fn n -> reads n t) sorts;
+    let tail_of t = match t { Term.prim(:list_tail, _, _, _, _, [x]) => sorted x, _ => false };
+    // How a call of itself hands the queue on: `[:pop, pieces]`, `[:keep,
+    // pieces]`, `[:new]`, or `()` when it reads the queue some other way.
+    let handed arg = match addends p arg {
+        [base, pieces] if tail_of base && not (list.any mentions pieces) => [:pop, pieces],
+        [base, pieces] if is_q base && not (list.any mentions pieces) => [:keep, pieces],
+        _ => if mentions arg { () } else { [:new] },
+    };
+    let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
+    let hands = list.map (fn c -> handed (list.nth j (self_args c))) self_calls;
+    let read_as_queue = list.all (fn t -> match t {
+        Term.lam(_, _, _, caps) => not (list.contains q caps) && not (list.any (fn n -> list.contains n caps) sorts),
+        Term.prim(:list_is_empty, _, _, _, _, [x]) if is_q x => true,
+        Term.prim(:get, _, _, _, _, [x, i, Term.absent]) if sorted x =>
+            match i { Term.prim(:const_int, _, k, _, _, _) => (Program.ints p).[k] == 0, _ => false },
+        _ if sort_of t => true,
+        _ if hoist.self_call gi t => list.all (fn [i, x] -> i == j || not (mentions x)) (list.enumerate (self_args t)),
+        // A tail of the sort, or the queue, handed on with pieces added is
+        // read by the call it is handed to.
+        Term.prim(:list_tail, _, _, _, _, [x]) if sorted x => true,
+        Term.prim(:add, _, _, _, _, [x, _]) if tail_of x || is_q x => true,
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), x, _]) if g == Program.append p && (tail_of x || is_q x) => true,
+        Term.prim(_, _, _, _, _, cs) => not (list.any (fn x -> is_q x || match x { Term.var(n, _) => list.contains n sorts, _ => false }) cs),
+        Term.trying(_, x, _, h) => not (mentions x || mentions h),
+        _ => true,
+    }) terms && list.all (fn s -> match s {
+        Stmt.bind(n, _, x) => sort_of x && list.contains n sorts || not (is_q x || match x { Term.var(m, _) => list.contains m sorts, _ => false }),
+        Stmt.expr(Term.var(_, fl)) if ir.has_flag fl ir.f_strict => true,
+        Stmt.expr(x) => not (is_q x || match x { Term.var(m, _) => list.contains m sorts, _ => false }),
+    }) stmts;
+    let pops = list.any (fn h -> match h { [:pop, _] => true, _ => false }) hands;
+    if not pops || not read_as_queue || list.any (fn h -> h == ()) hands { () }
+    else {
+        let h = Term.var q 0;
+        let cond c y z = Term.prim :if 0 ir.no_node ir.no_node ir.no_node [c, y, z];
+        let empty = builtin p "_heap_empty" [h];
+        let zero = Term.prim :const_int 0 ((Program.small_ints p).[0]) ir.no_node ir.no_node [];
+        let pushed base pieces = list.fold (fn acc piece -> builtin p "_heap_push" [acc, piece]) base pieces;
+        let reads = list.head (hoist.rewrite (fn t -> match t {
+            Term.prim(:list_is_empty, _, _, _, _, [x]) if is_q x => empty,
+            // On an empty queue, the read as written, which fails as it did.
+            Term.prim(:get, fl, a, b, c, [x, _, Term.absent]) if sorted x =>
+                cond empty (Term.prim :get fl a b c [nil, zero, Term.absent]) (builtin p "_heap_min" [h]),
+            _ => (),
+        }) %{} body);
+        let worker_body = list.head (hoist.rewrite (fn t ->
+            if hoist.self_call gi t {
+                let args = self_args t;
+                let next = match handed (list.nth j args) {
+                    [:pop, pieces] => pushed (cond empty (builtin p "_heap_of" [Term.prim :list_tail 0 ir.no_node ir.no_node ir.no_node [nil]])
+                                                         (builtin p "_heap_pop" [h])) pieces,
+                    [:keep, pieces] => pushed h pieces,
+                    [:new] => builtin p "_heap_of" [list.nth j args],
+                };
+                call (Site.wgi site) (list.map (fn [i, x] -> if i == j { next } else { x }) (list.enumerate args))
+            } else { () }) %{} reads);
+        let f = (Program.funcs p).[Site.fi site];
+        let k = Site.k site;
+        let worker = sc.fun_of f worker_body;
+        let params = list.map (fn i -> if i == j { builtin p "_heap_of" [Term.var q 0] } else { Term.var (sc.slot_name i) 0 }) (list.range 0 k);
+        let wrapper = sc.fun_of f (Term.block 0 (list.append (hoist.strict_reads body) [Stmt.expr (call (Site.wgi site) params)]));
+        [wrapper, worker, ((Program.globals p).[gi]).[:target => Site.wfi site]]
+    }
+};

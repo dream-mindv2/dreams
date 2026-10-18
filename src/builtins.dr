@@ -133,6 +133,11 @@ let names = [
     "_list_drop",
     "_index_new",
     "_index_find",
+    "_heap_of",
+    "_heap_push",
+    "_heap_empty",
+    "_heap_min",
+    "_heap_pop",
 
 ];
 
@@ -248,6 +253,11 @@ let signatures = %{
     "_list_drop" => "integer -> list -> the list past that many cells",
     "_index_new" => "list -> path -> bool -> an index of the list by the key the path reads, nothing read yet",
     "_index_find" => "index -> value -> [the first element with that key] or [], or () when the index cannot say",
+    "_heap_of" => "list -> the heap the list sorts to",
+    "_heap_push" => "heap -> list -> the heap of the list the heap stands for with the list after it",
+    "_heap_empty" => "heap -> whether the list it stands for is empty",
+    "_heap_min" => "heap -> the head of the list it stands for, sorted",
+    "_heap_pop" => "heap -> the heap of the tail of the list it stands for, sorted",
 
 };
 
