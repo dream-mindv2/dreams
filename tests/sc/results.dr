@@ -1,0 +1,24 @@
+// A `Result` made and taken apart at every step of a loop, which the
+// supercompiler decides away: see `dreams/tests/sc.sh`.
+import std.console;
+
+let parse_digit : :integer -> Result;
+let parse_digit c = if c >= 48 && c <= 57 { Result.ok (c - 48) } else { Result.error :not_a_digit };
+
+let rec digits !acc !i n =
+    if i >= n { Result.ok acc }
+    else {
+        match parse_digit (48 + i % 10) {
+            Result.ok(d) => digits (acc * 3 % 1000003 + d) (i + 1) n,
+            Result.error(e) => Result.error e,
+        }
+    };
+
+let rec repeat !k !total n = if k == 0 { total } else {
+    match digits 0 0 n {
+        Result.ok(v) => repeat (k - 1) (total + v) n,
+        Result.error(_) => repeat (k - 1) total n,
+    }
+};
+
+let main! = console.print! (to_string (repeat 100 0 50000));

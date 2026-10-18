@@ -343,6 +343,9 @@ let emit_new !e tail t = match t {
                         if tail { ir.add_flag fl ir.f_tail } else { untail_flags fl }
                     } else { fl };
         let n x y z = ir.with_flags flags (ir.node op x y z);
+        // A count is the children's, whatever the term says: a term the
+        // driver made, or one whose children it changed, need not say it.
+        let k = list.length is;
         match layout op {
             :leaf => push e2 (n a b c),
             :a => push e2 (n (list.nth 0 is) b c),
@@ -350,17 +353,23 @@ let emit_new !e tail t = match t {
             :abc => push e2 (n (list.nth 0 is) (list.nth 1 is) (list.nth 2 is)),
             :kids_bc => {
                 let [e3, off] = push_kids e2 is;
-                push e3 (n a off c)
+                push e3 (n a off k)
             },
-            // The rest keep a kids section: `a` and the kids after it, or
-            // the kids alone at `a`.
-            l if l == :kids_ab || l == :kids_ab2 => {
+            :kids_ab => {
                 let [e3, off] = push_kids e2 is;
-                push e3 (n off b c)
+                push e3 (n off k c)
+            },
+            :kids_ab2 => {
+                let [e3, off] = push_kids e2 is;
+                push e3 (n off (k / 2) c)
+            },
+            :a_kids2 => {
+                let [e3, off] = push_kids e2 (list.drop 1 is);
+                push e3 (n (list.head is) off ((k - 1) / 2))
             },
             _ => {
                 let [e3, off] = push_kids e2 (list.drop 1 is);
-                push e3 (n (list.head is) off c)
+                push e3 (n (list.head is) off (k - 1))
             },
         }
     },

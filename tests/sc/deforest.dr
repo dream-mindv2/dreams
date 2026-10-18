@@ -1,0 +1,41 @@
+// A pipeline of user-written list functions -- what `std`'s fusion does not
+// see -- which the supercompiler runs into one loop over integers that
+// builds no list: `dreams/tests/sc.sh` holds it to half the reductions, at
+// most, of what it runs as written.
+import std.console;
+import std.list;
+
+let rec mapl f xs = match xs {
+    [] => [],
+    [x, ..rest] => list.cons (f x) (mapl f rest),
+};
+
+let rec filterl p xs = match xs {
+    [] => [],
+    [x, ..rest] => if p x { list.cons x (filterl p rest) } else { filterl p rest },
+};
+
+let rec suml !acc xs = match xs {
+    [] => acc,
+    [x, ..rest] => suml (acc + x) rest,
+};
+
+let rec upto !i n = if i >= n { [] } else { list.cons i (upto (i + 1) n) };
+
+let rec appendl xs ys = match xs {
+    [] => ys,
+    [x, ..rest] => list.cons x (appendl rest ys),
+};
+
+let rec lengthl !acc xs = match xs {
+    [] => acc,
+    [_, ..rest] => lengthl (acc + 1) rest,
+};
+
+let pipeline n = suml 0 (mapl (fn x -> x * 3) (filterl (fn x -> x % 2 == 0) (upto 0 n)));
+
+let both n = lengthl 0 (appendl (upto 0 n) (upto 0 n));
+
+let rec repeat !k !total n = if k == 0 { total } else { repeat (k - 1) (total + pipeline n + both n) n };
+
+let main! = console.print! (to_string (repeat 200 0 20000));

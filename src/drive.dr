@@ -19,16 +19,36 @@
 // is a loss (docs/notes/inlining.md) -- it grows the frame every suspension
 // in it carries -- so a fold is what pays for the frame.
 //
-// What is never run: a function that is impure, recursive, a thunk or a
-// global value (unfolding a global value would do its work once per use
-// instead of once), and anything already being unfolded above the call.
-// Recursive functions are the next step, specialised on what is known at
-// the call and folded back to the specialisation when the call recurs.
+// What is never unfolded for its own sake: a function that is impure,
+// recursive, a thunk or a global value (unfolding a global value would do
+// its work once per use instead of once), and anything already being
+// unfolded above the call.
+//
+// A recursive function is **specialised** instead, on what is known of its
+// arguments at the call: a closure (its captures become parameters), and a
+// call of another function that nothing else reads, which is the producer
+// of the list or record this function consumes -- each a *shape*, with
+// whatever is not known a hole. The specialisation is a new function of the
+// holes, its body the original's driven with the shapes put back; it is
+// registered before it is driven, so a call inside it of the same function
+// in the same shape is a call of the specialisation. That fold is what ties
+// a loop.
+//
+// The producer is run into the consumer. Where a body forces a parameter
+// bound to a producer -- the subject of its `match` -- the producer is
+// unfolded once, there, and the rest of the body is pushed into each of its
+// branches (`case-of-case`): a branch that ends in a constructor meets the
+// `match` that takes it apart, and decides it; a branch that ends in a call
+// is the consumer called again on that call, a call of a known shape, which
+// specialises and folds. `sum (map f (filter p (upto 0 n)))` comes out as
+// one loop over `i` that builds no list. See "Milestone 2" in
+// docs/notes/supercompilation.md.
 
 import std.array;
 import std.lazy;
 import std.list;
 import std.map;
+import std.num;
 import std.str;
 
 import dreams.builtins;
@@ -56,6 +76,7 @@ mapping View {
     is_cons
     head
     tail
+    match_fail
 }
 
 let view : ir.Image -> View;
@@ -69,7 +90,7 @@ let view img = {
               (array.of_list (ir.Image.globals img))
               (array.of_list (list.map (fn s -> strs.[s]) (ir.Image.atoms img)))
               (array.of_list (ir.Image.ints img))
-              (id "_record_is") (id "_match_at") (id "_match_is_cons") (id "_match_head") (id "_match_tail")
+              (id "_record_is") (id "_match_at") (id "_match_is_cons") (id "_match_head") (id "_match_tail") (id "_match_fail")
 };
 
 /// How many nodes a term is.
@@ -97,7 +118,20 @@ mapping Ctx {
     known = %{}
     unfolding = []
     depth = 0
+    // Each name bound lazily to a call of a known pure function that is the
+    // only reader of it: a producer, which a specialisation may take as a
+    // shape rather than a value (`shape_of`).
+    pending = %{}
+    // The function whose body this is and the names its parameters are
+    // bound to, `[callee, names]`, where this is in tail position in that
+    // body, else `()`: a branch of a pushed `match` that ends in a call is
+    // this function called again (`push`).
+    self = ()
 }
+
+/// The context of a part that is not in tail position.
+let inside : Ctx -> Ctx;
+let inside cx = if Ctx.self cx == () { cx } else { Ctx.set_self () cx };
 
 /// What is threaded through the walk: the next fresh name, and how many
 /// things were decided. A function nothing was decided in is left as it was.
@@ -112,6 +146,31 @@ mapping St {
     // was driven in: a node the arena shares is reached once per parent,
     // and driving it again would make a copy for each (`drive`).
     memo = %{}
+    // Across the program: each specialisation by its key (`spec_key`) as
+    // `[function, global]`, the functions and globals made so far (latest
+    // first), the next indices, and how many were made for the function
+    // being driven.
+    specs = %{}
+    added = []
+    new_globals = []
+    next_fi = 0
+    next_gi = 0
+    made = 0
+    // The terms unfolding and pushing have written into the function being
+    // driven, against `budget`: the whistle that bounds the whole, where the
+    // others bound one step. Pushes nest -- each copy of a block's rest may
+    // push its own rest -- and without it the work is exponential in how
+    // many `match`es a block has.
+    grown = 0
+    budget = 0
+    // Whether to say why (`--sc-stats`); saying costs a string a decline.
+    explain = false
+    // What each specialisation's global stands for: `[callee, shapes]`, the
+    // call it was made from with its holes left open (`original_call`).
+    spec_calls = %{}
+    // Why each producer met was not run into its consumer, for
+    // `--sc-stats`: the whistles, said.
+    why = []
 }
 
 /// The deepest unfolding inside an unfolding, and the largest body unfolded.
@@ -121,10 +180,48 @@ let max_size : :integer;
 let max_size = 160;
 let max_tries : :integer;
 let max_tries = 400;
+/// The most specialisations made while driving one function, and in all;
+/// how deep a shape's calls nest before what is deeper is a hole; the
+/// largest rest of a block pushed into a producer's branches, and the most
+/// branches it is pushed into. Each is a whistle: past it, what would be
+/// specialised or pushed is left as written.
+let max_made : :integer;
+let max_made = 24;
+let max_specs : :integer;
+let max_specs = 3000;
+let max_shape : :integer;
+let max_shape = 4;
+let max_pushed : :integer;
+let max_pushed = 600;
+let max_leaves : :integer;
+let max_leaves = 12;
 
 let settle : St -> St;
 let settle st = if lazy.forced (St.fresh st) && lazy.forced (St.folds st) && lazy.forced (St.tries st)
-                   && lazy.forced (St.memo st) { st } else { st };
+                   && lazy.forced (St.memo st) && lazy.forced (St.specs st) && lazy.forced (St.added st)
+                   && lazy.forced (St.new_globals st) && lazy.forced (St.next_fi st)
+                   && lazy.forced (St.next_gi st) && lazy.forced (St.made st) && lazy.forced (St.why st) && lazy.forced (St.grown st)
+                   && lazy.forced (St.spec_calls st) { st } else { st };
+
+/// The state for driving the next function: what is the program's carried,
+/// what was this function's cleared.
+let for_function : St -> :integer -> St;
+let for_function !st n = settle (st |> St.set_folds 0 |> St.set_tries 0 |> St.set_memo %{} |> St.set_made 0
+                                   |> St.set_grown 0 |> St.set_budget (num.max max_growth (growth_factor * n)));
+
+/// A function may grow by `growth_factor` times its size, or `max_growth`
+/// terms if that is more, before nothing more is unfolded or pushed in it.
+let growth_factor : :integer;
+let growth_factor = 3;
+let max_growth : :integer;
+let max_growth = 2000;
+
+/// Whether `n` more terms fit the function's budget.
+let affordable : St -> :integer -> :bool;
+let affordable st n = St.grown st + n <= St.budget st;
+
+let grow : St -> :integer -> St;
+let grow !st n = settle (St.set_grown (St.grown st + n) st);
 
 let folded : St -> St;
 let folded !st = settle (St.set_folds (St.folds st + 1) st);
@@ -211,7 +308,7 @@ let known v cx t = match t {
 /// which is what a union's variant without fields is (`Option.none`).
 let known_global : View -> :integer -> Term | :unit;
 let known_global v g = {
-    let gr = (View.globals v).[g];
+    let gr = (View.globals v).[g else %{}];
     if gr.[:kind else -1] != ir.global_function { () }
     else {
         let fi = gr.[:target];
@@ -230,6 +327,9 @@ let known_global v g = {
 /// global function, a closure made here, or a name bound to one.
 let callee_of : View -> Ctx -> Term -> [:integer, [:string]] | :unit;
 let callee_of v cx c = match c {
+    // A specialisation's global is past the image's own, and not known:
+    // it is a call already made of what is known.
+    Term.prim(:global, _, g, _, _, _) if g >= array.length (View.globals v) => (),
     Term.prim(:global, _, g, _, _, _) => {
         let gr = (View.globals v).[g];
         if gr.[:kind else -1] == ir.global_function { [gr.[:target], []] } else { () }
@@ -246,11 +346,17 @@ let callee_of v cx c = match c {
 /// Whether function `fi` may be written out where it is called with `n`
 /// arguments, here.
 let unfoldable : View -> Ctx -> :integer -> :integer -> :bool;
-let unfoldable v cx fi n = {
+let unfoldable v cx fi n = runnable v cx fi n && not (ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_rec);
+
+/// Whether function `fi` may be run here with `n` arguments at all: pure,
+/// saturated, not a thunk or a global value, not already being run above
+/// this point, and not too large.
+let runnable : View -> Ctx -> :integer -> :integer -> :bool;
+let runnable v cx fi n = {
     let f = (View.funcs v).[fi];
     let fl = f.[:flags else 0];
     f.[:arity else -1] == n && n > 0
-        && not (ir.has_flag fl ir.fn_impure) && not (ir.has_flag fl ir.fn_rec)
+        && not (ir.has_flag fl ir.fn_impure)
         && not (ir.has_flag fl ir.fn_thunk) && not (ir.has_flag fl ir.fn_global_value)
         && not (list.contains fi (Ctx.unfolding cx))
         && Ctx.depth cx < max_depth
@@ -432,15 +538,15 @@ let rec drive_new v cx !st t = match t {
         [st2, sc.rebuilt_block (View.reading v) t (block_flags b2) (block_stmts b2)]
     },
     Term.trying(fl, body, err, h) => {
-        let [st2, body2] = drive v cx st body;
-        let [st3, h2] = drive v cx st2 h;
+        let [st2, body2] = drive v (inside cx) st body;
+        let [st3, h2] = drive v (inside cx) st2 h;
         let rd = View.reading v;
         [st3, if sc.same rd body body2 && sc.same rd h h2 { t } else { Term.trying fl body2 err h2 }]
     },
     // A condition known decides which branch there is, and only that one is
     // driven.
     Term.prim(:if, fl, a, b, c, [x, y, z]) => {
-        let [st2, x2] = drive v cx st x;
+        let [st2, x2] = drive v (inside cx) st x;
         match truth x2 {
             true => inherited t (drive v cx (folded st2) y),
             false => if z == Term.absent { [folded st2, inherit t (Term.prim :unit 0 ir.no_node ir.no_node ir.no_node [])] }
@@ -453,7 +559,7 @@ let rec drive_new v cx !st t = match t {
         }
     },
     Term.prim(:switch_atom, fl, a, b, c, [subject, ..kids]) => {
-        let [st2, s2] = drive v cx st subject;
+        let [st2, s2] = drive v (inside cx) st subject;
         match known v cx s2 {
             Term.prim(:record_make, _, _, _, rc, _) =>
                 inherited t (drive v cx (folded st2) (switch_target v (record_name v rc) kids)),
@@ -463,11 +569,50 @@ let rec drive_new v cx !st t = match t {
             },
         }
     },
+    // A call of a recursive function is specialised on its arguments as
+    // written, before they are driven: driven first, a producer among them
+    // would be specialised on its own, and a specialisation's call is a
+    // name the consumer cannot see into. Outermost first is what lets the
+    // consumer take the whole pipeline as one shape.
+    Term.prim(:apply, fl, _, _, _, [callee, ..args]) if outermost v cx st t => {
+        let fi = match callee_of v cx callee { [f, _] => f, _ => -1 };
+        let [st2, done] = specialise v cx st fl callee fi args t;
+        if sc.same (View.reading v) t done { drive_call v cx st2 t } else { [st2, done] }
+    },
     Term.prim(op, fl, a, b, c, cs) => {
-        let [st2, cs2] = drive_all v cx st cs;
+        let [st2, cs2] = drive_all v (inside cx) st cs;
         let t2 = sc.rebuilt (View.reading v) t cs2;
         match decide v cx t2 {
             () => if op == :apply { call v cx st2 t2 } else { [st2, t2] },
+            d => [folded st2, inherit t d],
+        }
+    },
+    _ => [st, t],
+};
+
+/// Whether a term is a pure call of a known recursive global with an
+/// argument that has a shape: one to specialise before its arguments are
+/// driven.
+let outermost : View -> Ctx -> St -> Term -> :bool;
+let outermost v cx st t = match t {
+    Term.prim(:apply, fl, _, _, _, [callee, ..args]) if is_global callee && not (ir.has_flag fl ir.f_impure) =>
+        match callee_of v cx callee {
+            [fi, []] => ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_rec
+                        && runnable v (Ctx.set_unfolding [] cx) fi (list.length args)
+                        && not (all_holes (list.map (fn a -> list.head (shape_of v cx st 0 a)) args)),
+            _ => false,
+        },
+    _ => false,
+};
+
+/// A call driven the ordinary way: its parts, then what that decides.
+let drive_call : View -> Ctx -> St -> Term -> [St, Term];
+let drive_call v cx !st t = match t {
+    Term.prim(op, fl, a, b, c, cs) => {
+        let [st2, cs2] = drive_all v (inside cx) st cs;
+        let t2 = sc.rebuilt (View.reading v) t cs2;
+        match decide v cx t2 {
+            () => [st2, t2],
             d => [folded st2, inherit t d],
         }
     },
@@ -498,12 +643,13 @@ let call v cx !st t = match t {
     Term.prim(:apply, fl, _, _, _, [callee, ..args]) if not (ir.has_flag fl ir.f_impure) =>
         match callee_of v cx callee {
             [fi, caps] if unfoldable v cx fi (list.length args) && St.tries st < max_tries
+                          && affordable st ((View.sizes v).[fi])
                           && (not (is_global callee) || list.any (fn x -> known v cx x != ()) args) => {
                 let before = St.folds st;
                 // A closure's call written out is a decision of its own: the
                 // call through it was indirect, and once nothing calls it the
                 // closure is not made at all (`prune`).
-                let tried = settle (St.set_tries (St.tries st + 1) st);
+                let tried = grow (settle (St.set_tries (St.tries st + 1) st)) ((View.sizes v).[fi]);
                 let st1 = if is_global callee { tried } else { folded tried };
                 let [st2, out] = unfold v cx st1 fl fi caps args;
                 // Only an unfolding that decided something is kept; the
@@ -511,6 +657,9 @@ let call v cx !st t = match t {
                 if St.folds st2 > before { [st2, out] }
                 else { [St.set_folds before st2, t] }
             },
+            [fi, []] if is_global callee && ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_rec
+                        && runnable v (Ctx.set_unfolding [] cx) fi (list.length args) =>
+                specialise v cx st fl callee fi args t,
             _ => [st, t],
         },
     _ => [st, t],
@@ -524,18 +673,387 @@ let is_global t = match t { Term.prim(:global, _, _, _, _, _) => true, _ => fals
 /// name it is read from here, and the whole driven as a block.
 let unfold : View -> Ctx -> St -> :integer -> :integer -> [:string] -> [Term] -> [St, Term];
 let unfold v cx !st fl fi caps args = {
-    let [st2, subst, binds_rev] = list.fold (fn [s, m, bs] [k, arg] -> match arg {
-        Term.var(n, 0) => [s, m.[sc.slot_name k => n], bs],
+    let [st2, block, _] = unfolding v cx st fl fi caps args;
+    let inner = cx |> Ctx.set_unfolding (list.cons fi (Ctx.unfolding cx)) |> Ctx.set_depth (Ctx.depth cx + 1)
+                   |> Ctx.set_self ();
+    drive v inner st2 block
+};
+
+/// Function `fi`'s body written out with `args`, undriven, and the names
+/// its parameters are bound to.
+let unfolding : View -> Ctx -> St -> :integer -> :integer -> [:string] -> [Term] -> [St, Term, [:string]];
+let unfolding v cx !st fl fi caps args = {
+    let [st2, subst, binds_rev, names_rev] = list.fold (fn [s, m, bs, ns] [k, arg] -> match arg {
+        Term.var(n, 0) => [s, m.[sc.slot_name k => n], bs, list.cons n ns],
         _ => {
             let [s2, x] = fresh s;
-            [s2, m.[sc.slot_name k => x], list.cons (Stmt.bind x 0 arg) bs]
+            [s2, m.[sc.slot_name k => x], list.cons (Stmt.bind x 0 arg) bs, list.cons x ns]
         },
-    }) [st, %{}, []] (list.enumerate args);
+    }) [st, %{}, [], []] (list.enumerate args);
     let with_caps = list.fold (fn m [i, n] -> m.[sc.capture_name i => n]) subst (list.enumerate caps);
     let [st3, body] = rename st2 with_caps ((View.bodies v).[fi]);
-    let inner = cx |> Ctx.set_unfolding (list.cons fi (Ctx.unfolding cx)) |> Ctx.set_depth (Ctx.depth cx + 1);
-    drive v inner st3 (Term.block (sc.untail_flags fl) (list.reverse (list.cons (Stmt.expr body) binds_rev)))
+    [st3, Term.block (sc.untail_flags fl) (list.reverse (list.cons (Stmt.expr body) binds_rev)), list.reverse names_rev]
 };
+
+// --- specialising -----------------------------------------------------------------
+
+/// What is known of an argument, for specialising: a hole -- an argument
+/// passed as it is -- a closure of function `fi` with `n` captures, each a
+/// hole, or a call of `fi` through `callee` with its own arguments' shapes.
+union Shape {
+    hole
+    closure(fi : :integer, n : :integer)
+    call(callee : Term, fi : :integer, args : [Shape])
+}
+
+/// An argument's shape, and the terms its holes are, in order.
+let shape_of : View -> Ctx -> St -> :integer -> Term -> [Shape, [Term]];
+let rec shape_of v cx st depth t0 = {
+  let t = original_call st t0;
+  match known v cx t {
+    Term.lam(:make_closure, _, fi, caps) => [Shape.closure fi (list.length caps), list.map (fn n -> Term.var n 0) caps],
+    _ => {
+        let pending = match t { Term.var(n, _) => original_call st ((Ctx.pending cx).[n else ()]), _ => () };
+        let producer = match t { Term.prim(:apply, _, _, _, _, _) => t, _ => pending };
+        match producer {
+            Term.prim(:apply, fl, _, _, _, [callee, ..args]) if depth < max_shape && is_global callee
+                                                              && not (ir.has_flag fl ir.f_impure) =>
+                match callee_of v cx callee {
+                    [fi, []] if runnable v (Ctx.set_unfolding [] cx) fi (list.length args) => {
+                        let parts = list.map (fn a -> shape_of v cx st (depth + 1) a) args;
+                        [Shape.call callee fi (list.map list.head parts), list.concat (list.map (fn p -> list.nth 1 p) parts)]
+                    },
+                    _ => [Shape.hole, [t0]],
+                },
+            _ => [Shape.hole, [t0]],
+        }
+    },
+  }
+};
+
+/// A call of a specialisation as the call it stands for: the original
+/// function, with the shapes it was made for built again around the
+/// arguments. A specialisation is a name for a call, and seen through, a
+/// pipeline one of whose stages was specialised on its own is still one
+/// shape to the stage that consumes it. Anything else is itself.
+let original_call : St -> Term -> Term;
+let original_call st t = match t {
+    Term.prim(:apply, fl, a, b, c, [Term.prim(:global, _, gi, _, _, _), ..args]) => match (St.spec_calls st).[gi else ()] {
+        // A closure's captures are names; one passed something else is not
+        // a closure that can be built again here.
+        [callee, shapes] if closures_named shapes args => {
+            let [rebuilt, _] = rebuild_with shapes args;
+            Term.prim :apply fl a b c (list.cons callee rebuilt)
+        },
+        _ => t,
+    },
+    _ => t,
+};
+
+/// Whether every hole a closure's capture fills is a name.
+let closures_named : [Shape] -> [Term] -> :bool;
+let closures_named shapes holes = list.head (named_from shapes holes);
+
+let named_from : [Shape] -> [Term] -> [:bool, [Term]];
+let rec named_from shapes holes = match shapes {
+    [] => [true, holes],
+    [Shape.hole, ..rest] => named_from rest (list.drop 1 holes),
+    [Shape.closure(_, n), ..rest] => {
+        let ok = list.all (fn h -> match h { Term.var(_, _) => true, _ => false }) (list.take n holes);
+        let [later, left] = named_from rest (list.drop n holes);
+        [ok && later, left]
+    },
+    [Shape.call(_, _, args), ..rest] => {
+        let [inner, left] = named_from args holes;
+        let [later, left2] = named_from rest left;
+        [inner && later, left2]
+    },
+};
+
+/// The shapes built again with `holes` for their holes, in order: the
+/// terms, and the holes left over.
+let rebuild_with : [Shape] -> [Term] -> [[Term], [Term]];
+let rec rebuild_with shapes holes = match shapes {
+    [] => [[], holes],
+    [sh, ..rest] => {
+        let [t, left] = match sh {
+            Shape.hole => [list.head holes, list.drop 1 holes],
+            Shape.closure(fi, n) => [Term.lam :make_closure 0 fi (list.map (fn h -> match h { Term.var(m, _) => m, _ => "?" }) (list.take n holes)),
+                                     list.drop n holes],
+            Shape.call(callee, _, args) => {
+                let [ts, left2] = rebuild_with args holes;
+                [Term.prim :apply 0 ir.no_node ir.no_node ir.no_node (list.cons callee ts), left2]
+            },
+        };
+        let [ts, left3] = rebuild_with rest left;
+        [list.cons t ts, left3]
+    },
+};
+
+let shape_text : Shape -> :string;
+let rec shape_text sh = match sh {
+    Shape.hole => "_",
+    Shape.closure(fi, n) => "λ" + to_string fi + "/" + to_string n,
+    Shape.call(_, fi, args) => to_string fi + "(" + str.join_str "," (list.map shape_text args) + ")",
+};
+
+let all_holes : [Shape] -> :bool;
+let all_holes shapes = list.all (fn sh -> sh == Shape.hole) shapes;
+
+/// The arguments a specialisation's body is driven with: each shape built
+/// again from the specialisation's parameters, `s0` onwards, in hole order.
+let rebuild : [Shape] -> :integer -> [[Term], :integer];
+let rec rebuild shapes k = match shapes {
+    [] => [[], k],
+    [sh, ..rest] => {
+        let [t, k2] = rebuild_one sh k;
+        let [ts, k3] = rebuild rest k2;
+        [list.cons t ts, k3]
+    },
+};
+
+let rebuild_one : Shape -> :integer -> [Term, :integer];
+let rebuild_one sh k = match sh {
+    Shape.hole => [Term.var (sc.slot_name k) 0, k + 1],
+    Shape.closure(fi, n) => [Term.lam :make_closure 0 fi (list.map sc.slot_name (list.range k (k + n))), k + n],
+    Shape.call(callee, _, args) => {
+        let [ts, k2] = rebuild args k;
+        [Term.prim :apply 0 ir.no_node ir.no_node ir.no_node (list.cons callee ts), k2]
+    },
+};
+
+/// A call of recursive function `fi`, specialised on its arguments' shapes:
+/// the specialisation that has their key if there is one, else one made
+/// now, else the call as it was.
+let specialise : View -> Ctx -> St -> :integer -> Term -> :integer -> [Term] -> Term -> [St, Term];
+let specialise v cx !st fl callee fi args t = {
+    let parts = list.map (fn a -> shape_of v cx st 0 a) args;
+    let shapes = list.map list.head parts;
+    let raw_holes = list.concat (list.map (fn p -> list.nth 1 p) parts);
+    let key = to_string fi + "(" + str.join_str "," (list.map shape_text shapes) + ")";
+    let call_of gi holes = Term.prim :apply fl ir.no_node ir.no_node ir.no_node
+                                     (list.cons (Term.prim :global 0 gi ir.no_node ir.no_node []) holes);
+    if all_holes shapes { [st, t] }
+    else {
+        match (St.specs st).[key else ()] {
+            [_, gi] => {
+                let [st1, holes] = drive_all v (inside cx) st raw_holes;
+                [folded st1, call_of gi holes]
+            },
+            () if St.made st < max_made && map.size (St.specs st) < max_specs => {
+                let made = make_spec v st fi callee key shapes (list.length raw_holes);
+                let [st1, holes] = drive_all v (inside cx) made raw_holes;
+                [folded st1, call_of ((St.specs made).[key].[1]) holes]
+            },
+            _ => [st, t],
+        }
+    }
+};
+
+/// Specialisation `key` of function `fi`, made: registered first, so that the
+/// call of it its body comes to folds; then its body driven, which is the
+/// original's with its parameters bound to the shapes built again.
+let make_spec : View -> St -> :integer -> Term -> :string -> [Shape] -> :integer -> St;
+let make_spec v !st fi callee key shapes n = {
+    let hfi = St.next_fi st;
+    let hgi = St.next_gi st;
+    let registered = settle (st |> St.set_specs ((St.specs st).[key => [hfi, hgi]])
+                                |> St.set_spec_calls ((St.spec_calls st).[hgi => [callee, shapes]])
+                                |> St.set_next_fi (hfi + 1) |> St.set_next_gi (hgi + 1)
+                                |> St.set_made (St.made st + 1));
+    let [args, _] = rebuild shapes 0;
+    let cx = Ctx.new () |> Ctx.set_depth 1;
+    // Its own budget while its body is driven, and the caller's after.
+    let budgeted = settle (registered |> St.set_grown 0
+                                      |> St.set_budget (num.max max_growth (growth_factor * (View.sizes v).[fi])));
+    let [st2, block, names] = unfolding v cx budgeted 0 fi [] args;
+    let body_cx = cx |> Ctx.set_unfolding [fi] |> Ctx.set_self [callee, names];
+    let [st3, body] = drive v body_cx st2 block;
+    let f = (View.funcs v).[fi];
+    let record = f.[:arity => n].[:n_captures => 0].[:captures_off => 0].[:slots => 0];
+    let fun = sc.fun_of record (pruned (View.reading v) body);
+    let g = global_of v callee;
+    settle (st3 |> St.set_grown (St.grown st) |> St.set_budget (St.budget st)
+                |> St.set_added (list.cons [hfi, fun] (St.added st3))
+                |> St.set_new_globals (list.cons [hgi, g.[:target => hfi]] (St.new_globals st3)))
+};
+
+let global_of : View -> Term -> :map;
+let global_of v callee = match callee {
+    Term.prim(:global, _, g, _, _, _) => (View.globals v).[g],
+    _ => %{},
+};
+
+// --- pushing a consumer into its producer ---------------------------------------
+
+/// `bind n strict x; rest`, with `x` a producer -- a call, or a name bound
+/// to one -- run into what consumes it, if that decides anything: the
+/// producer unfolded once, here, and `rest` pushed into each branch of what
+/// it came to (`push`). Answers the block from here on, or `()`.
+let consume : View -> Ctx -> St -> :integer -> [Stmt] -> [Stmt] -> [St, Term | :unit];
+let consume v cx !st fl ss acc = match ss {
+    [Stmt.bind(n, bfl, x), ..rest] if bfl == ir.f_strict && St.tries st < max_tries && reads n rest => {
+        let producer = original_call st (match x { Term.var(p, _) => (Ctx.pending cx).[p else x], _ => x });
+        match producer {
+            Term.prim(:apply, afl, _, _, _, [callee, ..args]) if not (ir.has_flag afl ir.f_impure) => {
+                // The arguments go in as written: the unfolding binds them,
+                // and a binding remembers a producer as written (`pending`),
+                // where driven first it would be a specialisation's call.
+                let [st2, callee2] = drive v (inside cx) st callee;
+                let args2 = args;
+                match callee_of v cx callee2 {
+                    [fi, _] if not (runnable v cx fi (list.length args2) && Ctx.depth cx < max_depth
+                                    && (View.sizes v).[fi] <= max_size && size_of_stmts rest <= max_pushed) =>
+                        declined st (to_string fi + ": runnable " + to_string (runnable v cx fi (list.length args2))
+                                     + ", depth " + to_string (Ctx.depth cx) + ", size " + to_string ((View.sizes v).[fi])
+                                     + ", rest " + to_string (size_of_stmts rest)),
+                    [fi, _] if not (affordable st2 ((View.sizes v).[fi] + size_of_stmts rest)) =>
+                        declined st "over the function's budget",
+                    [fi, caps] => {
+                        let tried = settle (St.set_tries (St.tries st2 + 1) st2);
+                        let [st3, block, names] = unfolding v cx tried fl fi caps args2;
+                        let inner = cx |> Ctx.set_unfolding (list.cons fi (Ctx.unfolding cx))
+                                       |> Ctx.set_depth (Ctx.depth cx + 1)
+                                       |> Ctx.set_self (if is_global callee2 { [callee2, names] } else { () });
+                        let [st4, produced] = drive v inner st3 block;
+                        let leaves = leaves_of produced;
+                        if list.length leaves > max_leaves || not (list.any (fn l -> constructed v cx l) leaves) {
+                            declined st (to_string fi + ": " + to_string (list.length leaves) + " leaves, none constructed")
+                        }
+                        else {
+                            let again = match [x, Ctx.self cx] {
+                                [Term.var(p, _), [g, params]] if list.contains p params => [g, params, p],
+                                _ => (),
+                            };
+                            let pushed = push v cx n bfl rest again produced;
+                            let copies = list.length (list.filter (fn l -> not (raises v l)) leaves);
+                            let charged = grow st4 ((View.sizes v).[fi] + copies * size_of_stmts rest);
+                            let [st5, out] = drive v cx (folded charged) pushed;
+                            [st5, Term.block fl (list.reverse (list.cons (Stmt.expr out) acc))]
+                        }
+                    },
+                    _ => declined st "callee unknown",
+                }
+            },
+            _ => [st, ()],
+        }
+    },
+    _ => [st, ()],
+};
+
+/// `()`, noting why, when the state is the stats run's.
+let declined : St -> :string -> [St, Term | :unit];
+let declined !st why = if St.explain st { [settle (St.set_why (list.cons why (St.why st)) st), ()] } else { [st, ()] };
+
+/// The terms a produced value can finish as: through blocks to their last
+/// statement, through `if`s to both branches, through a switch to its
+/// targets.
+let leaves_of : Term -> [Term];
+let rec leaves_of t = match t {
+    Term.block(_, ss) => match list.reverse ss { [Stmt.expr(l), .._] => leaves_of l, _ => [t] },
+    Term.prim(:if, _, _, _, _, [_, y, z]) => list.append (leaves_of y) (leaves_of z),
+    Term.prim(:switch_atom, _, _, _, _, [_, ..kids]) => list.concat (list.map leaves_of (switch_targets kids)),
+    _ => [t],
+};
+
+let switch_targets : [Term] -> [Term];
+let rec switch_targets kids = match kids {
+    [default] => [default],
+    [_, target, ..rest] => list.cons target (switch_targets rest),
+    [] => [],
+};
+
+/// Whether a produced leaf is a constructor -- something a `match` decides.
+let constructed : View -> Ctx -> Term -> :bool;
+let constructed v cx t = match t {
+    Term.prim(op, _, _, _, _, _) if op == :record_make || op == :make_list || op == :cons => true,
+    Term.prim(:global, _, _, _, _, _) => known v cx t != (),
+    _ => false,
+};
+
+/// `produced` with `bind n strict leaf; rest` at each of its leaves: what
+/// the consumer does with each thing the producer can finish as. A leaf that
+/// raises raises, and needs nothing after it. A leaf that is a call, where
+/// the consumer is a function forcing its own parameter `p` in tail position
+/// (`again`), is that function called again with the call in `p`'s place --
+/// the same consumer on the rest of the producer, which specialises to the
+/// specialisation being made, and ties the loop.
+let push : View -> Ctx -> :string -> :integer -> [Stmt] -> [Term, [:string], :string] | :unit -> Term -> Term;
+let rec push v cx n bfl rest again t = {
+    let p x = push v cx n bfl rest again x;
+    match t {
+        Term.block(bf, ss) => match list.reverse ss {
+            [Stmt.expr(l), ..before] => Term.block bf (list.reverse (list.cons (Stmt.expr (p l)) before)),
+            _ => t,
+        },
+        Term.prim(:if, fl, a, b, c, [x, y, z]) => Term.prim :if (sc.untail_flags fl) a b c [x, p y, p z],
+        Term.prim(:switch_atom, fl, a, b, c, [subject, ..kids]) =>
+            Term.prim :switch_atom fl a b c (list.cons subject (push_targets p kids)),
+        _ if raises v t => t,
+        Term.prim(:apply, _, _, _, _, _) if again != () && not (constructed v cx t) => {
+            let [g, params, q] = again;
+            Term.prim :apply 0 ir.no_node ir.no_node ir.no_node
+                      (list.cons g (list.map (fn name -> if name == q { t } else { Term.var name 0 }) params))
+        },
+        _ => Term.block 0 (list.cons (Stmt.bind n bfl t) rest),
+    }
+};
+
+let push_targets : (Term -> Term) -> [Term] -> [Term];
+let rec push_targets p kids = match kids {
+    [default] => [p default],
+    [key, target, ..rest] => list.cons key (list.cons (p target) (push_targets p rest)),
+    [] => [],
+};
+
+/// Whether a term is a failed `match`, which raises and finishes nothing.
+let raises : View -> Term -> :bool;
+let raises v t = match t {
+    Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, id, _, _, _), .._]) => id == View.match_fail v,
+    _ => false,
+};
+
+/// Whether `rest` reads `n`. Bounded: past a budget of terms it answers yes,
+/// which costs only a push that decides nothing.
+let reads : :string -> [Stmt] -> :bool;
+let reads n ss = list.any (fn s -> match s {
+    Stmt.bind(_, _, x) => mentions n x,
+    Stmt.expr(e) => mentions n e,
+}) ss;
+
+let mentions : :string -> Term -> :bool;
+let rec mentions n t = match t {
+    Term.var(m, _) => m == n,
+    Term.lam(_, _, _, caps) => list.contains n caps,
+    Term.prim(_, _, _, _, _, cs) => list.any (fn c -> mentions n c) cs,
+    Term.block(_, ss) => reads n ss,
+    Term.trying(_, body, _, h) => mentions n body || mentions n h,
+    Term.absent => false,
+};
+
+/// How many times `rest` reads `n`, counting no further than two.
+let uses : :string -> [Stmt] -> :integer;
+let uses n ss = list.fold (fn k s -> if k >= 2 { k } else {
+    k + (match s { Stmt.bind(_, _, x) => count n x, Stmt.expr(e) => count n e })
+}) 0 ss;
+
+let count : :string -> Term -> :integer;
+let rec count n t = match t {
+    Term.var(m, _) => if m == n { 1 } else { 0 },
+    // One branch runs: a name read in each is read once.
+    Term.prim(:if, _, _, _, _, [x, y, z]) => count n x + num.max (count n y) (count n z),
+    Term.prim(op, _, _, _, _, [subject, ..kids]) if op == :switch_atom || op == :switch_head =>
+        count n subject + list.fold (fn k target -> num.max k (count n target)) 0 (switch_targets kids),
+    // A closure may run any number of times.
+    Term.lam(_, _, _, caps) => if list.contains n caps { 2 } else { 0 },
+    Term.prim(_, _, _, _, _, cs) => list.fold (fn k c -> if k >= 2 { k } else { k + count n c }) 0 cs,
+    Term.block(_, ss) => uses n ss,
+    Term.trying(_, body, _, h) => count n body + count n h,
+    Term.absent => 0,
+};
+
+let size_of_stmts : [Stmt] -> :integer;
+let size_of_stmts ss = list.fold_strict (fn k s -> k + stmt_size s) 0 ss;
 
 /// A block's statements, driven in order, each binding known to the ones
 /// after it. A statement that is a block is spliced into this one when that
@@ -548,7 +1066,7 @@ let drive_block : View -> Ctx -> St -> :integer -> [Stmt] -> [Stmt] -> [St, Term
 let rec drive_block v cx !st fl ss acc = match ss {
     [] => [st, Term.block fl (list.reverse acc)],
     [Stmt.expr(e)] => {
-        let [st2, e2] = drive v cx st e;
+        let [st2, e2] = drive v cx st e;  // the last statement: in tail position if this is
         match e2 {
             Term.block(_, inner) if fresh_term v e2 => [st2, Term.block fl (list.append (list.reverse acc) inner)],
             _ => [st2, Term.block fl (list.reverse (list.cons (kept_expr v (list.head ss) e e2) acc))],
@@ -560,11 +1078,12 @@ let rec drive_block v cx !st fl ss acc = match ss {
         // parameter, once the function is written out -- forces nothing.
         if not (ir.has_flag (flags_of e) ir.f_strict) || harmless v cx e { drive_block v cx st fl rest acc }
         else {
-            let [st2, e2] = drive v cx st e;
+            let [st2, e2] = drive v (inside cx) st e;
             drive_block v cx st2 fl rest (list.cons (kept_expr v (list.head ss) e e2) acc)
         },
-    [Stmt.bind(n, bfl, x), ..rest] => {
-        let [st2, x2] = drive v cx st x;
+    [Stmt.bind(n, bfl, x), ..rest] => match consume v cx st fl ss acc {
+      [st0, ()] => {
+        let [st1, x2] = drive v (inside cx) st0 x;
         let [hoisted, value] = match x2 {
             Term.block(_, inner) if fresh_term v x2 && spliceable bfl inner => {
                 let [last, before] = match list.reverse inner { [Stmt.expr(l), ..b] => [l, list.reverse b], _ => [x2, []] };
@@ -572,15 +1091,45 @@ let rec drive_block v cx !st fl ss acc = match ss {
             },
             _ => [[], x2],
         };
-        let cx2 = list.fold (fn c s -> learn v c s) cx hoisted;
+        // A constructor bound strictly -- a pushed `match`'s subject -- has
+        // its parts named, so that taking it apart reads a name.
+        let [st2, parts, value2] = if ir.has_flag bfl ir.f_strict { named st1 value } else { [st1, [], value] };
+        let before = list.append hoisted parts;
+        // A producer is remembered as it was written (`outermost`), though
+        // its binding keeps what it was driven to.
+        let cx1 = match x {
+            Term.prim(:apply, _, _, _, _, _) if bfl == 0 => learn v cx (Stmt.bind n 0 x) rest,
+            _ => cx,
+        };
+        let cx2 = list.fold (fn c s -> learn v c s rest) cx1 before;
         // Forcing a value that is known is building it, which cannot fail,
         // so a strict binding of one need not be strict -- and then, if
         // nothing reads it, it need not be at all.
-        let bfl2 = if bfl == ir.f_strict && harmless v cx2 value { 0 } else { bfl };
-        let bound = if bfl2 == bfl && sc.same (View.reading v) x value { list.head ss } else { Stmt.bind n bfl2 value };
-        drive_block v (learn v cx2 bound) st2 fl rest
-                    (list.cons bound (list.append (list.reverse hoisted) acc))
+        let bfl2 = if bfl == ir.f_strict && harmless v cx2 value2 { 0 } else { bfl };
+        let bound = if bfl2 == bfl && sc.same (View.reading v) x value2 { list.head ss } else { Stmt.bind n bfl2 value2 };
+        let cx3 = if (Ctx.pending cx1).[n else ()] != () { cx2 } else { learn v cx2 bound rest };
+        drive_block v cx3 st2 fl rest
+                    (list.cons bound (list.append (list.reverse before) acc))
+      },
+      done => done,
     },
+};
+
+/// A constructor whose parts are not all trivial, with each such part bound
+/// to a fresh name first: the bindings, and the constructor of names.
+let named : St -> Term -> [St, [Stmt], Term];
+let named !st t = match t {
+    Term.prim(op, fl, a, b, c, cs) if (op == :record_make || op == :cons || op == :make_list)
+                                      && not (list.all trivial cs) => {
+        let [st2, binds_rev, cs_rev] = list.fold (fn [s, bs, out] x ->
+            if trivial x { [s, bs, list.cons x out] }
+            else {
+                let [s2, name] = fresh s;
+                [s2, list.cons (Stmt.bind name 0 x) bs, list.cons (Term.var name 0) out]
+            }) [st, [], []] cs;
+        [st2, list.reverse binds_rev, Term.prim op fl a b c (list.reverse cs_rev)]
+    },
+    _ => [st, [], t],
 };
 
 /// Whether a term is one the driver made rather than one read from the
@@ -614,10 +1163,21 @@ let spliceable bfl inner = match list.reverse inner {
 };
 
 /// What a statement teaches: the value a binding binds, when that is known.
-let learn : View -> Ctx -> Stmt -> Ctx;
-let learn v cx s = match s {
-    Stmt.bind(n, _, x) => match known v cx x {
-        () => cx,
+///
+/// A lazy binding of a call of a known pure function that `rest` reads at
+/// most once is a producer, which a call may be specialised on (`pending`).
+let learn : View -> Ctx -> Stmt -> [Stmt] -> Ctx;
+let learn v cx s rest = match s {
+    // Another name for a producer is the producer.
+    Stmt.bind(n, 0, Term.var(m, _)) if (Ctx.pending cx).[m else ()] != () && uses n rest <= 1 =>
+        Ctx.set_pending ((Ctx.pending cx).[n => (Ctx.pending cx).[m]]) cx,
+    Stmt.bind(n, bfl, x) => match known v cx x {
+        () => match x {
+            Term.prim(:apply, afl, _, _, _, [callee, .._]) if bfl == 0 && not (ir.has_flag afl ir.f_impure)
+                                                             && is_global callee && uses n rest <= 1 =>
+                Ctx.set_pending ((Ctx.pending cx).[n => x]) cx,
+            _ => cx,
+        },
         k => Ctx.set_known ((Ctx.known cx).[n => k]) cx,
     },
     _ => cx,
@@ -686,16 +1246,20 @@ let rec prune_new rd !memo t = match t {
 // --- the program -------------------------------------------------------------------
 
 /// Function `fi`'s body driven, if that decided anything.
-let drive_function : View -> :integer -> Option;
-let drive_function v fi = Option.map (fn d -> list.head d) (driven v fi);
 
-/// Function `fi` driven, with how many things were decided in it, if any.
-let driven : View -> :integer -> Option;
-let driven v fi = {
-    let [st, body] = drive v (Ctx.new ()) (St.new ()) ((View.bodies v).[fi]);
-    if St.folds st == 0 { Option.none }
-    else { Option.some [sc.fun_of ((View.funcs v).[fi]) (pruned (View.reading v) body), St.folds st] }
-};
+/// Function `fi` driven, with how many things were decided in it, if any,
+/// and the state carried on to the next.
+let driven : View -> St -> :integer -> [St, Option];
+let driven v !st fi = if ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_impure { [st, Option.none] } else {
+    let [st2, body] = drive v (Ctx.new ()) (for_function st ((View.sizes v).[fi])) ((View.bodies v).[fi]);
+    if St.folds st2 == 0 { [st2, Option.none] }
+    else { [st2, Option.some [sc.fun_of ((View.funcs v).[fi]) (pruned (View.reading v) body), St.folds st2]] }
+  };
+
+/// The state a program is driven from: specialisations numbered after its
+/// own functions and globals.
+let start : View -> St;
+let start v = St.new () |> St.set_next_fi (array.length (View.funcs v)) |> St.set_next_gi (array.length (View.globals v));
 
 /// What driving decides, function by function, for `--sc-stats`: a line of
 /// totals, then the functions that grew most, each with what was decided in
@@ -703,20 +1267,24 @@ let driven v fi = {
 let report : ir.Image -> [:string];
 let report img = {
     let v = view img;
-    let rows = list.fold (fn out fi -> match driven v fi {
-        Option.some([f, folds]) => {
+    let [st, rows] = list.fold (fn [s, out] fi -> match driven v s fi {
+        [s2, Option.some([f, folds])] => {
             let before = (View.sizes v).[fi];
             let after = size (Fun.body f);
-            list.cons [fi, folds, before, after] out
+            [s2, list.cons [fi, folds, before, after] out]
         },
-        Option.none => out,
-    }) [] (list.range 0 (array.length (View.funcs v)));
+        [s2, Option.none] => [s2, out],
+    }) [St.set_explain true (start v), []] (list.range 0 (array.length (View.funcs v)));
     let total k = list.sum (list.map (fn r -> list.nth k r) rows);
     let name fi = (View.strs v).[(View.funcs v).[fi].[:name else 0]];
     let grown = list.take 25 (list.reverse (list.sort_on (fn r -> list.nth 3 r - list.nth 2 r) rows));
     list.cons ("supercompiler: " + to_string (list.length rows) + " of " + to_string (array.length (View.funcs v))
                + " functions changed, " + to_string (total 1) + " decisions, "
-               + to_string (total 2) + " -> " + to_string (total 3) + " terms")
+               + to_string (total 2) + " -> " + to_string (total 3) + " terms, "
+               + to_string (list.length (St.added st)) + " specialisations; declined: "
+               + str.join_str "; " (list.take 200 (St.why st)) + "; made: "
+               + str.join_str ", " (list.map (fn [key, fg] -> key + " = fn#" + to_string (list.head fg) + " g" + to_string (list.nth 1 fg))
+                                             (map.pairs (St.specs st))))
         (list.map (fn [fi, folds, before, after] ->
              "  fn#" + to_string fi + " " + to_string (name fi) + ": " + to_string folds + " decided, "
              + to_string before + " -> " + to_string after) grown)
@@ -727,9 +1295,19 @@ let report img = {
 let supercompile : ir.Image -> Result;
 let supercompile img = {
     let v = view img;
-    let changed = list.fold (fn m fi -> match drive_function v fi {
-        Option.some(f) => m.[fi => f],
-        Option.none => m,
-    }) %{} (list.range 0 (array.length (View.funcs v)));
-    sc.patch img (View.reading v) changed [] []
+    let [st, changed] = list.fold (fn [s, m] fi -> match driven v s fi {
+        [s2, Option.some([f, _])] => [s2, m.[fi => f]],
+        [s2, Option.none] => [s2, m],
+    }) [start v, %{}] (list.range 0 (array.length (View.funcs v)));
+    let added = list.map (fn a -> list.nth 1 a) (list.sort_on list.head (St.added st));
+    // In index order: a specialisation is numbered when it is begun and
+    // recorded when its body is done, and one begun inside another is done
+    // first.
+    let globals = list.map (fn g -> list.nth 1 g) (list.sort_on list.head (St.new_globals st));
+    let n_funcs = array.length (View.funcs v);
+    let numbered = list.map list.head (list.sort_on list.head (St.added st));
+    if numbered != list.range n_funcs (n_funcs + list.length numbered) || list.length globals != list.length added {
+        Result.error ["specialisations out of step: functions " + to_string numbered + ", "
+                      + to_string (list.length globals) + " globals, " + to_string (map.size (St.specs st)) + " keys"]
+    } else { sc.patch img (View.reading v) changed added globals }
 };

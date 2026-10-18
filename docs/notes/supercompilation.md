@@ -156,3 +156,56 @@ callee out moves its suspensions into a bigger frame. Deciding what is known
 is the floor the rest is built on, not the win; what removes suspensions is
 specialising recursive functions and pushing a consumer into its producer,
 which is step 2.
+
+## Milestone 2, step 2: specialising, and running producers into consumers (2026-10-17)
+
+A call of a recursive function is **specialised** on what is known of its
+arguments -- a closure (its captures become parameters), or a call nothing
+else reads, a *producer*, itself in shapes -- and the specialisation is
+registered before its body is driven, so the same call inside it folds back
+to it. Where a body forces a parameter bound to a producer (the subject of
+its `match`), the producer is unfolded there and the rest of the body pushed
+into each of its branches (case-of-case): a branch ending in a constructor
+meets the `match` and decides it; one ending in a call is the consumer called
+again on that call, a call of a known shape that folds. `dreams/tests/sc/`
+holds two programs to it: `suml 0 (mapl f (filterl p (upto 0 n)))` comes out
+as one loop over `i` that builds no list, and a `Result` made and matched at
+every step of a loop is never made.
+
+What it buys, the same VM, the JIT on:
+
+| program | as written | supercompiled |
+|---|---|---|
+| `tests/sc/deforest.dr` | 3.16 s, 2.84 GB allocated, 515 majors | 0.079 s, 0.48 MB, 0 majors |
+| `tests/sc/results.dr` | 203 ms, 131 MB | 68 ms, 9.9 MB |
+| self-compile | 4.85 s, 7.97 GB | 4.78 s, 8.01 GB |
+
+Interpreted the gain is smaller (deforest 8.7 s to 1.9 s, results 27% fewer
+reductions): what is left is a loop of strict integer arithmetic, which is
+exactly what the JIT takes and the interpreter still runs a frame per step
+for. The compiler itself is neither faster nor slower: its pipelines are
+`std.list`'s, which the existing fusion already runs as loops.
+
+What it took:
+
+- **Outermost first.** A call is specialised on its arguments *as written*,
+  before they are driven, and a producer is remembered as written; driven
+  first, the inner stage is specialised on its own and the outer one sees a
+  call it cannot look into. And a specialisation's call is seen through to
+  the call it stands for (`original_call`), so a stage that was specialised
+  anyway is still part of the shape.
+- **A name read in each branch of an `if` is read once.** The use count that
+  decides whether a binding is a producer added the branches together, so
+  the tail of every filtered list looked shared, and the loop over it was
+  specialised on the list instead of on the call that makes it.
+- **Globals are numbered when a specialisation is begun and recorded when it
+  is done**, and one begun inside another is done first: the table has to be
+  sorted, or a call of one specialisation is a call of another.
+- **A growth whistle per function.** Pushes nest -- each copy of a block's
+  rest may push its own -- so a bound per push is no bound; each unfolding
+  and push is charged the terms it writes against three times the function's
+  size. Without it example 21 needed more than 12 GB to compile.
+- **Impure bodies are not driven.** Driving them made the self-compile 15%
+  slower and allocate 15% more, none of it in any function's profile: a
+  process the build spawns copies the frame of what it is handed, and a body
+  written out into an impure function that spawns makes that frame larger.
