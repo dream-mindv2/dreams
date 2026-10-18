@@ -1471,6 +1471,16 @@ let bind_at ctx source name slot span r =
             if name == "_" { f }
             else { f.[:scopes => (on_front (fn sc -> list.append sc [[name, slot, span]]) (scopes f))] }) r);
 
+/// The frame's next free slot, and putting it back there: what lets branches
+/// of which only one runs give their slots to each other. `max_slots` keeps
+/// the widest, which is what the frame is made with.
+let slot_mark : Resolution -> :integer;
+let slot_mark r = next_slot (list.head (frames r));
+let slot_reset : :integer -> Resolution -> Resolution;
+let slot_reset k r = update_frame (fn fr -> fr.[:next_slot => k]) r;
+let larger : :integer -> :integer -> :integer;
+let larger a b = if a > b { a } else { b };
+
 /// Keep a slot out of circulation for the rest of the frame, after the scope
 /// that named it has gone.
 ///
@@ -2014,9 +2024,19 @@ let rec check_expr c e r =
         },
         [:unary, _, x, _] => check_expr c x r,
         [:binary, _, l, rhs, _] => check_expr c rhs (check_expr c l r),
+        // The two branches share their slots: only one of them runs in any
+        // one call, so a slot one binds is never one the other reads.
         [:if, cond, t, el, _] => {
-            let r1 = check_expr c t (check_expr c cond r);
-            match el { () => r1, x => check_expr c x r1 }
+            let r0 = check_expr c cond r;
+            let base = slot_mark r0;
+            let r1 = check_expr c t r0;
+            match el {
+                () => r1,
+                x => {
+                    let r2 = check_expr c x (slot_reset base r1);
+                    slot_reset (larger (slot_mark r1) (slot_mark r2)) r2
+                },
+            }
         },
         // Whether effects are allowed here is recorded, because lowering needs
         // it and cannot see it: a block's non-final statements are only worth
@@ -2103,7 +2123,16 @@ let rec check_expr c e r =
             let scoped = push_scope r1;
             let held = bind_one (ctx_mi c) (ctx_source c) "_" span scoped;
             let r2 = record (ctx_mi c) (ctx_source c) span (Meaning.subject (list.nth 1 held)) (list.head held);
-            pop_scope (list.fold (fn acc arm -> check_arm c arm acc) r2 arms)
+            // The arms share their slots, as an `if`'s branches do: the arm
+            // that runs is the only one whose bindings live past its test, and
+            // one tried before it whose guard failed made nothing that
+            // outlives the guard, which answers a boolean.
+            let base = slot_mark r2;
+            let [walked, top] = list.fold (fn [acc, widest] arm -> {
+                let done = check_arm c arm (slot_reset base acc);
+                [done, larger widest (slot_mark done)]
+            }) [r2, base] arms;
+            pop_scope (slot_reset top walked)
         },
 
         [:get, container, key, fallback, _] => {
@@ -4677,6 +4706,11 @@ when test {
         // Slots are not recycled when a scope ends. A value built in one scope
         // can be handed back unevaluated and read its binders out of the frame
         // later, by which time a sibling scope would have overwritten them.
+        // Branches are not siblings: only one of them runs in a call.
+        test.case "the branches of an if and the arms of a match share their slots"
+            $( test.eq! [3, 4]
+                        [func_slots (list.head (funcs (resolved! "let f x = if x { let a = 1; let b = 2; a + b } else { let c = 3; let d = 4; c + d };"))),
+                         func_slots (list.head (funcs (resolved! "let f x = match x { [a] => a, [b, c] => b + c };")))] ),
         test.case "a sibling scope gets its own slots rather than reusing them"
             $( test.eq! 3 (func_slots (list.head (funcs
                    (resolved! "let f x = { { let a = 1; a } { let b = 2; b } };")))) ),

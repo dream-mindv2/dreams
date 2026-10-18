@@ -176,6 +176,11 @@ mapping St {
 /// The deepest unfolding inside an unfolding, and the largest body unfolded.
 let max_depth : :integer;
 let max_depth = 4;
+/// The largest body written out where it is called for no reason but the
+/// call: its frame is not made, and its parameters are the caller's slots.
+let max_inline : :integer;
+let max_inline = 24;
+
 let max_size : :integer;
 let max_size = 160;
 let max_tries : :integer;
@@ -648,7 +653,8 @@ let call v cx !st t = match t {
         match callee_of v cx callee {
             [fi, caps] if unfoldable v cx fi (list.length args) && St.tries st < max_tries
                           && affordable st ((View.sizes v).[fi])
-                          && (not (is_global callee) || list.any (fn x -> known v cx x != ()) args) => {
+                          && (not (is_global callee) || (View.sizes v).[fi] <= max_inline
+                              || list.any (fn x -> known v cx x != ()) args) => {
                 let before = St.folds st;
                 // A closure's call written out is a decision of its own: the
                 // call through it was indirect, and once nothing calls it the
@@ -658,7 +664,7 @@ let call v cx !st t = match t {
                 let [st2, out] = unfold v cx st1 fl fi caps args;
                 // Only an unfolding that decided something is kept; the
                 // fresh names it used are not given back, which costs nothing.
-                if St.folds st2 > before { [st2, out] }
+                if St.folds st2 > before || (View.sizes v).[fi] <= max_inline { [st2, out] }
                 else { [St.set_folds before st2, t] }
             },
             [fi, []] if is_global callee && ir.has_flag ((View.funcs v).[fi].[:flags else 0]) ir.fn_rec
