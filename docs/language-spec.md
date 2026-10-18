@@ -1757,7 +1757,8 @@ case. `mind test` builds and runs every package's tests at once.
 ## 17. Running a program
 
 A program's entry point is the global `main!`. Its value is computed and then
-discarded. A program that ends normally exits with `0`; an error nothing
+discarded. Written with parameters -- `let main! () = ..` -- it is called, with
+`()` for each. A program that ends normally exits with `0`; an error nothing
 caught is printed (`dream: uncaught error: <error :kind payload>`) and exits
 with `1`; `os.exit! n` ends the program at once with `n`. The command-line
 arguments after the image are `os.args! ()`.
