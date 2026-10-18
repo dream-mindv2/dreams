@@ -1,0 +1,34 @@
+import std.console;
+import std.str;
+
+// Tree recursion written as a textbook writes it: each call makes the same
+// smaller calls again, so as written each is exponential. The supercompiler
+// keeps the values in a table, a lazy cell for each, and each is made once.
+
+let fib : :integer -> :integer;
+let rec fib n = if n < 2 { n } else { fib (n - 1) + fib (n - 2) };
+
+let choose : :integer -> :integer -> :integer;
+let rec choose n k = if k == 0 || k == n { 1 } else { choose (n - 1) (k - 1) + choose (n - 1) k };
+
+// The longest common subsequence of two strings, from their ends: two
+// numbers that count down, the strings handed on as they are.
+let lcs : :string -> :string -> :integer -> :integer -> :integer;
+let rec lcs a b i j =
+    if i == 0 || j == 0 { 0 }
+    else if str.byte (i - 1) a == str.byte (j - 1) b { 1 + lcs a b (i - 1) (j - 1) }
+    else {
+        let x = lcs a b (i - 1) j;
+        let y = lcs a b i (j - 1);
+        if x > y { x } else { y }
+    };
+
+let main! () = {
+    console.print! (to_string (fib 27))
+    console.print! (to_string (choose 22 11))
+    let a = "quick brown fox";
+    let b = "lazy dog quickly";
+    console.print! (to_string (lcs a b (str.byte_length a) (str.byte_length b)))
+    // Outside the table -- a negative number -- the body runs as written.
+    console.print! (to_string (fib (-3)))
+};

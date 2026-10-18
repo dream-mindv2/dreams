@@ -274,3 +274,45 @@ A worker's body is the original with its slots past the parameters moved up
 to make room (`hoist.shift_slots`), one substitution for the whole body. The
 first version renamed every binding afresh, which copies every node the body
 shares once per parent: the self-compile ran out of memory in `prune`.
+
+Later the same day the shapes widened, each found by writing the slow
+program a second way: `list.append acc [x]` is `acc + [x]`; a loop that
+tests `len acc` reads a count carried beside it (as written it ran out of
+memory at 12,000); `fold` with `acc + [x]` in its lambda is caught by running
+`hoist` and `accum` again after the driver, over the loops it specialised;
+and `filter (fn x -> list.contains x keep) xs` is caught through the scan
+loop `std`'s fusion writes for `contains` (`scan_shape`). The set grows with
+the list as the list is evaluated (`_set_refresh`), and a lookup it cannot
+answer hands back the rest it has not seen, where the scan goes on.
+
+## Milestone 2, step 5: tree recursion, kept in a table (2026-10-18)
+
+`fib (n - 1) + fib (n - 2)` is exponential as written, because each call
+makes the same smaller calls again. When a pure function calls itself more
+than once on one path, each call stepping its numbers back by constants
+(`n - c`) and handing every other parameter on as it was, `accum.memo_table`
+gives it a table: a lazy cell for each combination of its numbers from zero
+to where it was called, row by row, each cell the body again with every call
+of itself read from the table. The cells are lazy, so a cell no call reaches
+is never made, and the table is a knot -- the builder is handed the table it
+is building, which Dream allows because the bind is lazy and the cells are.
+
+What keeps it exact is where the table is asked for. The wrapper runs the
+body as written down to the branch that calls itself (`memo_point`), so what
+it forces before then is what the program forces, and there each number
+must already be forced (`forced_when`: both sides of a comparison, both
+sides of `a || b` once it is false) and must be an integer from zero to
+`memo_cap` -- the table is made whole, so a million cells is where making it
+stops being cheaper than not. Anything else, a negative number say, runs on
+as written. A call in a cell whose numbers fall below zero calls the
+function as written too.
+
+| | as written | supercompiled |
+|---|---|---|
+| `tests/sc/memo` (fib 27, choose 22 11, a 15×16 LCS) | 4,969 ms | 35 ms |
+| fib 32, choose 26 13, a 25×25 LCS | did not finish in 120 s | 34 ms |
+| fib 300 (a bignum) and a 720×720 LCS | -- | 389 ms |
+
+The 720×720 table is 518,000 cells and allocates 179 MB, about 350 bytes a
+cell: a cons, a thunk and a frame for each, since the builder is a Dream
+recursion. A builtin that made the cells would be a third of that.
