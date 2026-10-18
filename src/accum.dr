@@ -48,11 +48,21 @@ mapping Program {
     // The builtins it writes, by name, and `std.list.contains`'s global.
     ids
     contains
+    // `std.list.append`'s global, which is `+` by another name.
+    append
+    // Where the small integers are in the image's pool: a count written as a
+    // constant names its pool entry, not its value.
+    small_ints
+    // Each function that is `list.contains` by another name -- the scan
+    // `std`'s fusion writes for one -- as `[list parameter, value parameter]`,
+    // by global.
+    scans
 }
 
 /// The image with its slow accumulators written again.
 let accum : ir.Image -> Result;
-let accum img = {
+let accum img0 = {
+    let [img, small] = with_small_ints img0;
     let rd = sc.read img;
     let globals = array.of_list (ir.Image.globals img);
     let strs = array.of_list (ir.Image.strs img);
@@ -61,16 +71,82 @@ let accum img = {
         %{} (list.enumerate (ir.Image.globals img));
     let id name = match builtins.id name { () => -1, i => i };
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
-                        ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "to_string"];
-    let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids (global_named img strs "std.list" "contains");
+                        ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len"];
+    let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
+                         (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append") small %{};
+    let ints = array.of_list (ir.Image.ints img);
+    let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} (list.filter (fn [_, g] -> g.[:kind else -1] == ir.global_function) (list.enumerate (ir.Image.globals img)));
+    let p = Program.set_scans scans p;
     let n_funcs = array.length (Program.funcs p);
     let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
         match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
             [wrapper, worker, global] => [m.[fi => wrapper], list.cons worker added, list.cons global gs],
             _ => [m, added, gs],
         }) [%{}, [], []] (list.range 0 n_funcs);
-    if map.size changed == 0 { Result.ok img }
+    if map.size changed == 0 { Result.ok img0 }
     else { sc.patch img rd changed (list.reverse added_rev) (list.reverse globals_rev) }
+};
+
+/// The image with 0 to 16 in its integer pool, and where each is.
+let with_small_ints : ir.Image -> [ir.Image, %{:integer => :integer}];
+let with_small_ints img = {
+    let have = list.fold (fn m [i, v] -> if map.has v m { m } else { m.[v => i] }) %{} (list.enumerate (ir.Image.ints img));
+    let missing = list.filter (fn v -> not (map.has v have)) (list.range 0 17);
+    let n = list.length (ir.Image.ints img);
+    let placed = list.fold (fn m [i, v] -> m.[v => n + i]) have (list.enumerate missing);
+    [ir.Image.set_ints (list.append (ir.Image.ints img) missing) img, placed]
+};
+
+/// Whether function `fi`, called through global `gi`, is a membership scan:
+/// `if empty xs { false } else if xs.[0] == x { true } else { self (tail xs) .. x .. }`
+/// with every other parameter handed on as it was. `[list, value]`, its
+/// parameters' positions, or `()`.
+let scan_shape : Program -> #[:integer] -> :integer -> :integer -> [:integer, :integer] | :unit;
+let scan_shape p ints fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let k = f.[:arity else 0];
+        let head_of l t = match t {
+            Term.prim(:get, _, _, _, _, [Term.var(n, _), Term.prim(:const_int, _, i, _, _, _), Term.absent]) => n == l && ints.[i] == 0,
+            _ => false,
+        };
+        match unwrap (sc.body_of (Program.reading p) f) {
+            Term.prim(:if, _, _, _, _, [Term.prim(:list_is_empty, _, _, _, _, [Term.var(l, _)]),
+                                        Term.prim(:const_bool, _, 0, _, _, _),
+                                        rest]) => match unwrap rest {
+                Term.prim(:if, _, _, _, _, [Term.prim(:eq, _, _, _, _, [a, b]), Term.prim(:const_bool, _, 1, _, _, _), again]) => {
+                    let x = match [a, b] {
+                        [y, Term.var(n, _)] if head_of l y => n,
+                        [Term.var(n, _), y] if head_of l y => n,
+                        _ => (),
+                    };
+                    let li = list.find_index (fn j -> sc.slot_name j == l) (list.range 0 k);
+                    let xi = list.find_index (fn j -> sc.slot_name j == x) (list.range 0 k);
+                    match unwrap again {
+                        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args])
+                            if g == gi && x != () && li >= 0 && xi >= 0 && list.length args == k
+                               && list.all (fn [j, arg] -> if j == li { match arg {
+                                      Term.prim(:list_tail, _, _, _, _, [Term.var(n, _)]) => n == l,
+                                      _ => false,
+                                  } } else { is_var (sc.slot_name j) arg }) (list.enumerate args) => [li, xi],
+                        _ => (),
+                    }
+                },
+                _ => (),
+            },
+            _ => (),
+        }
+    };
+
+/// A term with the blocks of one statement around it taken off.
+let unwrap : Term -> Term;
+let rec unwrap t = match t {
+    Term.block(_, [Stmt.expr(e)]) => unwrap e,
+    _ => t,
 };
 
 /// The global through which `module.name` is called, or `-1`.
@@ -144,6 +220,9 @@ let rec around t = match t {
         [Stmt.expr(l), ..before] => list.append (list.concat (list.map (fn s -> match s {
             Stmt.bind(_, _, x) => [x],
             Stmt.expr(Term.var(_, fl)) if ir.has_flag fl ir.f_strict => [],
+            // `force acc` as a statement is the same: what the fused loops
+            // of `std.list` write for a strict accumulator.
+            Stmt.expr(Term.prim(:force, fl, _, _, _, [Term.var(_, _)])) if ir.has_flag fl ir.f_strict => [],
             Stmt.expr(e) => [e],
         }) before)) (around l),
         _ => [],
@@ -200,10 +279,15 @@ let is_var n t = match t { Term.var(m, _) => m == n, _ => false };
 
 /// `[base, pieces]` of a left-nested `+`: `((base + p1) + p2) + ..`, the
 /// pieces in order. A term that is not an addition is its own base.
-let addends : Term -> [Term, [Term]];
-let rec addends t = match t {
+let addends : Program -> Term -> [Term, [Term]];
+let rec addends p t = match t {
     Term.prim(:add, _, _, _, _, [x, y]) => {
-        let [base, pieces] = addends x;
+        let [base, pieces] = addends p x;
+        [base, list.append pieces [y]]
+    },
+    // `list.append x y` is `x + y`.
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), x, y]) if g == Program.append p && g >= 0 => {
+        let [base, pieces] = addends p x;
         [base, list.append pieces [y]]
     },
     _ => [t, []],
@@ -252,24 +336,33 @@ let is_nil t = match t { Term.prim(:make_list, _, _, _, _, []) => true, _ => fal
 /// names; the wrapper the function's strict reads and a call of the worker
 /// passing `start` for the new parameter.
 let built : Site -> :string -> :bool -> Term -> Term -> [Fun, Fun, :map];
-let built site new_name strict body start = {
+let built site new_name strict body start = built_with site [[new_name, strict, start]] [] body;
+
+/// The same with several new parameters, `[name, strict, start]` each, and
+/// `lets` bound lazily in the wrapper first, for the starts to read.
+let built_with : Site -> [[:string, :bool, Term]] -> [Stmt] -> Term -> [Fun, Fun, :map];
+let built_with site news lets body = {
     let p = Site.program site;
     let k = Site.k site;
+    let m = list.length news;
     let f = (Program.funcs p).[Site.fi site];
-    let param = sc.slot_name k;
-    let reads_new = if strict { [Stmt.expr (Term.var param ir.f_strict)] } else { [] };
-    // The body's own slots past its parameters move up one to make room for
-    // the new one (`hoist.shift_slots`), which takes the first of them.
+    let param i = sc.slot_name (k + i);
+    let index = list.fold (fn mp [i, [n, _, _]] -> mp.[n => param i]) %{} (list.enumerate news);
+    let reads_new = list.concat (list.map (fn [i, [_, strict, _]] -> if strict { [Stmt.expr (Term.var (param i) ir.f_strict)] } else { [] })
+                                          (list.enumerate news));
+    // The body's own slots past its parameters move up to make room for the
+    // new ones (`hoist.shift_slots`), which take the first of them.
     let named = list.head (hoist.rewrite (fn x -> match x {
-        Term.var(n, fl) if n == new_name => Term.var param fl,
+        Term.var(n, fl) => match index.[n else ()] { () => (), to => Term.var to fl },
         _ => (),
-    }) %{} (hoist.shift_slots k 1 body));
+    }) %{} (hoist.shift_slots k m body));
     let worker_body = Term.block 0 (list.append reads_new [Stmt.expr named]);
-    let worker = sc.fun_of (f.[:arity => k + 1].[:n_captures => 0].[:captures_off => 0]
-                             .[:slots => f.[:slots else 0] + 1]) worker_body;
+    let worker = sc.fun_of (f.[:arity => k + m].[:n_captures => 0].[:captures_off => 0]
+                             .[:slots => f.[:slots else 0] + m]) worker_body;
     let params = list.map (fn j -> Term.var (sc.slot_name j) 0) (list.range 0 k);
-    let wrapper = sc.fun_of f (Term.block 0 (list.append (hoist.strict_reads (Site.body site))
-                                                        [Stmt.expr (call (Site.wgi site) (list.append params [start]))]));
+    let starts = list.map (fn [_, _, start] -> start) news;
+    let wrapper = sc.fun_of f (Term.block 0 (list.concat [hoist.strict_reads (Site.body site), lets,
+                                                          [Stmt.expr (call (Site.wgi site) (list.append params starts))]]));
     [wrapper, worker, ((Program.globals p).[Site.gi site]).[:target => Site.wfi site]]
 };
 
@@ -284,11 +377,20 @@ let grown_at site j = {
     let p = Site.program site;
     let gi = Site.gi site;
     let acc = sc.slot_name j;
-    let body = Site.body site;
+    // `len acc` anywhere reads a count carried beside it, so a loop that
+    // measures what it has made -- its test, say -- does not walk it.
+    let len_id = (Program.ids p).["len"];
+    let measured = list.head (hoist.rewrite (fn x -> match x {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), Term.var(n, _)]) if b == len_id && n == acc =>
+            Term.var "acc_count" 0,
+        _ => (),
+    }) %{} (Site.body site));
+    let counted = reads "acc_count" measured;
+    let body = if counted { measured } else { Site.body site };
     let ls = leaves body;
     let self_calls = list.filter (fn l -> hoist.self_call gi l) ls;
     // Each call of itself passes `acc` on, or `acc` with pieces added.
-    let growth arg = match addends arg {
+    let growth arg = match addends p arg {
         [base, pieces] if is_var acc base && not (list.is_empty pieces) && not (list.any (fn x -> reads acc x) pieces) => pieces,
         _ => (),
     };
@@ -323,16 +425,31 @@ let grown_at site j = {
                     let kept = match growth arg { () => Term.var r 0, pieces => onto pieces };
                     // `acc` itself is handed on as it came: what was added is kept.
                     let passed = list.map (fn [i, x] -> if i == j { Term.var acc 0 } else { x }) (list.enumerate args);
-                    call (Site.wgi site) (list.append passed [kept])
+                    let count = match growth arg {
+                        () => [Term.var "acc_count" 0],
+                        pieces => [list.fold (fn n piece -> Term.prim :add 0 ir.no_node ir.no_node ir.no_node [n, piece_length p piece])
+                                             (Term.var "acc_count" 0) pieces],
+                    };
+                    call (Site.wgi site) (list.concat [passed, [kept], if counted { count } else { [] }])
                 } else if reads acc l {
                     // Where the loop ends, `acc` is what it was: put in order once.
                     Term.block 0 [Stmt.bind "acc_whole" 0 in_order,
                                   Stmt.expr (list.head (hoist.rewrite (fn x -> if is_var acc x { Term.var "acc_whole" 0 } else { () }) %{} l))]
                 } else { l };
-                built site r true (map_leaves leaf body) nil
+                let news = list.append [[r, true, nil]]
+                                       (if counted { [["acc_count", false, builtin p "len" [Term.var acc 0]]] } else { [] });
+                built_with site news [] (map_leaves leaf body)
             },
         }
     }
+};
+
+/// How many elements a piece adds: a literal's own count, else its length.
+let piece_length : Program -> Term -> Term;
+let piece_length p piece = match piece {
+    Term.prim(:make_list, _, _, _, _, xs) if list.length xs <= 16 =>
+        Term.prim :const_int 0 ((Program.small_ints p).[list.length xs]) ir.no_node ir.no_node [],
+    _ => builtin p "len" [piece],
 };
 
 // --- a result grown at the end -------------------------------------------------------
@@ -346,7 +463,7 @@ let appended_result site = {
     let gi = Site.gi site;
     let body = Site.body site;
     let ls = leaves body;
-    let appended l = match addends l {
+    let appended l = match addends p l {
         [base, pieces] if hoist.self_call gi base && not (list.is_empty pieces) && not (list.any (fn x -> names gi x) pieces)
                           && list.all (fn x -> not (names gi x)) (self_args base) => pieces,
         _ => (),
@@ -372,7 +489,7 @@ let appended_result site = {
                   else if is_nil l { Term.var k 0 }
                   else { Term.prim :add 0 ir.no_node ir.no_node ir.no_node [l, Term.var k 0] },
             pieces => {
-                let [base, _] = addends l;
+                let [base, _] = addends p l;
                 call (Site.wgi site) (list.append (self_args base) [onto pieces])
             },
         };
@@ -390,21 +507,45 @@ let literal_pieces pieces = list.all (fn x -> match x { Term.prim(:make_list, _,
 /// set carried beside it.
 let member_set : Site -> [Fun, Fun, :map] | :unit;
 let member_set site =
-    if Program.contains (Site.program site) < 0 { () }
+    if Program.contains (Site.program site) < 0 && map.size (Program.scans (Site.program site)) == 0 { () }
     else { first_of (list.map (fn j -> fn () -> member_at site j) (list.range 0 (Site.k site))) };
+
+/// The value `t` asks to find in `seen`, if `t` is a membership scan of it:
+/// `list.contains x seen`, or a call of a function that is one by another
+/// name (`Program.scans`).
+let scanned : Program -> :string -> Term -> Term | :unit;
+let scanned p seen t = match t {
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), x, xs]) if g == Program.contains p && is_var seen xs => x,
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match (Program.scans p).[g else ()] {
+        [li, xi] if is_var seen (list.nth li args) => list.nth xi args,
+        _ => (),
+    },
+    _ => (),
+};
+
+/// The scan `t` looking for `x` in `xs`.
+let with_value : Program -> Term -> Term -> Term -> Term;
+let with_value p t x xs = match t {
+    Term.prim(:apply, fl, a, b, c, [callee, ..args]) => {
+        let [xi, li] = match callee {
+            Term.prim(:global, _, g, _, _, _) =>
+                if g == Program.contains p { [0, 1] } else { match (Program.scans p).[g else ()] { [l, v] => [v, l], _ => [-1, -1] } },
+            _ => [-1, -1],
+        };
+        Term.prim :apply fl a b c (list.cons callee (list.map (fn [i, arg] -> if i == xi { x } else if i == li { xs } else { arg })
+                                                              (list.enumerate args)))
+    },
+    _ => t,
+};
 
 let member_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
 let member_at site j = {
     let p = Site.program site;
     let gi = Site.gi site;
-    let gc = Program.contains p;
     let seen = sc.slot_name j;
     let body = Site.body site;
     let [terms, _] = hoist.parts body;
-    let scans = list.filter (fn t -> match t {
-        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), _, xs]) => g == gc && is_var seen xs,
-        _ => false,
-    }) terms;
+    let scans = list.filter (fn t -> scanned p seen t != ()) terms;
     let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
     let grown arg = match arg {
         Term.prim(:cons, _, _, _, _, [e, rest]) if is_var seen rest && hoist.trivial_term e => e,
@@ -420,23 +561,32 @@ let member_at site j = {
         let rewritten_body = list.head (hoist.rewrite (fn t ->
             if hoist.self_call gi t {
                 let args = self_args t;
-                let kept = match grown (list.nth j args) { () => Term.var s 0, e => builtin p "_set_add" [Term.var s 0, e] };
+                // Handed on refreshed: once a scan has evaluated the list, a
+                // set that could not say can be built again, and say.
+                let fresh = builtin p "_set_refresh" [Term.var s 0, Term.var seen 0];
+                let kept = match grown (list.nth j args) { () => fresh, e => builtin p "_set_add" [fresh, e] };
                 call (Site.wgi site) (list.append args [kept])
             } else {
-                match t {
-                    Term.prim(:apply, fl, a, b, c, [Term.prim(:global, cf, g, ca, cb, cc), x, xs]) if g == gc && is_var seen xs => {
-                        let callee = Term.prim :global cf g ca cb cc;
+                match scanned p seen t {
+                    () => (),
+                    x => {
                         // The set's answer when it has one; the scan as
                         // written when it has not.
-                        Term.block fl [Stmt.bind "seen_x" 0 x,
+                        Term.block (drive.flags_of t) [Stmt.bind "seen_x" 0 x,
                                        Stmt.bind "seen_says" ir.f_strict (builtin p "_set_lookup" [Term.var s 0, Term.var "seen_x" 0]),
+                                       // `()`: the set cannot say, and the
+                                       // scan runs as written. A list: the
+                                       // rest the set has not seen, which is
+                                       // where the scan would go on.
                                        Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node
                                            [Term.prim :eq 0 ir.no_node ir.no_node ir.no_node
                                                       [Term.var "seen_says" 0, Term.prim :unit 0 ir.no_node ir.no_node ir.no_node []],
-                                            Term.prim :apply fl a b c [callee, Term.var "seen_x" 0, xs],
-                                            Term.var "seen_says" 0])]
+                                            with_value p t (Term.var "seen_x" 0) (Term.var seen 0),
+                                            Term.prim :if 0 ir.no_node ir.no_node ir.no_node
+                                                [Term.prim :type_is 0 ir.no_node 7 0 [Term.var "seen_says" 0],
+                                                 with_value p t (Term.var "seen_x" 0) (Term.var "seen_says" 0),
+                                                 Term.var "seen_says" 0]])]
                     },
-                    _ => (),
                 }
             }) %{} body);
         built site s false rewritten_body (builtin p "_set_of" [Term.var seen 0])

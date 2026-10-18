@@ -524,7 +524,11 @@ let finished b = match Options.supercompile (Build.options b) {
     // Loop invariants are hoisted out first (`dreams/src/hoist.dr`), so that
     // what the driver specialises is the loop that no longer recomputes them.
     :drive => Result.map (fn img -> finish b img)
-                         (hoist.hoist (shared_image b) |> Result.and_then accum.accum |> Result.and_then drive.supercompile),
+                         (hoist.hoist (shared_image b) |> Result.and_then accum.accum |> Result.and_then drive.supercompile
+                          // Again, over what the driver made: a specialisation
+                          // of `fold` on a closure is the loop the closure's
+                          // accumulator was in.
+                          |> Result.and_then hoist.hoist |> Result.and_then accum.accum),
     _ => Result.ok (finish b (shared_image b)),
 };
 

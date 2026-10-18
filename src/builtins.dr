@@ -126,6 +126,7 @@ let names = [
     "_set_of",
     "_set_add",
     "_set_lookup",
+    "_set_refresh",
 
 ];
 
@@ -234,6 +235,7 @@ let signatures = %{
     "_set_of" => "list -> a membership set of what is evaluated of it",
     "_set_add" => "set -> value -> the set with the value",
     "_set_lookup" => "set -> value -> whether it is a member, or () when the set cannot say",
+    "_set_refresh" => "set -> list -> the set, built again from the list when it has been evaluated since",
 
 };
 
