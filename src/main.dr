@@ -171,7 +171,20 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
     compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true)
-                         (list.map remap_spec (o.[:remaps else []])) (opt o :supercompile);
+                         (list.map remap_spec (o.[:remaps else []])) (supercompiling o);
+
+/// What the supercompiler is asked to do. A release build drives by default
+/// -- `--release`, or `-D release`, which is how `mind build --release` says
+/// it -- since that is the build whose speed is the point and whose compile
+/// time is not; it costs a large program several times its compile.
+/// `--no-supercompile` turns it off, and so does `--no-opt`, whose point is
+/// the arena exactly as lowered.
+let supercompiling o = match [opt o :supercompile, opt o :no_opt] {
+    [_, true] => (),
+    [:none, _] => (),
+    [(), _] => if list.contains "release" (o.[:defines else []]) { :drive } else { () },
+    [s, _] => s,
+};
 
 /// `FROM=TO` as `[from, to]`. The split is at the last `=`, since a path may
 /// hold one and a package name never does.
@@ -920,6 +933,7 @@ let rec parse_args args o =
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
         ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :supercompile :roundtrip o),
         ["--supercompile", ..rest] => parse_args rest (with_opt :supercompile :drive o),
+        ["--no-supercompile", ..rest] => parse_args rest (with_opt :supercompile :none o),
         ["--sc-stats", ..rest] => parse_args rest (with_opt :sc_stats true o),
         ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,
         ["--remap-path-prefix", spec, ..rest] => parse_args rest (append_opt :remaps spec o),
@@ -985,9 +999,11 @@ let usage! () = {
         "                           it, native payloads and `when os` decide",
         "  --test                   define `test`, and add a runner for the tests",
         "                           each module exports",
-        "  --release                define `release`",
+        "  --release                define `release`, and supercompile",
         "  --no-opt                 emit the arena as lowered, unshared",
         "  --supercompile           run the program at compile time and keep what that decides",
+        "                           (the default for a release build)",
+        "  --no-supercompile        compile the program as written, even for a release",
         "  --sc-roundtrip           take the image through the supercompiler's core and back",
         "  --sc-stats               say what the supercompiler decided, and where code grew",
         "  --remap-path-prefix FROM=TO",

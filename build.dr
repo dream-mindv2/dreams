@@ -37,13 +37,14 @@ let python ctx name =
                               "--compiler", list.last (build.Context.compiler ctx)];
 
 /// The seed, compiling this source, makes itself: the byte equality the
-/// bootstrap promises. Stage 3 against stage 2 alone let a seed that had
-/// fallen behind the source pass, since a stale seed still builds a compiler
-/// that reproduces itself -- just not one that is the seed.
+/// bootstrap promises, each stage a release build as the seed is. Stage 3
+/// against stage 2 alone let a seed that had fallen behind the source pass,
+/// since a stale seed still builds a compiler that reproduces itself -- just
+/// not one that is the seed.
 let bootstrap : :string;
 let bootstrap = "t=$(mktemp -d) && trap 'rm -rf \"$t\"' EXIT"
-    + " && \"$dream\" \"$seed\" -L mind -L . -o \"$t/stage2.dream\" dreams/src/main.dr >/dev/null"
-    + " && \"$dream\" \"$t/stage2.dream\" -L mind -L . -o \"$t/stage3.dream\" dreams/src/main.dr >/dev/null"
+    + " && \"$dream\" \"$seed\" --release -L mind -L . -o \"$t/stage2.dream\" dreams/src/main.dr >/dev/null"
+    + " && \"$dream\" \"$t/stage2.dream\" --release -L mind -L . -o \"$t/stage3.dream\" dreams/src/main.dr >/dev/null"
     + " && cmp \"$t/stage2.dream\" \"$t/stage3.dream\""
     + " && { cmp -s \"$seed\" \"$t/stage2.dream\" || { echo 'the seed is stale: it builds a different compiler from this source' >&2; exit 1; }; }";
 
