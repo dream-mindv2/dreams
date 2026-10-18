@@ -79,7 +79,7 @@ let accum img0 = {
     let id name = match builtins.id name { () => -1, i => i };
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
-                         "_array_of_list"];
+                         "_memo_cells"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
                          (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append") small %{}
                          (array.of_list (ir.Image.ints img));
@@ -92,6 +92,8 @@ let accum img0 = {
     let n_funcs = array.length (Program.funcs p);
     let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
         match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
+            // A worker made as a closure has no global of its own.
+            [wrapper, worker, ()] => [m.[fi => wrapper], list.cons worker added, gs],
             [wrapper, worker, global] => [m.[fi => wrapper], list.cons worker added, list.cons global gs],
             _ => [m, added, gs],
         }) [%{}, [], []] (list.range 0 n_funcs);
@@ -174,7 +176,7 @@ let global_named img strs module name = match list.find (fn m -> strs.[m.[:name 
 
 /// Function `fi` with the first shape that fits it written again: the
 /// wrapper, the worker (function `wfi`, global `wgi`) and its global, or `()`.
-let rewritten : Program -> :integer -> :integer -> :integer -> [Fun, Fun, :map] | :unit;
+let rewritten : Program -> :integer -> :integer -> :integer -> [Fun, Fun, :map | :unit] | :unit;
 let rewritten p fi wfi wgi = {
     let f = (Program.funcs p).[fi];
     let fl = f.[:flags else 0];
@@ -616,11 +618,11 @@ let memo_cap = 1048576;
 /// same smaller calls are made again under each. The values are kept in a
 /// table instead, a lazy cell for each, so each is made once.
 ///
-/// The table is the function's body again, as a builder (the worker): it
-/// makes the list of cells, `0..n` along each number that changes (row by
-/// row when there are several), and each cell is the body at its numbers with
-/// every call of itself read from the table -- or made by the function as
-/// written, when its numbers fall outside it. The cells are lazy, so a cell
+/// Each cell is the function's body again, as a closure of the cell's place
+/// (the worker): a cell for each of `0..n` along each number that changes,
+/// row by row when there are several, the body at those numbers with every
+/// call of itself read from the table -- or made by the function as written,
+/// when its numbers fall outside it. The cells are lazy, so a cell
 /// no call reaches is never made, and each forces only what the call it
 /// stands for would.
 ///
@@ -629,7 +631,7 @@ let memo_cap = 1048576;
 /// table is what the program forces. There every number must be forced
 /// already, and must be a small integer that is not negative, or the body
 /// runs on as written.
-let memo_table : Site -> [Fun, Fun, :map] | :unit;
+let memo_table : Site -> [Fun, Fun, :map | :unit] | :unit;
 let memo_table site = {
     let p = Site.program site;
     let gi = Site.gi site;
@@ -640,7 +642,7 @@ let memo_table site = {
     let self_calls = list.filter (fn t -> hoist.self_call gi t) terms;
     // A table made already: this function is a wrapper, from a round before.
     let made = list.any (fn t -> match t {
-        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => b == (Program.ids p).["_array_of_list"],
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => b == (Program.ids p).["_memo_cells"],
         _ => false,
     }) terms;
     match hoist.statics p gi k graph {
@@ -739,26 +741,33 @@ let rec calls gi t = match t {
 let larger : :integer -> :integer -> :integer;
 let larger a b = if a > b { a } else { b };
 
-/// The wrapper and the builder. The builder takes the function's parameters
-/// -- each number that changes counting through the table -- then the top of
-/// each number, then the table.
-let memo_built : Site -> [:integer] -> Term -> (Term -> Term) -> [Fun, Fun, :map];
+/// The wrapper and the cell: a function of a cell's place in the table,
+/// capturing what every cell shares -- the parameters handed on as they
+/// were, the top of each number, and the table -- that reads its numbers
+/// back out of its place and runs the body on them. `_memo_cells` makes the
+/// table of them, each a frame and a thunk of the cell's body; as a Dream
+/// recursion building a list it was 350 bytes a cell, the list and the
+/// builder's frames made only to be thrown away.
+let memo_built : Site -> [:integer] -> Term -> (Term -> Term) -> [Fun, Fun, :unit];
 let memo_built site dims m place = {
     let p = Site.program site;
     let gi = Site.gi site;
     let k = Site.k site;
     let d = list.length dims;
     let f = (Program.funcs p).[Site.fi site];
+    let statics = list.filter (fn j -> not (list.contains j dims)) (list.range 0 k);
+    let ns = list.length statics;
     let int v = Term.prim :const_int 0 ((Program.small_ints p).[v]) ir.no_node ir.no_node [];
     let op o x y = Term.prim o 0 ir.no_node ir.no_node ir.no_node [x, y];
-    let slot j = Term.var (sc.slot_name j) 0;
-    let top i = Term.var (sc.slot_name (k + i)) 0;
-    let tops = list.map top (list.range 0 d);
-    let table = Term.var (sc.slot_name (k + d)) 0;
+    let cap i = Term.var (sc.capture_name i) 0;
     // Row by row: a cell's place is its numbers read in the tops' radix.
     let flat at ts = list.fold (fn acc [x, t] -> op :add (op :mul acc (op :add t (int 1))) x)
                                (list.head at) (list.zip (list.tail at) (list.tail ts));
     let read from at ts = Term.prim :get 0 ir.no_node ir.no_node ir.no_node [from, flat at ts, Term.absent];
+    // In the cell: its place is slot 0, and the function's slots each one on.
+    let tops = list.map (fn i -> cap (ns + i)) (list.range 0 d);
+    let table = cap (ns + d);
+    let index = Term.var (sc.slot_name 0) 0;
     // A call of itself in a cell: the table's cell when its numbers are in
     // it -- below the cell's own, so above zero is all there is to ask --
     // and the function as written when they are not.
@@ -771,36 +780,35 @@ let memo_built site dims m place = {
                 [list.fold (fn c y -> op :and c (op :ge y (int 0))) (op :ge x (int 0)) xs, read table at tops, t],
         }
     };
-    let cell = list.head (hoist.rewrite (fn t -> if hoist.self_call gi t { lookup t } else { () }) %{}
-                                        (hoist.shift_slots k (d + 1) (Site.body site)));
-    let again changes = call (Site.wgi site) (list.concat [
-        list.map (fn j -> match changes.[j else ()] { () => slot j, x => x }) (list.range 0 k), tops, [table]]);
-    let last = list.nth (d - 1) dims;
-    let more = Term.prim :cons 0 ir.no_node ir.no_node ir.no_node [cell, again (%{}.[last => op :add (slot last) (int 1)])];
-    // Past the top of a number, the next row: that number from zero, the one
-    // before it a step on.
-    let rows = list.fold (fn rest i -> {
-        let here = list.nth i dims;
-        let before = list.nth (i - 1) dims;
-        Term.prim :if 0 ir.no_node ir.no_node ir.no_node
-            [op :gt (slot here) (top i), again (%{}.[here => int 0].[before => op :add (slot before) (int 1)]), rest]
-    }) more (list.reverse (list.range 1 d));
-    let builder_body = Term.block 0 (list.append (list.map (fn j -> Stmt.expr (Term.var (sc.slot_name j) ir.f_strict)) dims)
-        [Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [op :gt (slot (list.head dims)) (list.head tops), nil, rows])]);
-    let builder = sc.fun_of (f.[:arity => k + d + 1].[:n_captures => 0].[:captures_off => 0]
-                              .[:slots => f.[:slots else 0] + d + 1]) builder_body;
+    let body = list.head (hoist.rewrite (fn t -> if hoist.self_call gi t { lookup t } else { () }) %{}
+                                        (hoist.shift_slots 0 1 (Site.body site)));
+    // Each number out of the place: the last the place modulo its width,
+    // each before it the place over the widths after it, modulo its own.
+    let width i = op :add (list.nth i tops) (int 1);
+    let number i = {
+        let over = list.fold (fn x l -> op :div x (width l)) index (list.reverse (list.range (i + 1) d));
+        if i == 0 { over } else { op :mod over (width i) }
+    };
+    let unpacked = list.append
+        (list.map (fn [c, j] -> Stmt.bind (sc.slot_name (j + 1)) 0 (cap c)) (list.enumerate statics))
+        (list.map (fn [i, j] -> Stmt.bind (sc.slot_name (j + 1)) ir.f_strict (number i)) (list.enumerate dims));
+    let cell = Fun.make [sc.slot_name 0] (list.map sc.capture_name (list.range 0 (ns + d + 1)))
+                        (Term.block 0 (list.append unpacked [Stmt.expr body]))
+                        (f.[:arity => 1].[:n_captures => ns + d + 1].[:captures_off => 0]
+                          .[:slots => f.[:slots else 0] + 1]);
     // The wrapper: where the body calls itself, the table when the numbers
     // are small integers, the body as written when they are not.
-    let cap = Term.prim :const_int 0 ((Program.small_ints p).[memo_cap]) ir.no_node ir.no_node [];
+    let slot j = Term.var (sc.slot_name j) 0;
+    let limit = Term.prim :const_int 0 ((Program.small_ints p).[memo_cap]) ir.no_node ir.no_node [];
     let fits = list.fold (fn c j -> op :and c (op :and (Term.prim :type_is 0 ir.no_node 0 0 [slot j])
-                                                       (op :and (op :ge (slot j) (int 0)) (op :le (slot j) cap))))
+                                                       (op :and (op :ge (slot j) (int 0)) (op :le (slot j) limit))))
                          (Term.prim :const_bool 0 1 ir.no_node ir.no_node []) dims;
     let cells = list.fold (fn n j -> op :mul n (op :add (slot j) (int 1))) (int 1) dims;
     let at = list.map slot dims;
-    let start = call (Site.wgi site) (list.concat [list.map (fn j -> if list.contains j dims { int 0 } else { slot j }) (list.range 0 k),
-                                                   at, [Term.var "memo_table" 0]]);
-    let tabled = Term.block 0 [Stmt.bind "memo_table" 0 (builtin p "_array_of_list" [start]),
+    let made = Term.lam :make_closure 0 (Site.wfi site)
+                        (list.concat [list.map sc.slot_name statics, list.map sc.slot_name dims, ["memo_table"]]);
+    let tabled = Term.block 0 [Stmt.bind "memo_table" 0 (builtin p "_memo_cells" [cells, made]),
                                Stmt.expr (read (Term.var "memo_table" 0) at at)];
-    let wrapper = sc.fun_of f (place (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [op :and fits (op :le cells cap), tabled, m]));
-    [wrapper, builder, ((Program.globals p).[Site.gi site]).[:target => Site.wfi site]]
+    let wrapper = sc.fun_of f (place (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [op :and fits (op :le cells limit), tabled, m]));
+    [wrapper, cell, ()]
 };

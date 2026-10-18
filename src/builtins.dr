@@ -127,6 +127,7 @@ let names = [
     "_set_add",
     "_set_lookup",
     "_set_refresh",
+    "_memo_cells",
 
 ];
 
@@ -236,6 +237,7 @@ let signatures = %{
     "_set_add" => "set -> value -> the set with the value",
     "_set_lookup" => "set -> value -> whether it is a member, or () when the set cannot say",
     "_set_refresh" => "set -> list -> the set, built again from the list when it has been evaluated since",
+    "_memo_cells" => "integer -> function -> an array of that many cells, cell i the call of the function on i, suspended",
 
 };
 

@@ -312,6 +312,15 @@ let emit_new !e tail t = match t {
             // it always did. One made in a frame laid out anew -- written
             // into a function it was not in -- is made as a clone that
             // captures the new slots.
+            // A function the pass added captures what it is made with
+            // here, as in a translation, and is given those captures when
+            // the patch is finished.
+            orig if fi >= array.length orig => {
+                let known = (Emit.descriptors e2).[fi else ds];
+                let e3 = if known != ds { problem ("function " + to_string fi + " is made capturing different slots") e2 }
+                         else { settle (Emit.set_descriptors ((Emit.descriptors e2).[fi => ds]) e2) };
+                push e3 (ir.with_flags fl (ir.node op fi ir.no_node ir.no_node))
+            },
             orig => {
                 let [e3, made] = if orig.[fi] == ds { [e2, fi] } else { clone e2 fi ds };
                 push e3 (ir.with_flags fl (ir.node op made ir.no_node ir.no_node))
@@ -605,13 +614,21 @@ let patch img rd changed added globals = {
         let [e2, [body, slots]] = emit_fun e f;
         [e2, list.cons [fi, (Fun.record f).[:body => body].[:slots => slots]] out]
     }) [start, []] written;
-    let records = list.fold (fn m [fi, r] -> m.[fi => r]) %{} rev;
+    // An added function made as a closure captures what it was made with.
+    let [captured, made_rev] = list.fold (fn [e, out] [fi, r] -> match (Emit.descriptors e).[fi else ()] {
+        () => [e, list.cons [fi, r] out],
+        ds => {
+            let [e2, off] = push_kids e ds;
+            [e2, list.cons [fi, r.[:captures_off => off].[:n_captures => list.length ds]] out]
+        },
+    }) [emitted, []] rev;
+    let records = list.fold (fn m [fi, r] -> m.[fi => r]) %{} made_rev;
     let record fi = records.[fi else funcs.[fi]];
     // A clone is its function's record, as patched, with captures of its own.
     let [final, clones_rev] = list.fold (fn [e, out] [made, fi, ds] -> {
         let [e2, off] = push_kids e ds;
         [e2, list.cons [made, (record fi).[:captures_off => off]] out]
-    }) [emitted, []] (list.sort_on (fn p -> list.head p) (map.values (Emit.clones emitted)));
+    }) [captured, []] (list.sort_on (fn p -> list.head p) (map.values (Emit.clones emitted)));
     match Emit.problems final {
         [] => {
             let p = Emit.prog final;

@@ -313,6 +313,13 @@ function as written too.
 | fib 32, choose 26 13, a 25×25 LCS | did not finish in 120 s | 34 ms |
 | fib 300 (a bignum) and a 720×720 LCS | -- | 389 ms |
 
-The 720×720 table is 518,000 cells and allocates 179 MB, about 350 bytes a
-cell: a cons, a thunk and a frame for each, since the builder is a Dream
-recursion. A builtin that made the cells would be a third of that.
+The first version built the table with a Dream recursion -- a builder
+function consing a list of cells, read into an array -- and the 720×720
+table, 518,000 cells, allocated 179 MB, about 350 bytes a cell. The cell is
+now a closure of its place in the table, capturing what every cell shares,
+and `_memo_cells` makes each cell as the frame a call of it would have and a
+thunk of its body, which is what a top-level value already is
+(`global_value`). That is 134 MB, and no faster: what is left is running the
+cells, 34 reductions each, and a cell is a thunk of a function body, which
+the interpreter runs and the JIT does not take. `tests/sc/memo` went from 35
+to 7 ms, the builder having been most of a small table's cost.
