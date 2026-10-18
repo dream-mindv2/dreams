@@ -2,6 +2,8 @@
 // This layer sits above scope/lower to keep the compiler's imports acyclic.
 
 import std.list;
+import std.trunk;
+import std.num;
 import std.str;
 import std.vm;
 import dreams.ast;
@@ -180,8 +182,8 @@ let fail s mi sp message =
 /// wrapper is the only thing left saying it was ever anything else.
 let note_macro s mi start reference = {
     let l = loader s;
-    put_loader (l |> modules.Loader.set_expansions (modules.expansions l
-        + [[mi, modules.module_source (modules.module_at l mi), start, scope.Meaning.expanded reference]])) s
+    put_loader (modules.with_expansion
+        [mi, modules.module_source (modules.module_at l mi), start, scope.Meaning.expanded reference] l) s
 };
 
 /// The module a reference names and the name it names there, or `()`.
@@ -503,21 +505,25 @@ let evaluate_round! base s session0 jobs = {
         // when there are several. Their spans are what the resolver keyed its
         // answers by, which is why they are read back from the wrapper rather
         // than kept.
-        let targets = if alone { [scope.decl_body wrapper] }
-                      else { match scope.decl_body wrapper {
-                                 [:list, elements, _] => elements,
-                                 other => [other],
-                             } };
+        let targets = trunk.of (if alone { [scope.decl_body wrapper] }
+                                else { match scope.decl_body wrapper {
+                                           [:list, elements, _] => elements,
+                                           other => [other],
+                                       } });
 
         // What each call's name resolved to, and the macro it named. Asked
         // once per call rather than once per question about it: the arity
         // check, the diagnostic, the note an editor reads and the global the
         // session is entered at are all the same lookup.
+        // Trunks, since each is read by a call's position in loops over the
+        // calls: lists, every read was a walk to it, and a module with n
+        // `expand`s paid n^2 for each of these.
         let sites = list.range 0 (list.length calls);
-        let references = map (fn i ->
+        let call_at = trunk.of calls;
+        let references = trunk.of (map (fn i ->
             scope.resolution sited mi (modules.module_source m)
-                             (ast.span (list.nth i targets))) sites;
-        let definitions = map (fn i -> macro_definition l (list.nth i references)) sites;
+                             (ast.span (trunk.at i targets))) sites);
+        let definitions = trunk.of (map (fn i -> macro_definition l (trunk.at i references)) sites);
 
         /// What is wrong with call `i`, or `()`. A resolution error anywhere in
         /// the round is everyone's objection: the round resolved the wrappers
@@ -542,7 +548,7 @@ let evaluate_round! base s session0 jobs = {
         /// reported anything.
         let sited_errors = filter (fn d -> diag.is_error d) (scope.r_diags sited);
         let objection i =
-            match list.nth i definitions {
+            match trunk.at i definitions {
                 () => if list.is_empty sited_errors {
                           "`expand` needs the name of a declared macro"
                       } else {
@@ -557,7 +563,7 @@ let evaluate_round! base s session0 jobs = {
                 },
                 definition => {
                     let arity = list.length (list.nth 2 definition);
-                    let given = list.length (call_args (list.head (list.nth i calls)));
+                    let given = list.length (call_args (list.head (trunk.at i call_at)));
                     if arity == given { () }
                     else { "macro expects " + to_string arity + " syntax arguments, received "
                            + to_string given }
@@ -566,20 +572,20 @@ let evaluate_round! base s session0 jobs = {
 
         /// The state with every call that named a macro written down, for an
         /// editor.
-        let noted = fold (fn acc i -> match list.nth i definitions {
+        let noted = fold (fn acc i -> match trunk.at i definitions {
             () => acc,
             _ => note_macro acc mi
-                     (ast.span_start (ast.span (call_callee (list.head (list.nth i calls)))))
-                     (list.nth i references),
+                     (ast.span_start (ast.span (call_callee (list.head (trunk.at i call_at)))))
+                     (trunk.at i references),
         }) st0 sites;
 
         fold (fn [st, session, answers] i -> {
-            let at = list.nth 1 (list.nth i calls);
+            let at = list.nth 1 (trunk.at i call_at);
             match objection i {
                 why if why != () =>
                     [fail (counted st :refused 1) mi at why, session, list.cons () answers],
                 _ => {
-                    let [target_mi, target_name] = macro_target (list.nth i references);
+                    let [target_mi, target_name] = macro_target (trunk.at i references);
                     let opened = open_round! st session;
                     let st1 = list.head opened;
                     let handle = list.nth 1 opened;
@@ -587,7 +593,7 @@ let evaluate_round! base s session0 jobs = {
                     let outcome = try! {
                         let value = vm.call_image! handle
                             (modules.module_name (modules.module_at staged target_mi))
-                            target_name (call_args (list.head (list.nth i calls)));
+                            target_name (call_args (list.head (trunk.at i call_at)));
                         strict! value
                         ok value
                     } catch e { Result.error (to_string e) };
@@ -609,7 +615,7 @@ let evaluate_round! base s session0 jobs = {
                         // for the round's.
                         Result.error(_) => {
                             let got = evaluate! (base.[:whole => true])
-                                          (counted ran :one_by_one 1) () mi [list.nth i calls];
+                                          (counted ran :one_by_one 1) () mi [trunk.at i call_at];
                             strict! got
                             let spent = match list.nth 1 got {
                                 () => (),
@@ -798,14 +804,46 @@ let expand_item! base s mi i item = {
 
 let complaints s = list.length (modules.diags (loader s));
 
-/// Is offset `at` inside this declaration, and is any of `sites`?
-let holds item at = {
+// Which declarations hold which `expand` offsets is a question of spans
+// against points, asked of every declaration of a file with offsets and of
+// every offset. Asked as written -- each declaration against each offset --
+// a file with n `expand`s and n declarations paid n^2 twice, and a file of two
+// thousand calls took seven seconds to compile, most of it here. The offsets
+// are sorted once into a trunk, so a declaration's offsets are a run of it
+// found by two binary searches over positions read in one step each.
+
+/// The first position in the sorted offsets `at` whose offset is `x` or more.
+let first_from : :trunk -> :integer -> :integer -> :integer -> :integer;
+let rec first_from at x !lo !hi =
+    if lo >= hi { lo }
+    else {
+        let mid = (lo + hi) / 2;
+        if trunk.at mid at < x { first_from at x (mid + 1) hi } else { first_from at x lo mid }
+    };
+
+/// The run of sorted offsets `at` inside this declaration's span, as
+/// `[first, past]` positions.
+let held_run : :trunk -> :any -> [:integer, :integer];
+let held_run at item = {
     let sp = ast.span item;
-    ast.span_start sp <= at && at < ast.span_end sp
+    let n = trunk.length at;
+    [first_from at (ast.span_start sp) 0 n, first_from at (ast.span_end sp) 0 n]
 };
-let rec in_item sites item = match sites {
-    [] => false,
-    [at, ..rest] => holds item at || in_item rest item,
+
+/// Does this declaration hold any of the sorted offsets `at`?
+let holds_any : :trunk -> :any -> :bool;
+let holds_any at item = {
+    let [first, past] = held_run at item;
+    first < past
+};
+
+/// Do the declarations together hold every one of the sorted offsets `at`?
+/// Their runs, sorted, must leave no position uncovered.
+let covers_all : :trunk -> [:any] -> :bool;
+let covers_all at items = {
+    let runs = list.sort_on list.head (list.filter (fn r -> list.head r < list.nth 1 r) (map (held_run at) items));
+    let reach = list.fold (fn !upto r -> if list.head r <= upto { num.max upto (list.nth 1 r) } else { upto }) 0 runs;
+    reach >= trunk.length at
 };
 
 /// One module's share of the question `work_of` asks: its source, its offsets,
@@ -816,12 +854,13 @@ let picks_of l mi = {
     let m = modules.module_at l mi;
     let source = modules.module_source m;
     let sites = modules.expand_sites l source;
-    if list.is_empty sites { [mi, source, [], [], []] }
+    if list.is_empty sites { [mi, source, trunk.empty, [], []] }
     else {
+        let at = trunk.of (list.sort sites);
         let numbered = list.reverse (list.nth 1 (list.fold (fn [i, acc] item ->
             [i + 1, list.cons [i, item] acc]) [0, []] (modules.module_items m)));
-        [mi, source, sites, numbered,
-         filter (fn [_, item] -> in_item sites item) numbered]
+        [mi, source, at, numbered,
+         filter (fn [_, item] -> holds_any at item) numbered]
     }
 };
 
@@ -869,13 +908,12 @@ let work_of l = {
     let seen = fold (fn acc [_, source, _, _, picked] ->
         if list.is_empty picked { acc }
         else { acc.[source => picked + acc.[source else []]] }) %{} picks;
-    list.concat (map (fn [mi, source, sites, numbered, picked] ->
-        if list.is_empty sites { [] }
+    list.concat (list.map (fn [mi, source, at, numbered, picked] ->
+        if list.is_empty numbered { [] }
         else {
-            let accounted = list.all (fn at ->
-                list.any (fn [_, item] -> holds item at) (seen.[source else []])) sites;
-            map (fn [i, item] -> [mi, i, item])
-                (filter (fn [_, item] -> has_expansion (macro_let item))
+            let accounted = covers_all at (list.map (fn [_, item] -> item) (seen.[source else []]));
+            list.map (fn [i, item] -> [mi, i, item])
+                (list.filter (fn [_, item] -> has_expansion (macro_let item))
                              (if accounted { picked } else { numbered }))
         }) picks)
 };

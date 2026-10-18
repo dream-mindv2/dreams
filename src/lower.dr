@@ -1819,7 +1819,7 @@ let places_of ld = fold (fn acc i -> {
     let src = modules.file_at ld i;
     // The text itself is left behind: only its line starts and the ranges a
     // macro generated are wanted, and this table is shared with every part.
-    let origins = diag.Source.make (diag.source_path src) "" (diag.origins src);
+    let origins = diag.Source.set_text "" src;
     // Left lazy: `vm.share!` forces it where the table is shared, and a whole
     // lowering builds a file's table only once a `match` in it asks.
     acc.[i => [shown_path ld (diag.source_path src), diag.line_starts (diag.source_text src), origins]]

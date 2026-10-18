@@ -16,6 +16,7 @@
 import std.array;
 import std.list;
 import std.str;
+import std.trunk;
 
 import dreams.ast;
 
@@ -26,7 +27,15 @@ import dreams.ast;
 /// it back to the call it came from. Generated occurrences keep offsets of
 /// their own, unique for resolution, and the range map is what puts a
 /// diagnostic back where the author wrote something.
-group Source { path, text, origins = [] }
+///
+/// The ranges are a trunk, in the order expansion made them, which is the
+/// order of their offsets -- each is handed the next fresh run -- so the one
+/// holding an offset is found by a binary search. As a list searched whole,
+/// every expansion's own range was found by searching every range before it,
+/// and a file with n `expand`s paid n^2. `ordered` says the runs did come in
+/// order and do not overlap, which is what the search needs; a file where
+/// they did not is searched newest first, as it always was.
+group Source { path, text, origins : :trunk = trunk.empty, ordered : :bool = true }
 
 let source : :string -> :string -> Source;
 let source path text = Source.new path text;
@@ -35,20 +44,41 @@ let source_path s = Source.path s;
 let source_text : Source -> :string;
 let source_text s = Source.text s;
 let origins : Source -> [[:any]];
-let origins s = Source.origins s;
+let origins s = list.reverse (trunk.to_list (Source.origins s));
 
 /// Where the author wrote what `sp` was generated from: `sp` itself, unless it
 /// falls in a range macro expansion made.
 let origin_span : Source -> ast.Span -> ast.Span;
 let origin_span s sp = {
-    let found = filter (fn r -> ast.span_start sp >= list.nth 0 r
-                                 && ast.span_start sp < list.nth 1 r) (origins s);
-    match found { [] => sp, [r, .._] => list.nth 2 r }
+    let ranges = Source.origins s;
+    let at = ast.span_start sp;
+    let holds r = at >= list.nth 0 r && at < list.nth 1 r;
+    if Source.ordered s {
+        // The last range starting at or before `at`, if it reaches past it.
+        let i = last_starting ranges at 0 (trunk.length ranges) - 1;
+        if i >= 0 && holds (trunk.at i ranges) { list.nth 2 (trunk.at i ranges) } else { sp }
+    } else {
+        match list.find holds (list.reverse (trunk.to_list ranges)) { () => sp, r => list.nth 2 r }
+    }
 };
 
+/// How many of the ordered ranges start at or before `at`.
+let last_starting : :trunk -> :integer -> :integer -> :integer -> :integer;
+let rec last_starting ranges at !lo !hi =
+    if lo >= hi { lo }
+    else {
+        let mid = (lo + hi) / 2;
+        if list.nth 0 (trunk.at mid ranges) <= at { last_starting ranges at (mid + 1) hi }
+        else { last_starting ranges at lo mid }
+    };
+
 let with_origin : :integer -> :integer -> ast.Span -> Source -> Source;
-let with_origin start end sp s =
-    Source.set_origins (list.cons [start, end, origin_span s sp] (origins s)) s;
+let with_origin start end sp s = {
+    let ranges = Source.origins s;
+    let after = trunk.is_empty ranges || start >= list.nth 1 (trunk.last ranges);
+    (s |> Source.set_origins (trunk.push [start, end, origin_span s sp] ranges)
+       |> Source.set_ordered (Source.ordered s && after))
+};
 
 // --- a diagnostic -----------------------------------------------------------
 
@@ -184,9 +214,17 @@ let label s = match s { :warning => "warning", _ => "error" };
 /// One diagnostic as the lines it prints as. A note is indented under its
 /// message so that the two read as one thing rather than two.
 let render : [:any] -> :map -> [:string];
-let render sources d = {
-    let src = if source_of d < list.length sources { list.nth (source_of d) sources }
-              else { source "<unknown>" "" };
+let render sources d = render_from (trunk.of sources) d;
+
+/// `render` with the sources as a trunk, so each diagnostic finds its file in
+/// one step: as a list, a build with many warnings walked the list of files
+/// once per warning.
+let render_from : :trunk -> :map -> [:string];
+let render_from sources d = {
+    let src = match trunk.get (source_of d) sources {
+        Option.some(found) => found,
+        Option.none => source "<unknown>" "",
+    };
     let head = position (source_path src) (source_text src) (ast.span_start (origin_span src (span d)))
                + ": " + label (severity d) + ": " + message d;
     match note d {
@@ -197,8 +235,10 @@ let render sources d = {
 
 /// Every diagnostic, as one block of text.
 let render_all : [:any] -> [:map] -> :string;
-let render_all sources ds =
-    str.join_str "\n" (list.concat (map (fn d -> render sources d) ds));
+let render_all sources ds = {
+    let by_index = trunk.of sources;
+    str.join_str "\n" (list.concat (map (fn d -> render_from by_index d) ds))
+};
 
 // --- tests -------------------------------------------------------------------
 

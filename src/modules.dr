@@ -29,6 +29,7 @@ import std.list;
 import std.os;
 import std.path;
 import std.str;
+import std.trunk;
 import std.vm;
 
 import dreams.ast;
@@ -143,7 +144,9 @@ mapping Loader {
     // Every setting a `when` read, as a set.
     reads = %{}
     foreigns = []
-    expansions = []
+    // A trunk, pushed once per expansion (`with_expansion`): appended to as a
+    // list, a program's n expansions cost n^2.
+    expansions : :trunk = trunk.empty
     metering = false
     macro_meter = ()
     std_sources = %{}
@@ -305,7 +308,11 @@ let foreigns l     = Loader.foreigns l;
 /// pass that did resolve it says so here, and `scope.resolve!` seeds its
 /// occurrence table with these. See `note_macro` in dreams/src/expand.dr.
 let expansions : Loader -> [[:any]];
-let expansions l   = Loader.expansions l;
+let expansions l   = trunk.to_list (Loader.expansions l);
+
+/// The loader with one more expansion written down, after the others.
+let with_expansion : [:any] -> Loader -> Loader;
+let with_expansion e l = Loader.set_expansions (trunk.push e (Loader.expansions l)) l;
 
 /// Should macro expansion measure itself, and what did it measure?
 ///
