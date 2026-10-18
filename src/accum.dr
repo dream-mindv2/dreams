@@ -119,14 +119,19 @@ let accum img0 = {
     let n_funcs = array.length (Program.funcs p);
     let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
         match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
-            // A worker made as a closure has no global of its own.
-            [wrapper, worker, ()] => [m.[fi => wrapper], list.cons worker added, gs],
-            [wrapper, worker, global] => [m.[fi => wrapper], list.cons worker added, list.cons global gs],
+            // Workers made as closures have no globals of their own, and
+            // there may be more than one, numbered in order from `wfi`.
+            [wrapper, workers, ()] => [m.[fi => wrapper], list.fold (fn a w -> list.cons w a) added (workers_of workers), gs],
+            [wrapper, worker, global] => [m.[fi => wrapper], list.fold (fn a w -> list.cons w a) added (workers_of worker), list.cons global gs],
             _ => [m, added, gs],
         }) [%{}, [], []] (list.range 0 n_funcs);
     if map.size changed == 0 { Result.ok img0 }
     else { sc.patch img rd changed (list.reverse added_rev) (list.reverse globals_rev) }
 };
+
+/// A shape's workers: one, or a list of them.
+let workers_of : :any -> [Fun];
+let workers_of w = if type_of w == :list { w } else { [w] };
 
 /// The image with 0 to 16 in its integer pool, and `memo_cap`, and where each is.
 let with_small_ints : ir.Image -> [ir.Image, %{:integer => :integer}];
@@ -203,7 +208,7 @@ let global_named img strs module name = match list.find (fn m -> strs.[m.[:name 
 
 /// Function `fi` with the first shape that fits it written again: the
 /// wrapper, the worker (function `wfi`, global `wgi`) and its global, or `()`.
-let rewritten : Program -> :integer -> :integer -> :integer -> [Fun, Fun, :map | :unit] | :unit;
+let rewritten : Program -> :integer -> :integer -> :integer -> [Fun, Fun | [Fun], :map | :unit] | :unit;
 let rewritten p fi wfi wgi = {
     let f = (Program.funcs p).[fi];
     let fl = f.[:flags else 0];
@@ -685,7 +690,7 @@ let memo_cap = 1048576;
 /// table is what the program forces. There every number must be forced
 /// already, and must be a small integer that is not negative, or the body
 /// runs on as written.
-let memo_table : Site -> [Fun, Fun, :map | :unit] | :unit;
+let memo_table : Site -> [Fun, [Fun], :unit] | :unit;
 let memo_table site = {
     let p = Site.program site;
     let gi = Site.gi site;
@@ -802,7 +807,12 @@ let larger a b = if a > b { a } else { b };
 /// table of them, each a frame and a thunk of the cell's body; as a Dream
 /// recursion building a list it was 350 bytes a cell, the list and the
 /// builder's frames made only to be thrown away.
-let memo_built : Site -> [:integer] -> Term -> (Term -> Term) -> [Fun, Fun, :unit];
+/// A function's flags without `rec`: a cell and its caller call nothing of
+/// their own.
+let untagged : :integer -> :integer;
+let untagged fl = if ir.has_flag fl ir.fn_rec { fl - ir.fn_rec } else { fl };
+
+let memo_built : Site -> [:integer] -> Term -> (Term -> Term) -> [Fun, [Fun], :unit];
 let memo_built site dims m place = {
     let p = Site.program site;
     let gi = Site.gi site;
@@ -849,7 +859,7 @@ let memo_built site dims m place = {
     let cell = Fun.make [sc.slot_name 0] (list.map sc.capture_name (list.range 0 (ns + d + 1)))
                         (Term.block 0 (list.append unpacked [Stmt.expr body]))
                         (f.[:arity => 1].[:n_captures => ns + d + 1].[:captures_off => 0]
-                          .[:slots => f.[:slots else 0] + 1]);
+                          .[:slots => f.[:slots else 0] + 1].[:flags => untagged (f.[:flags else 0])]);
     // The wrapper: where the body calls itself, the table when the numbers
     // are small integers, the body as written when they are not.
     let slot j = Term.var (sc.slot_name j) 0;
@@ -861,10 +871,21 @@ let memo_built site dims m place = {
     let at = list.map slot dims;
     let made = Term.lam :make_closure 0 (Site.wfi site)
                         (list.concat [list.map sc.slot_name statics, list.map sc.slot_name dims, ["memo_table"]]);
-    let tabled = Term.block 0 [Stmt.bind "memo_table" 0 (builtin p "_memo_cells" [cells, made]),
+    // A cell is a thunk of `fn i -> cell i` -- the cell called, rather than
+    // its body run in the cell's own frame -- because a call is what the JIT
+    // takes: a thunk of a body only the interpreter runs. The frame each cell
+    // keeps is this one's, the place and the cell, and the cell's own is made
+    // only while it runs.
+    let calling = Fun.make [sc.slot_name 0] [sc.capture_name 0]
+                           (Term.prim :apply 0 ir.no_node ir.no_node ir.no_node [cap 0, index])
+                           (f.[:arity => 1].[:n_captures => 1].[:captures_off => 0].[:slots => 1]
+                             .[:flags => untagged (f.[:flags else 0])]);
+    let tabled = Term.block 0 [Stmt.bind "memo_cell" 0 made,
+                               Stmt.bind "memo_table" 0 (builtin p "_memo_cells"
+                                   [cells, Term.lam :make_closure 0 (Site.wfi site + 1) ["memo_cell"]]),
                                Stmt.expr (read (Term.var "memo_table" 0) at at)];
     let wrapper = sc.fun_of f (place (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [op :and fits (op :le cells limit), tabled, m]));
-    [wrapper, cell, ()]
+    [wrapper, [cell, calling], ()]
 };
 
 // --- a queue grown at the end ---------------------------------------------------------

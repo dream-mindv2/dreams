@@ -354,3 +354,18 @@ image's bytes were first forced inside the write, so emitting ran inside a
 native's force. With both, 1.08 GB live at the largest collection went to
 0.85 GB and eight builds in a row passed. That margin is thin; the
 supercompiler's own live set is next.
+
+The cells then went under the JIT, or tried to: a cell is now a thunk of `fn
+i -> cell i`, a two-slot frame holding its place and the cell closure, so
+forcing one calls the cell, which is what the JIT takes, and the cell's own
+frame lives only while it runs. That took the 720×720 LCS's peak live set
+from 58 to 34 MB and its time from 398 to 345 ms; the JIT compiles the cell
+but gains little, because every lookup forces a neighbouring cell through a
+nested force and the compiled code falls back each time. Filling the table
+bottom up, a loop the JIT would take whole, is only exact when a cell cannot
+fail, and is not done.
+
+It also showed a cost every short program paid: a run that ended while the
+JIT was compiling a function that had just got hot waited for LLVM to
+finish, 50 ms on a 7 ms program. `dream_main` now ends without waiting, once
+the processes are gone, as `os.exit!` does.
