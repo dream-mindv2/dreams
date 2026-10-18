@@ -401,3 +401,24 @@ extends the calls in another.
 Still quadratic: a join by key (`list.find (fn c -> key c == o) customers`
 per order), which wants an index built as the scans go, as the membership
 set is; and a priority queue sorted again each step, which wants a heap.
+
+The join became linear too. A search of an unchanging list by a key --
+`list.find (fn c -> c.[0] == o) customers`, the scan fusion writes for it --
+reads through an index (`_index_new`, `_index_find`) filled as the scans
+would have read it: a key already read answers from the map, anything else
+reads on from where the index stopped, an element and its key at a time,
+until it finds the key or the list ends. It is filled in place, with the
+write barrier on each store, because a functional index threaded through
+the loop cannot learn keys the scans compute and drop. A search inside a
+small function the loop hands the list to (`name_of customers o`) is read
+the same way, through a copy of that function taking the index too, called
+as a closure so it needs no global. The test puts an element whose key is
+`1 / 0` past the last one asked for: neither the scan nor the index reaches
+it. 641 → 31 ms.
+
+The supercompiled self-compile still ran past the process heap one time in
+five. The cap is a guard against a program that runs away; a whole-program
+compile is large on purpose, so `[vm] max_heap` joins `nursery_max` as a
+setting a manifest makes and the image carries (`VMOP` key 2), applied
+unless `--max-heap` or `DREAM_MAX_HEAP` says otherwise, and the compiler's
+manifest asks for 4 GB. Its live set is still to be made smaller.

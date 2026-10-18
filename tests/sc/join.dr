@@ -1,0 +1,21 @@
+import std.console;
+import std.list;
+import std.str;
+
+// A join by key: for each order, its customer found by scanning the
+// customers. An index of the customers by that key is filled as the scans
+// would have read it, so each search is a lookup -- and reads no further
+// than the scan would: the customer past the last one asked for is an error
+// nothing reaches.
+let name_of : [[:any]] -> :integer -> :string;
+let name_of customers o = match list.find (fn c -> list.head c == o) customers { () => "?", c => list.nth 1 c };
+
+let main! () = {
+    let n = 12000;
+    let customers = list.append (list.map (fn i -> [i, "c" + to_string i]) (list.range 0 n)) [[1 / 0, "boom"]];
+    let orders = list.map (fn i -> (i * 7) % n) (list.range 0 n);
+    console.print! (to_string (list.sum (list.map (fn o -> str.byte_length (name_of customers o)) orders)))
+    // A key that is not there, and keys a map cannot hold, answer as written.
+    console.print! (to_string (list.map (fn o -> name_of [[1, "a"], [2, "b"]] o) [2, 3, 1]))
+    console.print! (to_string (list.map (fn o -> list.find (fn c -> list.head c == o) [[[1], "x"], [[2], "y"]]) [[2], [5]]))
+};

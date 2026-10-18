@@ -131,6 +131,8 @@ let names = [
     "_tally",
     "_tally_lookup",
     "_list_drop",
+    "_index_new",
+    "_index_find",
 
 ];
 
@@ -244,6 +246,8 @@ let signatures = %{
     "_tally" => "list -> each element to how often it occurs, or () when one cannot be counted by hashing",
     "_tally_lookup" => "tally -> list -> value -> how often the value occurs in the list, or () when the tally cannot say",
     "_list_drop" => "integer -> list -> the list past that many cells",
+    "_index_new" => "list -> path -> bool -> an index of the list by the key the path reads, nothing read yet",
+    "_index_find" => "index -> value -> [the first element with that key] or [], or () when the index cannot say",
 
 };
 

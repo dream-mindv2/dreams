@@ -49,6 +49,11 @@ mapping Vm {
     /// more (see "Strict builtins and pinned forces" in
     /// dream/docs/notes/vm-performance.md).
     nursery_max : :integer | :unit = ()
+    /// The most a process's heap may hold before the VM stops it, in bytes.
+    /// The VM's default, 1 GB, is a guard against a program that runs away;
+    /// a program that is large on purpose -- a whole-program compile -- says
+    /// how large here.
+    max_heap : :integer | :unit = ()
 }
 
 mapping Package {
@@ -234,7 +239,12 @@ let vm_settings entries =
                                + to_string value),
                 n => Result.ok (Vm.set_nursery_max n settings),
             },
-            _ => Result.error ("[vm] has no setting `" + key + "`; the one it has is nursery_max"),
+            "max_heap" => match size_of value {
+                () => Result.error ("[vm] max_heap takes a size such as 2147483648 or \"2G\", not "
+                               + to_string value),
+                n => Result.ok (Vm.set_max_heap n settings),
+            },
+            _ => Result.error ("[vm] has no setting `" + key + "`; the ones it has are nursery_max and max_heap"),
         },
         failed => failed,
     }) (Result.ok (Vm.new ())) entries;

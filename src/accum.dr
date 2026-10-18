@@ -28,6 +28,10 @@
 //   of a loop over something else, `xs` handed on as it was: a scan each.
 //   The list is counted once, every value at a time, into a map (`_tally`),
 //   and each count is a lookup (`tallied`).
+// - **A search of a list that does not change by a key**, `list.find (fn
+//   c -> c.[0] == o) customers` for each `o`: a scan each. An index of the
+//   list by that key is filled as the scans would have read it, and each
+//   search is a lookup (`indexed`).
 // - **The oldest of a list grown at the front**, `list.head (list.reverse
 //   acc)` with `acc` handed on as `x :: acc`: a copy each step for one
 //   element that does not change. It is carried beside the list
@@ -99,6 +103,15 @@ mapping Program {
     // prefix directly is an aggregate of it too.
     aggregates
     folds
+    // Each function that finds the first element of a list whose key is a
+    // value -- the scan `std`'s fusion writes for `list.find (fn e -> e.[0]
+    // == x) xs` -- as `[list, value, key path, value first, found, none]`:
+    // the path as the constant keys the key is read by, `found` and `none`
+    // the terms it answers (`found` reading the element as `l.[0]`). And
+    // each function, not itself a loop, that searches one of its parameters
+    // so: `[parameter, path, value first]` (`searcher_shape`).
+    keyed
+    searchers
 }
 
 /// The image with its slow accumulators written again.
@@ -114,12 +127,12 @@ let accum img0 = {
     let id name = match builtins.id name { () => -1, i => i };
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
-                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop"];
+                         "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
                          (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
                          (global_named img strs "std.list" "last") (global_named img strs "std.list" "reverse_from")
                          (global_named img strs "std.list" "take") small %{}
-                         (array.of_list (ir.Image.ints img)) %{} %{} %{};
+                         (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{};
     let ints = Program.ints p;
     let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
         () => m,
@@ -141,6 +154,14 @@ let accum img0 = {
         shape => m.[gi => shape],
     }) %{} functions;
     let p = Program.set_folds folds p;
+    let p = Program.set_keyed (list.fold (fn m [gi, g] -> match keyed_shape p (g.[:target else -1]) gi {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions) p;
+    let p = Program.set_searchers (list.fold (fn m [gi, g] -> match searcher_shape p (g.[:target else -1]) {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions) p;
     let p = Program.set_aggregates (list.fold (fn m [gi, g] -> match aggregate_shape p folds (g.[:target else -1]) {
         () => m,
         shape => m.[gi => shape],
@@ -257,7 +278,7 @@ let rewritten p fi wfi wgi = {
         let body = sc.body_of (Program.reading p) f;
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
-                  fn () -> tallied site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> queue site,
+                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> queue site,
                   fn () -> memo_table site]
     }
 };
@@ -1460,3 +1481,228 @@ let prefix_folded site = {
         }
     }
 };
+
+// --- searching a list that does not change by a key ----------------------------------------
+
+/// Whether function `fi`, called through global `gi`, finds the first
+/// element of a list whose key is a value: `if empty l { none } else if
+/// key (l.[0]) == x { found } else { self (tail l) .. x .. }`, the key read
+/// by constant `.[k]`s, `found` reading the element and nothing else of the
+/// list, `none` reading nothing, every other parameter handed on as it was.
+let keyed_shape : Program -> :integer -> :integer -> [:integer, :integer, :any, :bool, Term, Term] | :unit;
+let keyed_shape p fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let k = f.[:arity else 0];
+        let position n = list.find_index (fn j -> sc.slot_name j == n) (list.range 0 k);
+        let int_is t v = match t { Term.prim(:const_int, _, i, _, _, _) => (Program.ints p).[i] == v, _ => false };
+        let element l t = match t {
+            Term.prim(:get, _, _, _, _, [Term.var(n, _), i, Term.absent]) => n == l && int_is i 0,
+            _ => false,
+        };
+        // The path a key is read by, outermost last, or `()`.
+        let path_of l t = {
+            let rec walk t = if element l t { [] } else { match t {
+                Term.prim(:get, _, _, _, _, [inner, key, Term.absent]) => match key {
+                    Term.prim(op, _, _, _, _, []) if op == :const_int || op == :const_atom || op == :const_str =>
+                        match walk inner { () => (), path => list.append path [key] },
+                    _ => (),
+                },
+                _ => (),
+            } };
+            walk t
+        };
+        if f.[:n_captures else 0] > 0 || ir.has_flag (f.[:flags else 0]) ir.fn_impure { () }
+        else {
+            match past_strict (sc.body_of (Program.reading p) f) {
+                Term.prim(:if, _, _, _, _, [Term.prim(:list_is_empty, _, _, _, _, [Term.var(l, _)]), none, rest]) => match unwrap rest {
+                    Term.prim(:if, _, _, _, _, [Term.prim(:eq, _, _, _, _, [a, b]), found, again]) => {
+                        let [x, path, x_first] = match [a, b] {
+                            [Term.var(n, _), y] if path_of l y != () => [n, path_of l y, true],
+                            [y, Term.var(n, _)] if path_of l y != () => [n, path_of l y, false],
+                            _ => ["", [], false],
+                        };
+                        let [li, xi] = [position l, position x];
+                        let reads_only_element t = list.all (fn y -> match y {
+                            Term.var(n, _) => n != l && position n >= 0,
+                            Term.lam(_, _, _, caps) => list.is_empty caps,
+                            Term.block(_, _) => false,
+                            _ => true,
+                        }) (list.head (hoist.parts (list.head (hoist.rewrite (fn y -> if element l y { Term.prim :unit 0 ir.no_node ir.no_node ir.no_node [] } else { () }) %{} t))));
+                        let closed t = list.all (fn y -> match y {
+                            Term.var(_, _) => false,
+                            Term.lam(_, _, _, caps) => list.is_empty caps,
+                            Term.block(_, _) => false,
+                            _ => true,
+                        }) (list.head (hoist.parts t));
+                        let stepping = match unwrap again {
+                            Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) =>
+                                g == gi && list.length args == k && list.all (fn [j, arg] ->
+                                    if j == li { match arg { Term.prim(:list_tail, _, _, _, _, [Term.var(m, _)]) => m == l, _ => false } }
+                                    else { is_var (sc.slot_name j) arg }) (list.enumerate args),
+                            _ => false,
+                        };
+                        if li >= 0 && xi >= 0 && stepping && reads_only_element (unwrap found) && closed (unwrap none) {
+                            [li, xi, path, x_first, unwrap found, unwrap none]
+                        } else { () }
+                    },
+                    _ => (),
+                },
+                _ => (),
+            }
+        }
+    };
+
+/// A loop that searches parameter `j`, a list it hands on as it was, by a
+/// key: an index of it carried beside it, made the first time a search needs
+/// it, and each search a lookup in it -- or the search as written, when the
+/// index cannot say.
+let indexed : Site -> [Fun, Fun | [Fun], :map] | :unit;
+let indexed site =
+    if map.size (Program.keyed (Site.program site)) == 0 { () }
+    else {
+        match hoist.statics (Site.program site) (Site.gi site) (Site.k site) (hoist.parts (Site.body site)) {
+            () => (),
+            statics => first_of (list.map (fn j -> fn () -> indexed_at site j) statics),
+        }
+    };
+
+let indexed_at : Site -> :integer -> [Fun, Fun | [Fun], :map] | :unit;
+let indexed_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let xs = sc.slot_name j;
+    let [terms, _] = hoist.parts (Site.body site);
+    // Searches of `xs` in the loop's own body, and calls handing `xs` to a
+    // function that searches it.
+    // Read through an index already, by a round before: the search left as
+    // written is the one the index could not answer.
+    let done = list.any (fn t -> match t {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => b == (Program.ids p).["_index_find"],
+        _ => false,
+    }) terms;
+    let own = if done { [] } else { list.filter (fn t -> searched_in p xs t != ()) terms };
+    let handed = if done { [] } else { list.filter (fn t -> match t {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match (Program.searchers p).[g else ()] {
+            [at, _, _] => is_var xs (list.nth at args),
+            _ => false,
+        },
+        _ => false,
+    }) terms };
+    let keys = list.append (list.map (fn t -> match searched_in p xs t { [_, _, _, q, xf, _, _] => [q, xf], _ => [] }) own)
+                           (list.map (fn t -> match t {
+                               Term.prim(_, _, _, _, _, [Term.prim(_, _, g, _, _, _), .._]) => match (Program.searchers p).[g else ()] {
+                                   [_, q, xf] => [q, xf], _ => [],
+                               },
+                               _ => [],
+                           }) handed);
+    // One index, so every search must read the same key.
+    match keys {
+        [] => (),
+        [first, ..rest] if list.all (fn k -> k == first) rest => {
+            let [path, x_first] = first;
+            let index = Term.var "key_index" 0;
+            // A searching function handed `xs` is called as a copy of itself
+            // taking the index too: a closure of no captures, numbered after
+            // the loop's worker, so it needs no global of its own.
+            let called = list.unique (list.map (fn t -> match t { Term.prim(_, _, _, _, _, [Term.prim(_, _, g, _, _, _), .._]) => g, _ => -1 }) handed);
+            let copies = list.map (fn [n, g] -> [g, Site.wfi site + 1 + n]) (list.enumerate called);
+            let clone_of g = {
+                let fi = ((Program.globals p).[g]).[:target];
+                let f = (Program.funcs p).[fi];
+                let k = f.[:arity else 0];
+                let [at, _, _] = (Program.searchers p).[g];
+                let shifted = hoist.shift_slots k 1 (sc.body_of (Program.reading p) f);
+                let body = index_reads p (sc.slot_name at) (Term.var (sc.slot_name k) 0) shifted;
+                sc.fun_of (f.[:arity => k + 1].[:slots => f.[:slots else 0] + 1]
+                             .[:flags => untagged (f.[:flags else 0])]) body
+            };
+            // The searches and the calls handing `xs` on first, the calls of
+            // itself after, so that one inside a call's own arguments is
+            // rewritten too.
+            let reads = list.head (hoist.rewrite (fn t -> match t {
+                Term.prim(:apply, fl, a, b, c, [Term.prim(:global, _, g, _, _, _), ..args]) if g != gi => match list.find (fn [h, _] -> h == g) copies {
+                    [_, cfi] if is_var xs (list.nth (list.head ((Program.searchers p).[g])) args) =>
+                        Term.prim :apply fl a b c (list.cons (Term.lam :make_closure 0 cfi []) (list.append args [index])),
+                    _ => (),
+                },
+                _ => (),
+            }) %{} (index_reads p xs index (Site.body site)));
+            let body = list.head (hoist.rewrite (fn t ->
+                if hoist.self_call gi t { call (Site.wgi site) (list.append (self_args t) [index]) } else { () }) %{} reads);
+            let path_list = Term.prim :make_list 0 ir.no_node (list.length path) ir.no_node path;
+            let [wrapper, worker, global] = built site "key_index" false body
+                  (builtin p "_index_new" [Term.var xs 0, path_list, Term.prim :const_bool 0 (if x_first { 1 } else { 0 }) ir.no_node ir.no_node []]);
+            [wrapper, list.cons worker (list.map (fn [g, _] -> clone_of g) copies), global]
+        },
+        _ => (),
+    }
+};
+
+/// A search of `xs` that `t` is, as `[args, list, value, path, value first,
+/// found, none]`, or `()`.
+let searched_in : Program -> :string -> Term -> :any;
+let searched_in p xs t = match t {
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match (Program.keyed p).[g else ()] {
+        [li, xi, path, x_first, found, none] if is_var xs (list.nth li args) => [args, li, xi, path, x_first, found, none],
+        _ => (),
+    },
+    _ => (),
+};
+
+/// `body` with each search of `xs` a lookup in `index` -- or the search as
+/// written, when the index cannot say.
+let index_reads : Program -> :string -> Term -> Term -> Term;
+let index_reads p xs index body = list.head (hoist.rewrite (fn t ->
+    match searched_in p xs t {
+        () => (),
+        [args, li, xi, _, _, found, none] => {
+            let says = Term.var "key_says" 0;
+            // What it answers, in this frame: the element found where it read
+            // `l.[0]`, its parameters as this call hands them.
+            let l = sc.slot_name li;
+            let here = list.head (hoist.rewrite (fn y -> match y {
+                Term.prim(:get, _, _, _, _, [Term.var(n, _), _, Term.absent]) if n == l =>
+                    Term.prim :get 0 ir.no_node ir.no_node ir.no_node
+                        [says, Term.prim :const_int 0 ((Program.small_ints p).[0]) ir.no_node ir.no_node [], Term.absent],
+                Term.var(n, _) => match list.find_index (fn m -> sc.slot_name m == n) (list.range 0 (list.length args)) {
+                    -1 => (),
+                    m => list.nth m args,
+                },
+                _ => (),
+            }) %{} found);
+            Term.block (drive.flags_of t) [
+                Stmt.bind "key_says" ir.f_strict (builtin p "_index_find" [index, list.nth xi args]),
+                Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node
+                    [Term.prim :eq 0 ir.no_node ir.no_node ir.no_node [says, Term.prim :unit 0 ir.no_node ir.no_node ir.no_node []],
+                     t,
+                     Term.prim :if 0 ir.no_node ir.no_node ir.no_node
+                         [Term.prim :list_is_empty 0 ir.no_node ir.no_node ir.no_node [says], none, here]])]
+        },
+    }) %{} body);
+
+/// Whether function `fi` searches one of its parameters by a key -- a pure
+/// function of its own, not recursive, every search in it of that parameter
+/// and by one key: `[parameter, path, value first]`, or `()`.
+let searcher_shape : Program -> :integer -> [:integer, :any, :bool] | :unit;
+let searcher_shape p fi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let fl = f.[:flags else 0];
+        let k = f.[:arity else 0];
+        if k == 0 || ir.has_flag fl ir.fn_rec || ir.has_flag fl ir.fn_impure || ir.has_flag fl ir.fn_thunk
+           || ir.has_flag fl ir.fn_global_value || f.[:n_captures else 0] > 0 { () }
+        else {
+            let [terms, _] = hoist.parts (sc.body_of (Program.reading p) f);
+            let found = list.concat (list.map (fn j -> list.concat (list.map (fn t -> match searched_in p (sc.slot_name j) t {
+                [_, _, _, q, xf, _, _] => [[j, q, xf]],
+                _ => [],
+            }) terms)) (list.range 0 k));
+            match found {
+                [first, ..rest] if list.all (fn x -> x == first) rest => first,
+                _ => (),
+            }
+        }
+    };

@@ -11,3 +11,7 @@ description = "The Dream compiler: .dr source to .dream bytecode"
 # the VM's 32 MB a self-compile was no slower and held no more; see "Strict
 # builtins and pinned forces" in dream/docs/notes/vm-performance.md.
 nursery_max = "64M"
+# The supercompiler holds the whole program as a graph while it rewrites it,
+# and a release self-compile runs within a few hundred megabytes of the VM's
+# 1 GB guard: see "Milestone 2, step 6" in docs/notes/supercompilation.md.
+max_heap = "4G"

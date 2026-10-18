@@ -607,10 +607,10 @@ let remap_sources pairs img =
 let vm_options : modules.Loader -> [[:integer]];
 let vm_options l = match package.current (modules.packages l) {
     () => [],
-    p => match package.Vm.nursery_max (package.vm p) {
-        () => [],
-        n => [[emit.vm_nursery_max, n]],
-    },
+    p => list.concat [
+        match package.Vm.nursery_max (package.vm p) { () => [], n => [[emit.vm_nursery_max, n]] },
+        match package.Vm.max_heap (package.vm p) { () => [], n => [[emit.vm_max_heap, n]] },
+    ],
 };
 
 /// The image as the bytes a `.dream` file holds, payload excepted.
