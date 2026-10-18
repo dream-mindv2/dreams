@@ -1,0 +1,735 @@
+// The supercompiler's driver: docs/notes/supercompilation.md, milestone 2.
+//
+// It reads each function's body in the core (`dreams/src/sc.dr`) and runs it
+// at compile time against what is known at each point: a name bound to a
+// record, a list or a closure is known to be one, and an operation on a known
+// value is done now rather than when the program runs. A `match` lowers to
+// tests and reads -- `_record_is`, `_match_at`, `_match_is_cons`, a
+// `switch_atom` -- and each of those on a known value is decided here, so the
+// test, its branch not taken and the value's allocation can all go.
+//
+// What makes values known is unfolding. A call of a known pure function -- a
+// global, or a closure whose making is in sight -- is written out with its
+// parameters bound to its arguments, lazily, so that no argument's work is
+// done twice; the body is then driven with the arguments' values known, and
+// the block it came to is spliced into the place it was called from, so
+// that what it answers is known to what reads it. A call is unfolded only
+// when that decides something: the unfolding is driven first, and kept only
+// if something folded. Writing a call out for its own sake was measured and
+// is a loss (docs/notes/inlining.md) -- it grows the frame every suspension
+// in it carries -- so a fold is what pays for the frame.
+//
+// What is never run: a function that is impure, recursive, a thunk or a
+// global value (unfolding a global value would do its work once per use
+// instead of once), and anything already being unfolded above the call.
+// Recursive functions are the next step, specialised on what is known at
+// the call and folded back to the specialisation when the call recurs.
+
+import std.array;
+import std.lazy;
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.builtins;
+import dreams.ir;
+import dreams.sc;
+import dreams.sc.{Term, Stmt, Fun};
+
+// --- what the driver reads -----------------------------------------------------
+
+/// The program as the driver reads it, built once: the function records and
+/// their bodies as terms (each read the first time it is asked for), each
+/// body's size, the globals, every atom's name, the integer pool, and the
+/// builtins it decides.
+mapping View {
+    reading
+    strs
+    funcs
+    bodies
+    sizes
+    globals
+    atom_names
+    ints
+    record_is
+    match_at
+    is_cons
+    head
+    tail
+}
+
+let view : ir.Image -> View;
+let view img = {
+    let strs = array.of_list (ir.Image.strs img);
+    let rd = sc.read img;
+    let bodies = array.of_list (list.map (fn f -> sc.body_of rd f) (ir.Image.funcs img));
+    let id name = match builtins.id name { () => -1, i => i };
+    View.make rd strs (array.of_list (ir.Image.funcs img)) bodies
+              (array.of_list (list.map (fn i -> size (bodies.[i])) (list.range 0 (array.length bodies))))
+              (array.of_list (ir.Image.globals img))
+              (array.of_list (list.map (fn s -> strs.[s]) (ir.Image.atoms img)))
+              (array.of_list (ir.Image.ints img))
+              (id "_record_is") (id "_match_at") (id "_match_is_cons") (id "_match_head") (id "_match_tail")
+};
+
+/// How many nodes a term is.
+let size : Term -> :integer;
+let rec size t = match t {
+    Term.prim(_, _, _, _, _, cs) => list.fold_strict (fn n c -> n + size c) 1 cs,
+    Term.block(_, ss) => list.fold_strict (fn n s -> n + stmt_size s) 1 ss,
+    Term.trying(_, body, _, h) => 1 + size body + size h,
+    _ => 1,
+};
+
+let stmt_size : Stmt -> :integer;
+let stmt_size s = match s {
+    Stmt.bind(_, _, v) => 1 + size v,
+    Stmt.expr(e) => size e,
+};
+
+// --- where driving is ------------------------------------------------------------
+
+/// What is known where a term is driven: each name bound to a value whose
+/// parts can be read without doing work (`known`), the functions being
+/// unfolded above this point, and how deep that is. It goes down with the
+/// term, never across: a name is known only where it is in scope.
+mapping Ctx {
+    known = %{}
+    unfolding = []
+    depth = 0
+}
+
+/// What is threaded through the walk: the next fresh name, and how many
+/// things were decided. A function nothing was decided in is left as it was.
+mapping St {
+    fresh = 0
+    folds = 0
+    // How many unfoldings have been tried in this function, against
+    // `max_tries`: each is a drive of the callee's body, inside which more
+    // are tried, so without a budget the work is the product of the sizes.
+    tries = 0
+    // What each term read from the arena was driven to, by the context it
+    // was driven in: a node the arena shares is reached once per parent,
+    // and driving it again would make a copy for each (`drive`).
+    memo = %{}
+}
+
+/// The deepest unfolding inside an unfolding, and the largest body unfolded.
+let max_depth : :integer;
+let max_depth = 4;
+let max_size : :integer;
+let max_size = 160;
+let max_tries : :integer;
+let max_tries = 400;
+
+let settle : St -> St;
+let settle st = if lazy.forced (St.fresh st) && lazy.forced (St.folds st) && lazy.forced (St.tries st)
+                   && lazy.forced (St.memo st) { st } else { st };
+
+let folded : St -> St;
+let folded !st = settle (St.set_folds (St.folds st + 1) st);
+
+let fresh : St -> [St, :string];
+let fresh !st = [settle (St.set_fresh (St.fresh st + 1) st), "x" + to_string (St.fresh st)];
+
+// --- terms -----------------------------------------------------------------------
+
+let leaves : [:atom];
+let leaves = [:const_int, :const_float, :const_str, :const_char, :const_bool, :const_atom, :unit,
+              :global, :builtin];
+
+/// A term that costs nothing to read twice: a name or a constant.
+let trivial : Term -> :bool;
+let trivial t = match t {
+    Term.var(_, _) => true,
+    Term.prim(op, _, _, _, _, []) => list.contains op leaves,
+    _ => false,
+};
+
+let flags_of : Term -> :integer;
+let flags_of t = match t {
+    Term.var(_, fl) => fl,
+    Term.prim(_, fl, _, _, _, _) => fl,
+    Term.block(fl, _) => fl,
+    Term.lam(_, fl, _, _) => fl,
+    Term.trying(fl, _, _, _) => fl,
+    Term.absent => 0,
+};
+
+let boolean : :bool -> Term;
+let boolean b = Term.prim :const_bool 0 (if b { 1 } else { 0 }) ir.no_node ir.no_node [];
+
+/// The truth a term is, if it is a constant one.
+let truth : Term -> :bool | :unit;
+let truth t = match t {
+    Term.prim(:const_bool, _, a, _, _, _) => a == 1,
+    _ => (),
+};
+
+/// What replaces a term carries the term's strictness and effects: a
+/// statement that was strict is evaluated, and one that is not, is not, so
+/// an `if` decided to its branch must still be a strict statement.
+let inherit : Term -> Term -> Term;
+let inherit from t = {
+    let carry fl f = if ir.has_flag (flags_of from) f { ir.add_flag fl f } else { fl };
+    let fl = carry (carry (flags_of t) ir.f_strict) ir.f_impure;
+    if fl == flags_of t { t } else { with_flags fl t }
+};
+
+let with_flags : :integer -> Term -> Term;
+let with_flags fl t = match t {
+    Term.var(n, _) => Term.var n fl,
+    Term.prim(op, _, a, b, c, cs) => Term.prim op fl a b c cs,
+    Term.block(_, ss) => Term.block fl ss,
+    Term.lam(op, _, fi, caps) => Term.lam op fl fi caps,
+    Term.trying(_, body, e, h) => Term.trying fl body e h,
+    Term.absent => t,
+};
+
+/// A record's id as its name, the variant bit taken off.
+let record_name : View -> :integer -> :string;
+let record_name v c = (View.atom_names v).[if c >= ir.record_variant { c - ir.record_variant } else { c }];
+
+// --- what is known ---------------------------------------------------------------
+
+/// The value a term is known to be, or `()`: a record, a list cell or a list
+/// whose parts are all trivial, a closure, a constant, or a name bound to
+/// one of those. A part that is not trivial is not read twice, so a value
+/// with one is not known -- `named` makes its parts names first.
+let known : View -> Ctx -> Term -> Term | :unit;
+let known v cx t = match t {
+    Term.var(n, _) => (Ctx.known cx).[n else ()],
+    Term.lam(:make_closure, _, _, _) => t,
+    Term.prim(op, _, _, _, _, cs) if op == :record_make || op == :make_list || op == :cons =>
+        if list.all trivial cs { t } else { () },
+    Term.prim(:global, _, g, _, _, _) => known_global v g,
+    Term.prim(op, _, _, _, _, []) if list.contains op leaves => t,
+    _ => (),
+};
+
+/// A global known as a value: one whose value is a record with no fields,
+/// which is what a union's variant without fields is (`Option.none`).
+let known_global : View -> :integer -> Term | :unit;
+let known_global v g = {
+    let gr = (View.globals v).[g];
+    if gr.[:kind else -1] != ir.global_function { () }
+    else {
+        let fi = gr.[:target];
+        let f = (View.funcs v).[fi];
+        if not (ir.has_flag (f.[:flags else 0]) ir.fn_global_value) { () }
+        else {
+            match (View.bodies v).[fi] {
+                Term.prim(:record_make, fl, a, b, c, []) => Term.prim :record_make fl a b c [],
+                _ => (),
+            }
+        }
+    }
+};
+
+/// The function a callee is, with the names its captures are read from: a
+/// global function, a closure made here, or a name bound to one.
+let callee_of : View -> Ctx -> Term -> [:integer, [:string]] | :unit;
+let callee_of v cx c = match c {
+    Term.prim(:global, _, g, _, _, _) => {
+        let gr = (View.globals v).[g];
+        if gr.[:kind else -1] == ir.global_function { [gr.[:target], []] } else { () }
+    },
+    Term.lam(:make_closure, _, fi, caps) => [fi, caps],
+    Term.var(_, _) => match known v cx c {
+        Term.lam(:make_closure, _, fi, caps) => [fi, caps],
+        Term.prim(:global, _, g, _, _, _) => callee_of v cx (Term.prim :global 0 g ir.no_node ir.no_node []),
+        _ => (),
+    },
+    _ => (),
+};
+
+/// Whether function `fi` may be written out where it is called with `n`
+/// arguments, here.
+let unfoldable : View -> Ctx -> :integer -> :integer -> :bool;
+let unfoldable v cx fi n = {
+    let f = (View.funcs v).[fi];
+    let fl = f.[:flags else 0];
+    f.[:arity else -1] == n && n > 0
+        && not (ir.has_flag fl ir.fn_impure) && not (ir.has_flag fl ir.fn_rec)
+        && not (ir.has_flag fl ir.fn_thunk) && not (ir.has_flag fl ir.fn_global_value)
+        && not (list.contains fi (Ctx.unfolding cx))
+        && Ctx.depth cx < max_depth
+        && (View.sizes v).[fi] <= max_size
+};
+
+// --- deciding ----------------------------------------------------------------------
+
+/// A driven operation decided, if what it reads is known: `()` when it is not.
+let decide : View -> Ctx -> Term -> Term | :unit;
+let decide v cx t = match t {
+    Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, id, _, _, _), ..args]) => decide_builtin v cx id args,
+    Term.prim(:and, _, _, _, _, [x, y]) => match truth x { true => y, false => boolean false, _ => () },
+    Term.prim(:or, _, _, _, _, [x, y]) => match truth x { true => boolean true, false => y, _ => () },
+    Term.prim(:not, _, _, _, _, [x]) => match truth x { () => (), b => boolean (not b) },
+    Term.prim(:type_is, _, _, code, invert, [x]) => match known v cx x {
+        Term.prim(op, _, _, _, _, _) if op == :make_list || op == :cons => boolean ((code == 7) != (invert == 1)),
+        _ => (),
+    },
+    Term.prim(:list_is_empty, _, _, _, _, [x]) => match known v cx x {
+        Term.prim(:make_list, _, _, _, _, cs) => boolean (list.is_empty cs),
+        Term.prim(:cons, _, _, _, _, _) => boolean false,
+        _ => (),
+    },
+    Term.prim(:list_tail, _, _, _, _, [x]) => match known v cx x {
+        Term.prim(:cons, _, _, _, _, [_, rest]) => rest,
+        _ => (),
+    },
+    _ => (),
+};
+
+let decide_builtin : View -> Ctx -> :integer -> [Term] -> Term | :unit;
+let decide_builtin v cx id args = match args {
+    [Term.prim(:const_atom, _, a, _, _, _), x] if id == View.record_is v => match known v cx x {
+        Term.prim(:record_make, _, _, _, c, _) => boolean (record_name v c == (View.atom_names v).[a]),
+        _ => (),
+    },
+    [x, Term.prim(:const_int, _, i, _, _, _)] if id == View.match_at v => match known v cx x {
+        Term.prim(:record_make, _, _, _, _, cs) => list.nth ((View.ints v).[i]) cs,
+        _ => (),
+    },
+    [x] if id == View.is_cons v => match known v cx x {
+        Term.prim(:make_list, _, _, _, _, cs) => boolean (not (list.is_empty cs)),
+        Term.prim(:cons, _, _, _, _, _) => boolean true,
+        // Anything else known is not a list cell: a record, a closure, a
+        // constant. A `match` asks `type_is` first, so this is only a
+        // shortcut for what it would decide anyway.
+        Term.prim(:record_make, _, _, _, _, _) => boolean false,
+        _ => (),
+    },
+    [x] if id == View.head v => match known v cx x {
+        Term.prim(:make_list, _, _, _, _, [first, .._]) => first,
+        Term.prim(:cons, _, _, _, _, [first, _]) => first,
+        _ => (),
+    },
+    [x] if id == View.tail v => match known v cx x {
+        Term.prim(:cons, _, _, _, _, [_, rest]) => rest,
+        _ => (),
+    },
+    _ => (),
+};
+
+/// The target a `switch_atom` takes on a known record: the one keyed by the
+/// record's id, or the default.
+let switch_target : View -> :string -> [Term] -> Term;
+let rec switch_target v name kids = match kids {
+    [default] => default,
+    [Term.prim(:const_atom, _, a, _, _, _), target, ..rest] =>
+        if (View.atom_names v).[a] == name { target } else { switch_target v name rest },
+    [_, _, ..rest] => switch_target v name rest,
+    [] => Term.absent,
+};
+
+// --- renaming ---------------------------------------------------------------------
+
+/// A body with every name it binds made fresh and every free name read
+/// through `subst`: what a function's body is when it is written into
+/// another function's frame, where its slots' names mean nothing.
+///
+/// A lazy binding's value is renamed with its own name already rebound,
+/// because a suspension that reads its own slot reads itself -- that is how
+/// `let rec go = fn .. go ..` works. A strict one is evaluated before the
+/// slot is written, so its value reads the name as it was.
+let rename : St -> %{:string => :string} -> Term -> [St, Term];
+let rec rename !st subst t = match t {
+    Term.var(n, fl) => [st, Term.var (subst.[n else n]) fl],
+    Term.lam(op, fl, fi, caps) => [st, Term.lam op fl fi (list.map (fn n -> subst.[n else n]) caps)],
+    Term.prim(op, fl, a, b, c, cs) => {
+        let [st2, cs2] = rename_all st subst cs;
+        [st2, Term.prim op fl a b c cs2]
+    },
+    Term.block(fl, ss) => {
+        let [st2, ss2] = rename_stmts st subst ss [];
+        [st2, Term.block fl ss2]
+    },
+    Term.trying(fl, body, err, h) => {
+        let [st2, body2] = rename st subst body;
+        let [st3, e2] = fresh st2;
+        let [st4, h2] = rename st3 (subst.[err => e2]) h;
+        [st4, Term.trying fl body2 e2 h2]
+    },
+    Term.absent => [st, t],
+};
+
+let rename_all : St -> %{:string => :string} -> [Term] -> [St, [Term]];
+let rename_all !st subst ts = {
+    let [st2, rev] = list.fold (fn [s, out] x -> {
+        let [s2, x2] = rename s subst x;
+        [s2, list.cons x2 out]
+    }) [st, []] ts;
+    [st2, list.reverse rev]
+};
+
+let rename_stmts : St -> %{:string => :string} -> [Stmt] -> [Stmt] -> [St, [Stmt]];
+let rec rename_stmts !st subst ss acc = match ss {
+    [] => [st, list.reverse acc],
+    [Stmt.expr(e), ..rest] => {
+        let [st2, e2] = rename st subst e;
+        rename_stmts st2 subst rest (list.cons (Stmt.expr e2) acc)
+    },
+    [Stmt.bind(n, fl, x), ..rest] => {
+        let [st2, n2] = fresh st;
+        let inner = subst.[n => n2];
+        let [st3, x2] = rename st2 (if eager_bind fl x { subst } else { inner }) x;
+        rename_stmts st3 inner rest (list.cons (Stmt.bind n2 fl x2) acc)
+    },
+};
+
+/// A binding the VM evaluates before writing its slot: a strict one, unless
+/// its value is a closure or a thunk, which is always suspended first so it
+/// can capture its own slot.
+let eager_bind : :integer -> Term -> :bool;
+let eager_bind fl x = ir.has_flag fl ir.f_strict && match x {
+    Term.lam(_, _, _, _) => false,
+    _ => true,
+};
+
+// --- driving -----------------------------------------------------------------------
+
+/// A term driven: its parts first, then what that decides.
+///
+/// A term read from the arena that has parts is driven once per context and
+/// the answer kept: the arena shares nodes -- a `match`'s switch jumps into
+/// the middle of its own chain of tests -- and a node reached from two
+/// parents in one context is the same term driven to the same result, which
+/// must stay one term to stay one node.
+let drive : View -> Ctx -> St -> Term -> [St, Term];
+let drive v cx !st t =
+    if not (memoable v t) { drive_new v cx st t }
+    else {
+        match ((St.memo st).[t else %{}]).[cx else ()] {
+            () => {
+                let [st2, r] = drive_new v cx st t;
+                let by_cx = ((St.memo st2).[t else %{}]).[cx => r];
+                [settle (St.set_memo ((St.memo st2).[t => by_cx]) st2), r]
+            },
+            r => [st, r],
+        }
+    };
+
+let memoable : View -> Term -> :bool;
+let memoable v t = match t {
+    Term.prim(_, _, _, _, _, []) => false,
+    Term.var(_, _) => false,
+    Term.absent => false,
+    _ => not (fresh_term v t),
+};
+
+let drive_new : View -> Ctx -> St -> Term -> [St, Term];
+let rec drive_new v cx !st t = match t {
+    // A name known to be a constant is the constant, and the binding it was
+    // read from goes when nothing else reads it.
+    Term.var(_, _) => match known v cx t {
+        Term.prim(op, _, a, b, c, []) if op != :global && list.contains op leaves => [st, Term.prim op 0 a b c []],
+        _ => [st, t],
+    },
+    Term.block(fl, ss) => {
+        let [st2, b2] = drive_block v cx st fl ss [];
+        [st2, sc.rebuilt_block (View.reading v) t (block_flags b2) (block_stmts b2)]
+    },
+    Term.trying(fl, body, err, h) => {
+        let [st2, body2] = drive v cx st body;
+        let [st3, h2] = drive v cx st2 h;
+        let rd = View.reading v;
+        [st3, if sc.same rd body body2 && sc.same rd h h2 { t } else { Term.trying fl body2 err h2 }]
+    },
+    // A condition known decides which branch there is, and only that one is
+    // driven.
+    Term.prim(:if, fl, a, b, c, [x, y, z]) => {
+        let [st2, x2] = drive v cx st x;
+        match truth x2 {
+            true => inherited t (drive v cx (folded st2) y),
+            false => if z == Term.absent { [folded st2, inherit t (Term.prim :unit 0 ir.no_node ir.no_node ir.no_node [])] }
+                     else { inherited t (drive v cx (folded st2) z) },
+            _ => {
+                let [st3, y2] = drive v cx st2 y;
+                let [st4, z2] = drive v cx st3 z;
+                [st4, sc.rebuilt (View.reading v) t [x2, y2, z2]]
+            },
+        }
+    },
+    Term.prim(:switch_atom, fl, a, b, c, [subject, ..kids]) => {
+        let [st2, s2] = drive v cx st subject;
+        match known v cx s2 {
+            Term.prim(:record_make, _, _, _, rc, _) =>
+                inherited t (drive v cx (folded st2) (switch_target v (record_name v rc) kids)),
+            _ => {
+                let [st3, kids2] = drive_all v cx st2 kids;
+                [st3, sc.rebuilt (View.reading v) t (list.cons s2 kids2)]
+            },
+        }
+    },
+    Term.prim(op, fl, a, b, c, cs) => {
+        let [st2, cs2] = drive_all v cx st cs;
+        let t2 = sc.rebuilt (View.reading v) t cs2;
+        match decide v cx t2 {
+            () => if op == :apply { call v cx st2 t2 } else { [st2, t2] },
+            d => [folded st2, inherit t d],
+        }
+    },
+    _ => [st, t],
+};
+
+let drive_all : View -> Ctx -> St -> [Term] -> [St, [Term]];
+let drive_all v cx !st ts = {
+    let [st2, rev] = list.fold (fn [s, out] x -> {
+        let [s2, x2] = drive v cx s x;
+        [s2, list.cons x2 out]
+    }) [st, []] ts;
+    [st2, list.reverse rev]
+};
+
+let inherited : Term -> [St, Term] -> [St, Term];
+let inherited from [st, t] = [st, inherit from t];
+
+let block_flags : Term -> :integer;
+let block_flags t = match t { Term.block(fl, _) => fl, _ => 0 };
+let block_stmts : Term -> [Stmt];
+let block_stmts t = match t { Term.block(_, ss) => ss, _ => [] };
+
+/// A call, driven, unfolded if its callee is known and unfolding it decides
+/// anything; otherwise as it was.
+let call : View -> Ctx -> St -> Term -> [St, Term];
+let call v cx !st t = match t {
+    Term.prim(:apply, fl, _, _, _, [callee, ..args]) if not (ir.has_flag fl ir.f_impure) =>
+        match callee_of v cx callee {
+            [fi, caps] if unfoldable v cx fi (list.length args) && St.tries st < max_tries
+                          && (not (is_global callee) || list.any (fn x -> known v cx x != ()) args) => {
+                let before = St.folds st;
+                // A closure's call written out is a decision of its own: the
+                // call through it was indirect, and once nothing calls it the
+                // closure is not made at all (`prune`).
+                let tried = settle (St.set_tries (St.tries st + 1) st);
+                let st1 = if is_global callee { tried } else { folded tried };
+                let [st2, out] = unfold v cx st1 fl fi caps args;
+                // Only an unfolding that decided something is kept; the
+                // fresh names it used are not given back, which costs nothing.
+                if St.folds st2 > before { [st2, out] }
+                else { [St.set_folds before st2, t] }
+            },
+            _ => [st, t],
+        },
+    _ => [st, t],
+};
+
+let is_global : Term -> :bool;
+let is_global t = match t { Term.prim(:global, _, _, _, _, _) => true, _ => false };
+
+/// Function `fi` written out with `args`: each parameter a name bound to its
+/// argument (or the argument itself, when that is a name), each capture the
+/// name it is read from here, and the whole driven as a block.
+let unfold : View -> Ctx -> St -> :integer -> :integer -> [:string] -> [Term] -> [St, Term];
+let unfold v cx !st fl fi caps args = {
+    let [st2, subst, binds_rev] = list.fold (fn [s, m, bs] [k, arg] -> match arg {
+        Term.var(n, 0) => [s, m.[sc.slot_name k => n], bs],
+        _ => {
+            let [s2, x] = fresh s;
+            [s2, m.[sc.slot_name k => x], list.cons (Stmt.bind x 0 arg) bs]
+        },
+    }) [st, %{}, []] (list.enumerate args);
+    let with_caps = list.fold (fn m [i, n] -> m.[sc.capture_name i => n]) subst (list.enumerate caps);
+    let [st3, body] = rename st2 with_caps ((View.bodies v).[fi]);
+    let inner = cx |> Ctx.set_unfolding (list.cons fi (Ctx.unfolding cx)) |> Ctx.set_depth (Ctx.depth cx + 1);
+    drive v inner st3 (Term.block (sc.untail_flags fl) (list.reverse (list.cons (Stmt.expr body) binds_rev)))
+};
+
+/// A block's statements, driven in order, each binding known to the ones
+/// after it. A statement that is a block is spliced into this one when that
+/// keeps what is evaluated when, so that what it binds and answers is known
+/// here: the last statement always (it is evaluated last either way), and
+/// a binding's when the binding is strict or everything before the inner
+/// block's value is a lazy binding, which is evaluated whenever it is read
+/// wherever it stands.
+let drive_block : View -> Ctx -> St -> :integer -> [Stmt] -> [Stmt] -> [St, Term];
+let rec drive_block v cx !st fl ss acc = match ss {
+    [] => [st, Term.block fl (list.reverse acc)],
+    [Stmt.expr(e)] => {
+        let [st2, e2] = drive v cx st e;
+        match e2 {
+            Term.block(_, inner) if fresh_term v e2 => [st2, Term.block fl (list.append (list.reverse acc) inner)],
+            _ => [st2, Term.block fl (list.reverse (list.cons (kept_expr v (list.head ss) e e2) acc))],
+        }
+    },
+    [Stmt.expr(e), ..rest] =>
+        // A statement that is neither last nor strict is never evaluated,
+        // and a strict read of a name known to be a value -- a strict
+        // parameter, once the function is written out -- forces nothing.
+        if not (ir.has_flag (flags_of e) ir.f_strict) || harmless v cx e { drive_block v cx st fl rest acc }
+        else {
+            let [st2, e2] = drive v cx st e;
+            drive_block v cx st2 fl rest (list.cons (kept_expr v (list.head ss) e e2) acc)
+        },
+    [Stmt.bind(n, bfl, x), ..rest] => {
+        let [st2, x2] = drive v cx st x;
+        let [hoisted, value] = match x2 {
+            Term.block(_, inner) if fresh_term v x2 && spliceable bfl inner => {
+                let [last, before] = match list.reverse inner { [Stmt.expr(l), ..b] => [l, list.reverse b], _ => [x2, []] };
+                [before, last]
+            },
+            _ => [[], x2],
+        };
+        let cx2 = list.fold (fn c s -> learn v c s) cx hoisted;
+        // Forcing a value that is known is building it, which cannot fail,
+        // so a strict binding of one need not be strict -- and then, if
+        // nothing reads it, it need not be at all.
+        let bfl2 = if bfl == ir.f_strict && harmless v cx2 value { 0 } else { bfl };
+        let bound = if bfl2 == bfl && sc.same (View.reading v) x value { list.head ss } else { Stmt.bind n bfl2 value };
+        drive_block v (learn v cx2 bound) st2 fl rest
+                    (list.cons bound (list.append (list.reverse hoisted) acc))
+    },
+};
+
+/// Whether a term is one the driver made rather than one read from the
+/// arena. Only a block it made is spliced: one read is where it was put, and
+/// moving it decides nothing.
+let fresh_term : View -> Term -> :bool;
+let fresh_term v t = not (map.has t (sc.Reading.origins (View.reading v)));
+
+/// A statement that reads `e`, now `e2`: the one it was, if `e2` is `e`.
+let kept_expr : View -> Stmt -> Term -> Term -> Stmt;
+let kept_expr v s e e2 = if sc.same (View.reading v) e e2 { s } else { Stmt.expr e2 };
+
+/// Whether forcing a term is known to do nothing but build a value: it is
+/// one, or a name bound to one. A name read strictly that is known is the
+/// same, and so is a constant.
+let harmless : View -> Ctx -> Term -> :bool;
+let harmless v cx t = match t {
+    Term.var(_, _) => known v cx t != (),
+    Term.lam(_, _, _, _) => true,
+    _ => known v cx t != (),
+};
+
+/// Whether a block a binding's value came to can be spliced in front of it.
+let spliceable : :integer -> [Stmt] -> :bool;
+let spliceable bfl inner = match list.reverse inner {
+    [Stmt.expr(_), ..before] => ir.has_flag bfl ir.f_strict || list.all (fn s -> match s {
+        Stmt.bind(_, f2, _) => not (ir.has_flag f2 ir.f_strict),
+        Stmt.expr(_) => false,
+    }) before,
+    _ => false,
+};
+
+/// What a statement teaches: the value a binding binds, when that is known.
+let learn : View -> Ctx -> Stmt -> Ctx;
+let learn v cx s = match s {
+    Stmt.bind(n, _, x) => match known v cx x {
+        () => cx,
+        k => Ctx.set_known ((Ctx.known cx).[n => k]) cx,
+    },
+    _ => cx,
+};
+
+// --- what is left ------------------------------------------------------------------
+
+/// A body without the lazy bindings nothing reads. Deciding a `match` leaves
+/// its subject's binding and the reads of its fields behind, and a closure
+/// written out leaves the binding that made it; a lazy binding nothing reads
+/// is never forced, but the suspension it binds is still made, so it goes.
+let pruned : sc.Reading -> Term -> Term;
+let pruned rd t = list.nth 1 (prune rd %{} t);
+
+/// A term pruned, with the names it reads, and what each term pruned so far
+/// came to: as in `drive`, a term two parents share is pruned once, or it
+/// would be two terms. What nothing was taken out of is handed back as it
+/// was, so a node read from the arena stays that node.
+let prune : sc.Reading -> :map -> Term -> [:map, Term, %{:string => :bool}];
+let prune rd !memo t = match memo.[t else ()] {
+    [t2, reads] => [memo, t2, reads],
+    () => {
+        let [memo2, t2, reads] = prune_new rd memo t;
+        [memo2.[t => [t2, reads]], t2, reads]
+    },
+};
+
+let prune_new : sc.Reading -> :map -> Term -> [:map, Term, %{:string => :bool}];
+let rec prune_new rd !memo t = match t {
+    Term.var(n, _) => [memo, t, %{n => true}],
+    Term.lam(_, _, _, caps) => [memo, t, list.fold (fn m n -> m.[n => true]) %{} caps],
+    Term.prim(_, _, _, _, _, cs) => {
+        let [memo2, rev, reads] = list.fold (fn [m, out, r] c -> {
+            let [m2, c2, rc] = prune rd m c;
+            [m2, list.cons c2 out, map.merge r rc]
+        }) [memo, [], %{}] cs;
+        [memo2, sc.rebuilt rd t (list.reverse rev), reads]
+    },
+    Term.trying(fl, body, err, h) => {
+        let [m2, b2, rb] = prune rd memo body;
+        let [m3, h2, rh] = prune rd m2 h;
+        [m3, if sc.same rd body b2 && sc.same rd h h2 { t } else { Term.trying fl b2 err h2 },
+         map.merge rb (map.remove err rh)]
+    },
+    Term.block(fl, ss) => {
+        // From the last statement back: a binding is kept when what comes
+        // after it reads its name, or when it is strict.
+        let [memo2, kept, live] = list.fold (fn [m, out, live] s -> match s {
+            Stmt.expr(e) => {
+                let [m2, e2, r] = prune rd m e;
+                [m2, list.cons (if sc.same rd e e2 { s } else { Stmt.expr e2 }) out, map.merge live r]
+            },
+            Stmt.bind(n, bfl, x) =>
+                if bfl == 0 && not (map.has n live) { [m, out, live] }
+                else {
+                    let [m2, x2, r] = prune rd m x;
+                    [m2, list.cons (if sc.same rd x x2 { s } else { Stmt.bind n bfl x2 }) out,
+                     map.merge (map.remove n live) r]
+                },
+        }) [memo, [], %{}] (list.reverse ss);
+        [memo2, sc.rebuilt_block rd t fl kept, live]
+    },
+    Term.absent => [memo, t, %{}],
+};
+
+// --- the program -------------------------------------------------------------------
+
+/// Function `fi`'s body driven, if that decided anything.
+let drive_function : View -> :integer -> Option;
+let drive_function v fi = Option.map (fn d -> list.head d) (driven v fi);
+
+/// Function `fi` driven, with how many things were decided in it, if any.
+let driven : View -> :integer -> Option;
+let driven v fi = {
+    let [st, body] = drive v (Ctx.new ()) (St.new ()) ((View.bodies v).[fi]);
+    if St.folds st == 0 { Option.none }
+    else { Option.some [sc.fun_of ((View.funcs v).[fi]) (pruned (View.reading v) body), St.folds st] }
+};
+
+/// What driving decides, function by function, for `--sc-stats`: a line of
+/// totals, then the functions that grew most, each with what was decided in
+/// it and its size before and after, in terms.
+let report : ir.Image -> [:string];
+let report img = {
+    let v = view img;
+    let rows = list.fold (fn out fi -> match driven v fi {
+        Option.some([f, folds]) => {
+            let before = (View.sizes v).[fi];
+            let after = size (Fun.body f);
+            list.cons [fi, folds, before, after] out
+        },
+        Option.none => out,
+    }) [] (list.range 0 (array.length (View.funcs v)));
+    let total k = list.sum (list.map (fn r -> list.nth k r) rows);
+    let name fi = (View.strs v).[(View.funcs v).[fi].[:name else 0]];
+    let grown = list.take 25 (list.reverse (list.sort_on (fn r -> list.nth 3 r - list.nth 2 r) rows));
+    list.cons ("supercompiler: " + to_string (list.length rows) + " of " + to_string (array.length (View.funcs v))
+               + " functions changed, " + to_string (total 1) + " decisions, "
+               + to_string (total 2) + " -> " + to_string (total 3) + " terms")
+        (list.map (fn [fi, folds, before, after] ->
+             "  fn#" + to_string fi + " " + to_string (name fi) + ": " + to_string folds + " decided, "
+             + to_string before + " -> " + to_string after) grown)
+};
+
+/// The image with every function driven, and those something was decided in
+/// written anew (`sc.patch`).
+let supercompile : ir.Image -> Result;
+let supercompile img = {
+    let v = view img;
+    let changed = list.fold (fn m fi -> match drive_function v fi {
+        Option.some(f) => m.[fi => f],
+        Option.none => m,
+    }) %{} (list.range 0 (array.length (View.funcs v)));
+    sc.patch img (View.reading v) changed [] []
+};

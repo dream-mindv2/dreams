@@ -116,3 +116,43 @@ is already a graph -- 55,000 nodes -- and the core's trees are the
 unshared program, 246,000. That is the size the driver will work on, and it
 will have to work in parts as lowering does; the round trip runs in one
 process, which is right for a check and not for a build.
+
+## Milestone 2, step 1: deciding what is known (2026-10-17)
+
+`--supercompile` drives every function (`dreams/src/drive.dr`): a name bound
+to a record, a list or a closure is known to be one, the tests a `match`
+lowers to are decided on it (`_record_is`, `_match_at`, `_match_is_cons`,
+`switch_atom`, `type_is`, `if`, `and`), and a call of a known pure
+non-recursive function or closure is unfolded -- its parameters bound to its
+arguments lazily, so no argument's work is done twice -- and kept only when
+something in it was decided. A block it comes to is spliced into the place it
+was called from when that keeps what is evaluated when, so what it answers is
+known to what reads it. `area (Shape.square 4)` comes out as `4 * 4`; `twice
+(fn y -> y + 1) 5` as two additions. `--sc-stats` says what was decided and
+where code grew.
+
+What it took to keep the program the size it was:
+
+- **The arena is a graph and must be read as one.** A `match` lowers to a
+  switch whose targets are the tails of one chain of tests, so read as trees a
+  self-compile's 57,000 nodes were 670,000 terms, and written back as such.
+  Each node is now read into one term (`sc.read`), a map from term to node
+  (`origins`, keyed by identity) says which, and the emitter writes a term the
+  driver handed back unchanged as the node it was read from. Patching keeps
+  every slot where it was, so such a node means what it meant.
+- **Every walk over it is memoised**, by identity: the driver per term and
+  context, pruning per term, emitting per term and tail position. A walk that
+  is not makes one copy per parent. 112,000 nodes became 78,700.
+- **A decided term inherits what it replaces' strictness.** An `if` statement
+  decided to its branch must still be a strict statement, or it is dead code:
+  example 11's `unless` printed nothing.
+- **Unfolding is tried only where something is known**, with a budget per
+  function; tried everywhere, the work is the product of the bodies' sizes.
+
+What it buys, a self-compile A/B against the same compiler not supercompiled,
+interleaved: 2-5% fewer reductions, 1.5-2.4% more allocation, the same wall
+time. That is the inlining result again (docs/notes/inlining.md): writing a
+callee out moves its suspensions into a bigger frame. Deciding what is known
+is the floor the rest is built on, not the win; what removes suspensions is
+specialising recursive functions and pushing a consumer into its producer,
+which is step 2.

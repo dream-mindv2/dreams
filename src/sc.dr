@@ -17,6 +17,7 @@ import std.array;
 import std.lazy;
 import std.list;
 import std.map;
+import std.num;
 import std.str;
 
 import dreams.ir;
@@ -111,45 +112,6 @@ let node_of ar i = (Arena.nodes ar).[i];
 let kids_of : Arena -> :integer -> :integer -> [:integer];
 let kids_of ar off n = list.map (fn k -> (Arena.kids ar).[off + k]) (list.range 0 n);
 
-/// Node `i` as a term.
-let term_of : Arena -> :integer -> Term;
-let rec term_of ar i =
-    if i == ir.no_node { Term.absent }
-    else {
-        let n = node_of ar i;
-        let op = ir.node_op n;
-        let [fl, a, b, c] = [ir.node_flags n, ir.node_a n, ir.node_b n, ir.node_c n];
-        let t x = term_of ar x;
-        match op {
-            :local => Term.var (slot_name a) fl,
-            :capture => Term.var (capture_name a) fl,
-            :block => Term.block fl (list.map (fn k -> stmt_of ar k) (kids_of ar a b)),
-            :make_closure => Term.lam op fl a [],
-            :make_thunk => Term.lam op fl a [],
-            :try => Term.trying fl (t a) (slot_name c) (t b),
-            _ => Term.prim op fl a b c (match layout op {
-                :leaf => [],
-                :a => [t a],
-                :ab => [t a, t b],
-                :abc => [t a, t b, t c],
-                :a_kids => list.cons (t a) (list.map t (kids_of ar b c)),
-                :kids_ab => list.map t (kids_of ar a b),
-                :kids_ab2 => list.map t (kids_of ar a (2 * b)),
-                :a_kids2 => list.cons (t a) (list.map t (kids_of ar b (2 * c))),
-                :kids_bc => list.map t (kids_of ar b c),
-            }),
-        }
-    };
-
-let stmt_of : Arena -> :integer -> Stmt;
-let stmt_of ar i = {
-    let n = node_of ar i;
-    match ir.node_op n {
-        :bind => Stmt.bind (slot_name (ir.node_a n)) (ir.node_flags n) (term_of ar (ir.node_b n)),
-        _ => Stmt.expr (term_of ar i),
-    }
-};
-
 /// A closure's or a thunk's captures, as names of the frame that makes it:
 /// what its function's capture descriptors name there.
 let capture_terms : Arena -> :map -> [:string];
@@ -157,36 +119,6 @@ let capture_terms ar f =
     list.map (fn d -> if d >= ir.cap_from_capture { capture_name (d - ir.cap_from_capture) }
                       else { slot_name d })
              (kids_of ar (f.[:captures_off else 0]) (f.[:n_captures else 0]));
-
-/// Fill each `lam`'s capture terms from its function's descriptors.
-let with_captures : Arena -> #[:map] -> Term -> Term;
-let rec with_captures ar funcs t = {
-    let w x = with_captures ar funcs x;
-    match t {
-        Term.lam(op, fl, fi, _) => Term.lam op fl fi (capture_terms ar (funcs.[fi])),
-        Term.prim(op, fl, a, b, c, cs) => Term.prim op fl a b c (list.map w cs),
-        Term.block(fl, ss) => Term.block fl (list.map (fn s -> match s {
-            Stmt.bind(n, f2, v) => Stmt.bind n f2 (w v),
-            Stmt.expr(e) => Stmt.expr (w e),
-        }) ss),
-        Term.trying(fl, body, e, h) => Term.trying fl (w body) e (w h),
-        other => other,
-    }
-};
-
-/// Every function of an image, in the core.
-let from_image : ir.Image -> [Fun];
-let from_image img = {
-    let ar = Arena.make (array.of_list (ir.Image.nodes img)) (array.of_list (ir.Image.kids img));
-    let funcs = array.of_list (ir.Image.funcs img);
-    list.map (fn f -> {
-        let arity = f.[:arity else 0];
-        Fun.make (list.map slot_name (list.range 0 arity))
-                 (list.map capture_name (list.range 0 (f.[:n_captures else 0])))
-                 (with_captures ar funcs (term_of ar (f.[:body else ir.no_node])))
-                 f
-    }) (ir.Image.funcs img)
-};
 
 // --- to the IR ---------------------------------------------------------------
 
@@ -201,6 +133,24 @@ mapping Emit {
     next = 0
     descriptors = %{}
     problems = []
+    // When patching (`patch`): each function's descriptors as the image has
+    // them, the clones made of a function captured some other way, keyed by
+    // the function and the descriptors, and the next function index.
+    original = ()
+    clones = %{}
+    next_fi = 0
+    // When patching: which terms and statements were read from the arena,
+    // and from which node, so that one the driver handed back unchanged is
+    // that node again rather than a copy of it (`Reading`). Patching keeps
+    // every slot where it was -- `s4` is slot 4 -- so a node read from a
+    // function means the same thing written back into it.
+    origins = ()
+    stmt_origins = ()
+    // What has been written in this function, and in which position:
+    // `[tail, node]`, kept when `share` is set, so that a term two parents
+    // share is written once (`emit_at`).
+    emitted = %{}
+    share = false
 }
 
 let problem : :string -> Emit -> Emit;
@@ -216,19 +166,27 @@ let problem p !e = settle (Emit.set_problems (list.cons p (Emit.problems e)) e);
 let settle : Emit -> Emit;
 let settle e =
     if lazy.forced (Emit.prog e) && lazy.forced (Emit.names e) && lazy.forced (Emit.next e)
-       && lazy.forced (Emit.descriptors e) && lazy.forced (Emit.problems e) { e }
+       && lazy.forced (Emit.descriptors e) && lazy.forced (Emit.problems e)
+       && lazy.forced (Emit.clones e) && lazy.forced (Emit.next_fi e) && lazy.forced (Emit.emitted e) { e }
     else { e };
 
 /// What `name` stands for, giving it the next slot if it has none: a binding
 /// is the first a name is seen.
 let place : Emit -> :string -> [Emit, [:any]];
 let place !e name = match (Emit.names e).[name else ()] {
+    () if Emit.origins e != () && fixed_slot name != () => [e, [:slot, fixed_slot name]],
     () => {
         let k = Emit.next e;
         [settle (e |> Emit.set_names ((Emit.names e).[name => [:slot, k]]) |> Emit.set_next (k + 1)), [:slot, k]]
     },
     at => [e, at],
 };
+
+/// The slot a name read from the arena is: `s4` is 4. A name the driver
+/// made has none, and is given the next slot after the frame's own.
+let fixed_slot : :string -> :integer | :unit;
+let fixed_slot name =
+    if str.starts_with "s" name { num.parse_int (str.slice 1 (str.byte_length name - 1) name) } else { () };
 
 /// The slot `name` is, giving it one if it has none. A name a binding binds
 /// is never a capture: a closure's captures are read, not rebound.
@@ -253,7 +211,7 @@ let push_kids !e xs = {
     [settle (Emit.set_prog p e), off]
 };
 
-/// Several terms as nodes, in order.
+/// Several terms as nodes, in order, none in tail position.
 let emit_all : Emit -> [Term] -> [Emit, [:integer | :atom]];
 let emit_all !e ts = {
     let [e2, rev] = list.fold (fn [ex, is] t -> {
@@ -273,9 +231,39 @@ let descriptor !e name = {
     }
 };
 
-/// A term as nodes: the index of the node it is.
+/// A term as nodes, not in tail position: the index of the node it is.
 let emit : Emit -> Term -> [Emit, :integer | :atom];
-let rec emit !e t = match t {
+let emit !e t = emit_at e false t;
+
+/// A term as nodes, in tail position or not.
+///
+/// Patching, a term read from the arena is the node it was read from, and a
+/// term the driver made is written once however many parents share it --
+/// the driver hands a shared node's result to each of them as one term, and
+/// writing it per parent would undo the arena's sharing (`emitted`). A call
+/// the driver made is marked a tail call exactly when it is in tail position
+/// as `lower.mark_tail` decides it: the body, a branch of an `if` there, a
+/// switch's target, a forced tail, a block's last statement. A call read
+/// from the arena keeps its mark -- the driver only puts one where it stood,
+/// or where it ends the function exactly when it did -- and taking a
+/// function's tail calls into another is why the marks are made again.
+let emit_at : Emit -> :bool -> Term -> [Emit, :integer | :atom];
+let emit_at !e tail t =
+    if Emit.origins e != () && map.has t (Emit.origins e) { [e, (Emit.origins e).[t]] }
+    else {
+        match (Emit.emitted e).[t else ()] {
+            () => {
+                let [e2, i] = emit_new e tail t;
+                if not (Emit.share e2) { [e2, i] }
+                else { [settle (Emit.set_emitted ((Emit.emitted e2).[t => [tail, i]]) e2), i] }
+            },
+            [was, i] if was == tail => [e, i],
+            _ => emit_new e tail t,
+        }
+    };
+
+let emit_new : Emit -> :bool -> Term -> [Emit, :integer | :atom];
+let emit_new !e tail t = match t {
     Term.absent => [e, ir.no_node],
     Term.var(name, fl) => {
         let [e2, at] = place e name;
@@ -285,20 +273,23 @@ let rec emit !e t = match t {
         }
     },
     Term.block(fl, ss) => {
-        let [e2, rev] = list.fold (fn [ex, is] s -> match s {
+        let last = list.length ss - 1;
+        let [e2, rev] = list.fold (fn [ex, is] [k, s] -> match s {
+            Stmt.bind(_, _, _) if Emit.stmt_origins ex != () && map.has s (Emit.stmt_origins ex) =>
+                [ex, list.cons ((Emit.stmt_origins ex).[s]) is],
             // The name is given its slot before its value is emitted, which
             // is the order `lower` numbers them in.
             Stmt.bind(name, f2, v) => {
-                let [ex2, k] = slot ex name;
+                let [ex2, slot_k] = slot ex name;
                 let [ex3, vi] = emit ex2 v;
-                let [ex4, bi] = push ex3 (ir.with_flags f2 (ir.node :bind k vi ir.no_node));
+                let [ex4, bi] = push ex3 (ir.with_flags f2 (ir.node :bind slot_k vi ir.no_node));
                 [ex4, list.cons bi is]
             },
             Stmt.expr(x) => {
-                let [ex2, xi] = emit ex x;
+                let [ex2, xi] = emit_at ex (tail && k == last) x;
                 [ex2, list.cons xi is]
             },
-        }) [e, []] ss;
+        }) [e, []] (list.enumerate ss);
         let [e3, off] = push_kids e2 (list.reverse rev);
         push e3 (ir.with_flags fl (ir.node :block off (list.length ss) ir.no_node))
     },
@@ -310,10 +301,22 @@ let rec emit !e t = match t {
             [ex2, list.cons d ds]
         }) [e, []] cs;
         let ds = list.reverse rev;
-        let known = (Emit.descriptors e2).[fi else ds];
-        let e3 = if known != ds { problem ("function " + to_string fi + " is made capturing different slots") e2 }
-                 else { settle (Emit.set_descriptors ((Emit.descriptors e2).[fi => ds]) e2) };
-        push e3 (ir.with_flags fl (ir.node op fi ir.no_node ir.no_node))
+        match Emit.original e2 {
+            () => {
+                let known = (Emit.descriptors e2).[fi else ds];
+                let e3 = if known != ds { problem ("function " + to_string fi + " is made capturing different slots") e2 }
+                         else { settle (Emit.set_descriptors ((Emit.descriptors e2).[fi => ds]) e2) };
+                push e3 (ir.with_flags fl (ir.node op fi ir.no_node ir.no_node))
+            },
+            // Patching, a function made where it always was captures what
+            // it always did. One made in a frame laid out anew -- written
+            // into a function it was not in -- is made as a clone that
+            // captures the new slots.
+            orig => {
+                let [e3, made] = if orig.[fi] == ds { [e2, fi] } else { clone e2 fi ds };
+                push e3 (ir.with_flags fl (ir.node op made ir.no_node ir.no_node))
+            },
+        }
     },
     Term.trying(fl, body, err, h) => {
         let [e2, bi] = emit e body;
@@ -322,8 +325,24 @@ let rec emit !e t = match t {
         push e4 (ir.with_flags fl (ir.node :try bi hi k))
     },
     Term.prim(op, fl, a, b, c, cs) => {
-        let [e2, is] = emit_all e cs;
-        let n x y z = ir.with_flags fl (ir.node op x y z);
+        // Which children are in tail position when this is.
+        let n_cs = list.length cs;
+        let tails = match op {
+            :if => [false, tail, tail],
+            :force => [tail],
+            o if o == :switch_head || o == :switch_atom =>
+                list.map (fn k -> tail && k > 0 && (k % 2 == 0 || k == n_cs - 1)) (list.range 0 n_cs),
+            _ => list.map (fn _ -> false) cs,
+        };
+        let [e2, rev] = list.fold (fn [ex, is] [x, xt] -> {
+            let [ex2, xi] = emit_at ex xt x;
+            [ex2, list.cons xi is]
+        }) [e, []] (list.zip cs tails);
+        let is = list.reverse rev;
+        let flags = if op == :apply && Emit.origins e != () {
+                        if tail { ir.add_flag fl ir.f_tail } else { untail_flags fl }
+                    } else { fl };
+        let n x y z = ir.with_flags flags (ir.node op x y z);
         match layout op {
             :leaf => push e2 (n a b c),
             :a => push e2 (n (list.nth 0 is) b c),
@@ -347,6 +366,20 @@ let rec emit !e t = match t {
     },
 };
 
+/// The clone of function `fi` that captures `ds`, made if there is none.
+let clone : Emit -> :integer -> [:integer] -> [Emit, :integer];
+let clone !e fi ds = {
+    // Keyed by a string: a map compares a list by identity.
+    let key = to_string fi + ":" + str.join_str "," (list.map to_string ds);
+    match (Emit.clones e).[key else ()] {
+        () => {
+            let made = Emit.next_fi e;
+            [settle (e |> Emit.set_clones ((Emit.clones e).[key => [made, fi, ds]]) |> Emit.set_next_fi (made + 1)), made]
+        },
+        [made, _, _] => [e, made],
+    }
+};
+
 /// One function's body, from its own names: its parameters are its first
 /// slots, its captures what they always were, and the rest are given slots
 /// as they are first seen. Answers the body's node and the frame's size.
@@ -354,8 +387,12 @@ let emit_fun : Emit -> Fun -> [Emit, [:integer | :atom, :integer]];
 let emit_fun !e f = {
     let params = list.fold (fn m [k, n] -> m.[n => [:slot, k]]) %{} (list.enumerate (Fun.params f));
     let names = list.fold (fn m [i, n] -> m.[n => [:capture, i]]) params (list.enumerate (Fun.captures f));
-    let inside = settle (e |> Emit.set_names names |> Emit.set_next (list.length (Fun.params f)));
-    let [after, body] = emit inside (Fun.body f);
+    // Patching, the frame's own slots are where they were, so a name the
+    // driver made starts after them; a translation numbers them all anew.
+    let first = if Emit.origins e == () { list.length (Fun.params f) }
+                else { num.max (list.length (Fun.params f)) ((Fun.record f).[:slots else 0]) };
+    let inside = settle (e |> Emit.set_names names |> Emit.set_next first |> Emit.set_emitted %{});
+    let [after, body] = emit_at inside (Emit.origins e != ()) (Fun.body f);
     let had = (Fun.record f).[:slots else 0];
     [after, [body, if Emit.next after > had { Emit.next after } else { had }]]
 };
@@ -369,7 +406,7 @@ let to_image img funs = {
     let [emitted, rev] = list.fold (fn [e, out] f -> {
         let [e2, done] = emit_fun e f;
         [e2, list.cons done out]
-    }) [Emit.make ir.program %{} 0 %{} [], []] funs;
+    }) [Emit.new ir.program |> Emit.set_share true, []] funs;
     let fresh = list.zip (list.range 0 (list.length funs)) (list.zip funs (list.reverse rev));
     let [final, recs] = list.fold (fn [e, out] [fi, [f, [body, slots]]] -> {
         let r = Fun.record f;
@@ -388,6 +425,201 @@ let to_image img funs = {
     }
 };
 
-/// The image through the core and back, with nothing done in between.
+/// The image through the core and back, with nothing done in between: read
+/// with its sharing kept (`read`) and written with it kept (`emit_at`), so
+/// the arena comes back the size it went in and needs no sharing again.
 let roundtrip : ir.Image -> Result;
-let roundtrip img = to_image img (from_image img);
+let roundtrip img = {
+    let rd = read img;
+    to_image img (list.map (fn f -> fun_of f (body_of rd f)) (ir.Image.funcs img))
+};
+
+// --- patching an image ----------------------------------------------------------
+
+/// The arena read as terms with its sharing kept: each node is read once,
+/// into one term, and a node two parents share is the same term in both.
+/// Read as trees, a shared arena is the unshared program -- a `match` lowers
+/// to a switch whose targets are the tails of one chain of tests, quadratic
+/// in its arms once copied -- and a self-compile's 57,000 nodes were written
+/// back as 670,000. `origins` and `stmt_origins` say which node each term and
+/// statement was read from, which is also how a term is known to be one the
+/// driver handed back unchanged (`same`): a map keyed by a term keys it by
+/// identity.
+mapping Reading {
+    terms
+    stmts
+    origins
+    stmt_origins
+}
+
+let read : ir.Image -> Reading;
+let read img = {
+    let ar = Arena.make (array.of_list (ir.Image.nodes img)) (array.of_list (ir.Image.kids img));
+    let funcs = array.of_list (ir.Image.funcs img);
+    let n = array.length (Arena.nodes ar);
+    let tables = read_tables ar funcs n;
+    let [terms, stmts] = tables;
+    // Every node's term is made here, which is every node read once.
+    let origins = list.fold_strict (fn m i -> m.[terms.[i] => i]) %{} (list.range 0 n);
+    let stmt_origins = list.fold_strict (fn m i -> match ir.node_op (node_of ar i) {
+        :bind => m.[stmts.[i] => i],
+        _ => m,
+    }) %{} (list.range 0 n);
+    Reading.make terms stmts origins stmt_origins
+};
+
+/// The two tables, each element reading its children from the tables
+/// themselves: an element is a suspension until it is first read, and then
+/// the one term every reader of that node shares.
+let read_tables : Arena -> #[:map] -> :integer -> [#[Term], #[Stmt]];
+let read_tables ar funcs n = {
+    let rec tables = [array.of_list (list.map (fn i -> shared_term ar funcs tables i) (list.range 0 n)),
+                      array.of_list (list.map (fn i -> shared_stmt ar tables i) (list.range 0 n))];
+    tables
+};
+
+let shared_term : Arena -> #[:map] -> [#[Term], #[Stmt]] -> :integer -> Term;
+let shared_term ar funcs tables i = {
+    let [terms, stmts] = tables;
+    let n = node_of ar i;
+    let op = ir.node_op n;
+    let [fl, a, b, c] = [ir.node_flags n, ir.node_a n, ir.node_b n, ir.node_c n];
+    let t x = if x == ir.no_node { Term.absent } else { terms.[x] };
+    match op {
+        :local => Term.var (slot_name a) fl,
+        :capture => Term.var (capture_name a) fl,
+        :block => Term.block fl (list.map (fn k -> stmts.[k]) (kids_of ar a b)),
+        :make_closure => Term.lam op fl a (capture_terms ar (funcs.[a])),
+        :make_thunk => Term.lam op fl a (capture_terms ar (funcs.[a])),
+        :try => Term.trying fl (t a) (slot_name c) (t b),
+        _ => Term.prim op fl a b c (match layout op {
+            :leaf => [],
+            :a => [t a],
+            :ab => [t a, t b],
+            :abc => [t a, t b, t c],
+            :a_kids => list.cons (t a) (list.map t (kids_of ar b c)),
+            :kids_ab => list.map t (kids_of ar a b),
+            :kids_ab2 => list.map t (kids_of ar a (2 * b)),
+            :a_kids2 => list.cons (t a) (list.map t (kids_of ar b (2 * c))),
+            :kids_bc => list.map t (kids_of ar b c),
+        }),
+    }
+};
+
+let shared_stmt : Arena -> [#[Term], #[Stmt]] -> :integer -> Stmt;
+let shared_stmt ar tables i = {
+    let [terms, _] = tables;
+    let n = node_of ar i;
+    match ir.node_op n {
+        :bind => Stmt.bind (slot_name (ir.node_a n)) (ir.node_flags n)
+                           (if ir.node_b n == ir.no_node { Term.absent } else { terms.[ir.node_b n] }),
+        _ => Stmt.expr (terms.[i]),
+    }
+};
+
+/// Function `fi`'s body as read.
+let body_of : Reading -> :map -> Term;
+let body_of rd f = match f.[:body else ir.no_node] {
+    b if b == ir.no_node => Term.absent,
+    b => (Reading.terms rd).[b],
+};
+
+/// Whether `b` is `a` handed back unchanged: both read from the same node,
+/// or both nothing.
+let same : Reading -> Term -> Term -> :bool;
+let same rd a b = match [a, b] {
+    [Term.absent, Term.absent] => true,
+    _ => match (Reading.origins rd).[b else ()] {
+        () => false,
+        i => (Reading.origins rd).[a else ()] == i,
+    },
+};
+
+/// Whether a statement is one read from the arena.
+let read_stmt : Reading -> Stmt -> :bool;
+let read_stmt rd s = map.has s (Reading.stmt_origins rd);
+
+/// A term rebuilt from its parts, or the term itself when every part came
+/// back as it was: what keeps a node the driver did not change the node it
+/// was read from.
+let rebuilt : Reading -> Term -> [Term] -> Term;
+let rebuilt rd t cs2 = match t {
+    Term.prim(op, fl, a, b, c, cs) =>
+        if list.length cs == list.length cs2 && list.all (fn [x, y] -> same rd x y) (list.zip cs cs2) { t }
+        else { Term.prim op fl a b c cs2 },
+    _ => t,
+};
+
+/// A block rebuilt from its statements, or the block itself when they are
+/// the ones it had.
+let rebuilt_block : Reading -> Term -> :integer -> [Stmt] -> Term;
+let rebuilt_block rd t fl ss2 = match t {
+    Term.block(fl0, ss) if fl0 == fl && list.length ss == list.length ss2
+                           && list.all (fn [x, y] -> same_stmt rd x y) (list.zip ss ss2) => t,
+    _ => Term.block fl ss2,
+};
+
+let same_stmt : Reading -> Stmt -> Stmt -> :bool;
+let same_stmt rd a b = match [a, b] {
+    [Stmt.bind(n, f, x), Stmt.bind(n2, f2, y)] => n == n2 && f == f2 && same rd x y,
+    [Stmt.expr(x), Stmt.expr(y)] => same rd x y,
+    _ => false,
+};
+
+/// A function's own names: its parameters `s0`.., its captures `c0`...
+let fun_of : :map -> Term -> Fun;
+let fun_of f body = Fun.make (list.map slot_name (list.range 0 (f.[:arity else 0])))
+                             (list.map capture_name (list.range 0 (f.[:n_captures else 0])))
+                             body f;
+
+/// The image with the functions in `changed` written anew and `added`
+/// appended after the image's own, in that order, and `globals` after its
+/// globals. Only what changed is written: its nodes go after the arena's,
+/// which is left as it is, and a term or statement the driver handed back as
+/// it was read is the node it was read from. Its tail calls are marked as
+/// it is written (`emit_at`).
+let patch : ir.Image -> Reading -> %{:integer => Fun} -> [Fun] -> [:map] -> Result;
+let patch img rd changed added globals = {
+    let funcs = array.of_list (ir.Image.funcs img);
+    let n_funcs = array.length funcs;
+    let kids = array.of_list (ir.Image.kids img);
+    let original = array.of_list (list.map (fn f ->
+        list.map (fn k -> kids.[(f.[:captures_off else 0]) + k]) (list.range 0 (f.[:n_captures else 0])))
+        (ir.Image.funcs img));
+    let n_nodes = list.length (ir.Image.nodes img);
+    let start = Emit.new (ir.program |> ir.Program.set_node_count n_nodes |> ir.Program.set_kid_count (array.length kids))
+        |> Emit.set_original original |> Emit.set_next_fi (n_funcs + list.length added)
+        |> Emit.set_origins (Reading.origins rd) |> Emit.set_stmt_origins (Reading.stmt_origins rd)
+        |> Emit.set_share true;
+    let written = list.append (map.pairs changed) (list.map (fn [i, f] -> [n_funcs + i, f]) (list.enumerate added));
+    let [emitted, rev] = list.fold (fn [e, out] [fi, f] -> {
+        let [e2, [body, slots]] = emit_fun e f;
+        [e2, list.cons [fi, (Fun.record f).[:body => body].[:slots => slots]] out]
+    }) [start, []] written;
+    let records = list.fold (fn m [fi, r] -> m.[fi => r]) %{} rev;
+    let record fi = records.[fi else funcs.[fi]];
+    // A clone is its function's record, as patched, with captures of its own.
+    let [final, clones_rev] = list.fold (fn [e, out] [made, fi, ds] -> {
+        let [e2, off] = push_kids e ds;
+        [e2, list.cons [made, (record fi).[:captures_off => off]] out]
+    }) [emitted, []] (list.sort_on (fn p -> list.head p) (map.values (Emit.clones emitted)));
+    match Emit.problems final {
+        [] => {
+            let p = Emit.prog final;
+            let new_nodes = list.map (fn i -> (ir.nodes p).[i]) (list.range n_nodes (ir.node_count p));
+            let new_kids = list.map (fn i -> (ir.kids p).[i]) (list.range (array.length kids) (ir.kid_count p));
+            let funcs_out = list.append (list.map record (list.range 0 (n_funcs + list.length added)))
+                                        (list.map (fn c -> list.nth 1 c) (list.reverse clones_rev));
+            Result.ok (img |> ir.Image.set_nodes (list.append (ir.Image.nodes img) new_nodes)
+                           |> ir.Image.set_kids (list.append (ir.Image.kids img) new_kids)
+                           |> ir.Image.set_funcs funcs_out
+                           |> ir.Image.set_globals (list.append (ir.Image.globals img) globals))
+        },
+        ps => Result.error (list.reverse ps),
+    }
+};
+
+// --- tail calls ------------------------------------------------------------------
+
+let untail_flags : :integer -> :integer;
+let untail_flags fl = if ir.has_flag fl ir.f_tail { fl - ir.f_tail } else { fl };

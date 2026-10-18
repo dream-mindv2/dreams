@@ -28,6 +28,7 @@ import dreams.ast;
 import dreams.compile;
 import dreams.config;
 import dreams.diag;
+import dreams.drive;
 import dreams.emit;
 import dreams.expand as expansion;
 import dreams.fmt;
@@ -169,7 +170,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
     compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true)
-                         (list.map remap_spec (o.[:remaps else []])) (opt o :sc_roundtrip == true);
+                         (list.map remap_spec (o.[:remaps else []])) (opt o :supercompile);
 
 /// `FROM=TO` as `[from, to]`. The split is at the last `=`, since a path may
 /// hold one and a package name never does.
@@ -208,7 +209,7 @@ let show_packages! ps = {
 
 /// The execution trees the program lowers to.
 let show_ir! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] false);
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] ());
     let low = lower.lower_program r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
@@ -356,7 +357,7 @@ let write_depfile! path out l payloads =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang depfile specs said o = {
+let build! l out shebang depfile specs said stats o = {
     let named = list.map payload_spec specs;
     let payloads = list.map (fn e -> list.nth 1 e) named;
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
@@ -372,6 +373,9 @@ let build! l out shebang depfile specs said o = {
                   } else { () };
     let aim = target.decide said carried
                             (target.from_reads (modules.config_of l) (modules.reads l));
+    if stats && compile.ok b {
+        list.each! console.error! (drive.report (compile.shared_image b))
+    }
     if not (compile.ok b) { print_diags! (compile.files b) (compile.diags b) }
     else if not (list.is_empty unreadable) {
         console.error! ("dreams: cannot read payload " + list.head (list.head unreadable))
@@ -450,7 +454,7 @@ let build! l out shebang depfile specs said o = {
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] false);
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] ());
     let lowered = lower.image (lower.lower_program r);
     let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
@@ -903,7 +907,9 @@ let rec parse_args args o =
         // this, which is the point: when an image misbehaves it answers
         // whether the pass that rewrote it is why.
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
-        ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :sc_roundtrip true o),
+        ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :supercompile :roundtrip o),
+        ["--supercompile", ..rest] => parse_args rest (with_opt :supercompile :drive o),
+        ["--sc-stats", ..rest] => parse_args rest (with_opt :sc_stats true o),
         ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,
         ["--remap-path-prefix", spec, ..rest] => parse_args rest (append_opt :remaps spec o),
         ["--units"] => with_opt :error "--units needs a directory" o,
@@ -969,7 +975,9 @@ let usage! () = {
         "                           each module exports",
         "  --release                define `release`",
         "  --no-opt                 emit the arena as lowered, unshared",
+        "  --supercompile           run the program at compile time and keep what that decides",
         "  --sc-roundtrip           take the image through the supercompiler's core and back",
+        "  --sc-stats               say what the supercompiler decided, and where code grew",
         "  --remap-path-prefix FROM=TO",
         "                           record source paths that begin with FROM as",
         "                           beginning with TO, so the image does not depend on",
@@ -1028,7 +1036,7 @@ let run_command! o file =
         :check     => check_program! (load! o file) (compile_options o),
         :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :depfile)
                              (opt o :payloads)
-                             (opt o :said) (compile_options o),
+                             (opt o :said) (opt o :sc_stats == true) (compile_options o),
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),

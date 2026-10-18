@@ -35,6 +35,7 @@ import dreams.lower;
 import dreams.modules;
 import dreams.package;
 import dreams.opt as optimizer;
+import dreams.drive;
 import dreams.sc;
 import dreams.scope;
 import dreams.typecheck;
@@ -81,11 +82,11 @@ mapping Options {
     // `[from, to]` per `--remap-path-prefix FROM=TO`: how the source paths the
     // image records are rewritten (`remap_sources`).
     remap = []
-    // Take the finished image through the supercompiler's core and back
-    // (`dreams/src/sc.dr`, `--sc-roundtrip`), then share it again: milestone
-    // 1 of docs/notes/supercompilation.md, the translation with nothing done
-    // in between.
-    supercompile = false
+    // The supercompiler (docs/notes/supercompilation.md): `()` for none,
+    // `:roundtrip` to take the image through its core and back with nothing
+    // done in between (`--sc-roundtrip`, `dreams/src/sc.dr`), `:drive` to
+    // drive it (`--supercompile`, `dreams/src/drive.dr`).
+    supercompile = ()
 }
 
 /// The defaults: checked, shared, no payload.
@@ -95,7 +96,7 @@ let options = Options.new ();
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
 let scratch : Options;
-let scratch = Options.make false false [] false [] () false [] false;
+let scratch = Options.make false false [] false [] () false [] ();
 
 // --- a build --------------------------------------------------------------------
 
@@ -511,14 +512,16 @@ let image b = match finished b {
 /// command line asks this, since only it can say so; everything else takes
 /// `image`, which falls back to the image as it was before the translation.
 ///
-/// The supercompiler reads the arena as `lower` built it, before it is
-/// shared: shared, the arena is a graph, and the core is trees, so reading a
-/// shared arena unshares it first -- most of a self-compile's nodes many times
-/// over. What it writes is shared after.
+/// Both read the shared arena as the graph it is (`sc.read`) and write it
+/// back as one, so there is nothing to share again.
 let finished : Build -> Result;
-let finished b =
-    if not (Options.supercompile (Build.options b)) { Result.ok (finish b (shared_image b)) }
-    else { Result.map (fn img -> finish b (optimizer.optimize img)) (sc.roundtrip (lower.image (lowered b))) };
+let finished b = match Options.supercompile (Build.options b) {
+    :roundtrip => Result.map (fn img -> finish b img) (sc.roundtrip (shared_image b)),
+    // The driver reads the shared arena and writes only what it changed,
+    // after it (`sc.patch`), so there is nothing to unshare or share again.
+    :drive => Result.map (fn img -> finish b img) (drive.supercompile (shared_image b)),
+    _ => Result.ok (finish b (shared_image b)),
+};
 
 /// The arena, shared if the options say so.
 let shared_image : Build -> ir.Image;
