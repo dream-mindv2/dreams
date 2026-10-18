@@ -471,3 +471,44 @@ the list unevaluated, which `type_is` does not take for a list, so a
 lookup answered a list where a boolean belonged. `sc.sh` now builds the
 compiler supercompiled, has it supercompile itself, and holds the two to
 the same bytes.
+
+## Names for every binding, slots for every name, and what driving the compiler bought (2026-10-18)
+
+The fence came down partly. `sc.renamed` gives each binding of a slot bound
+in two places a name of its own (`b4.0`, `b4.1`), one function at a time
+as a pass takes it up: the reading is shared per node, and a read of slot 4
+is one term wherever it appears, so the names cannot be given there. A term
+with nothing renamed in it is the term itself, so whatever a pass leaves
+alone is still the node it was read from. The shape-rewriting passes
+(`accum`, `hoist`) now take those functions.
+
+Writing them back needed a slot allocator, which the emitter had not had:
+each new name took the next slot past the frame's. `colours` is an
+interference graph over the names a function binds -- two names interfere
+when one is bound where the other already is, on some path, the arms of an
+`if` and a switch's targets each starting from the path before them -- and
+a greedy colouring, preferring the slot a renamed name came from. A slot an
+arena name is bound to, by a kept node or one the driver rebuilt around
+it, is reserved: the first version missed the rebuilt ones and wrote a new
+binding into a slot the arena's took again later on the same path, which
+`std.path`'s `normalize_in` found as `no pattern fits /`. A term met twice
+-- a `match`'s chain of tests shares its tails -- is walked once, and met
+again everything it binds interferes with the new path. The round trip
+reproduces `lower`'s frames exactly (`infer` 22 slots, `lower_expr` 12).
+
+Driving those functions is where it stopped paying:
+
+| the compiler, supercompiled | reductions | allocated | self-compile | release build | image |
+|---|---|---|---|---|---|
+| fenced, as before | -2% | +3% | same | 26 s | 3.8 MB |
+| driven, new names in new slots | -8% | +150% | +42% | 197 s | 8.6 MB |
+| driven, coloured | -4% | +86% | +9% | 220 s | 8.7 MB |
+| rewritten, not driven (kept) | -1% | +11% | same | 46 s | 4.2 MB |
+
+The colouring did all it could: the driver writes what it unfolds as runs of
+lazy bindings in sequence -- `infer` came out with 611 slots -- and a lazy
+binding reads its frame whenever it is forced, so no two of them can share
+a slot without knowing when each thunk dies. That is a liveness analysis
+over suspensions, and until there is one, functions that share slots are
+not driven (`View.reuses`). The supercompiler's 5% of the compiler's
+reductions was not worth its frames.

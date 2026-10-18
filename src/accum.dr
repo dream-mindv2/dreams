@@ -280,9 +280,9 @@ let rewritten p fi wfi wgi = {
     let gi = (Program.global_of p).[fi else -1];
     if gi < 0 || k == 0 || not (ir.has_flag fl ir.fn_rec) || ir.has_flag fl ir.fn_impure
        || ir.has_flag fl ir.fn_thunk || f.[:n_captures else 0] > 0
-       || sc.reuses_slots (sc.body_of (Program.reading p) f) || rewritten_before p (sc.body_of (Program.reading p) f) { () }
+       || rewritten_before p (sc.body_of (Program.reading p) f) { () }
     else {
-        let body = sc.body_of (Program.reading p) f;
+        let body = sc.renamed (sc.body_of (Program.reading p) f);
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
                   fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site,

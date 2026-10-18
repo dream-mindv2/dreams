@@ -151,6 +151,16 @@ mapping Emit {
     // share is written once (`emit_at`).
     emitted = %{}
     share = false
+    // The slot each new name of the function being written takes, worked
+    // out before it is written (`colours`); a name it does not give is
+    // given one of its own past the rest.
+    colours = %{}
+    // The lowest slot a new name may take: the first after the parameters.
+    floor = 0
+    // Patching, the slots a node kept from the arena binds anywhere in the
+    // function: a new name never takes one, since the kept node may come
+    // later on the same path and bind it again (`reserved_slots`).
+    reserved = %{}
 }
 
 let problem : :string -> Emit -> Emit;
@@ -167,19 +177,197 @@ let settle : Emit -> Emit;
 let settle e =
     if lazy.forced (Emit.prog e) && lazy.forced (Emit.names e) && lazy.forced (Emit.next e)
        && lazy.forced (Emit.descriptors e) && lazy.forced (Emit.problems e)
-       && lazy.forced (Emit.clones e) && lazy.forced (Emit.next_fi e) && lazy.forced (Emit.emitted e) { e }
+       && lazy.forced (Emit.clones e) && lazy.forced (Emit.next_fi e) && lazy.forced (Emit.emitted e)
+       && lazy.forced (Emit.colours e) { e }
     else { e };
 
-/// What `name` stands for, giving it the next slot if it has none: a binding
-/// is the first a name is seen.
+/// What `name` stands for, giving it a slot if it has none: a binding is the
+/// first a name is seen.
+///
+/// A new name takes the lowest slot no binding on the path to here holds --
+/// the slot it was renamed from, for `b4.1` (`renamed`), when that one is
+/// free -- so the branches of a `match` share their slots as `lower` made
+/// them share, and the bodies the driver unfolds into different branches
+/// share theirs. Given a slot after the frame's own every time, they made the
+/// supercompiled compiler's frames five times larger, and it allocated 2.5
+/// times as much as the compiler it was made from.
 let place : Emit -> :string -> [Emit, [:any]];
 let place !e name = match (Emit.names e).[name else ()] {
     () if Emit.origins e != () && fixed_slot name != () => [e, [:slot, fixed_slot name]],
     () => {
-        let k = Emit.next e;
-        [settle (e |> Emit.set_names ((Emit.names e).[name => [:slot, k]]) |> Emit.set_next (k + 1)), [:slot, k]]
+        let k = match (Emit.colours e).[name else ()] {
+            () => free_slot %{} (Emit.reserved e) (num.max (Emit.next e) (Emit.floor e)),
+            c => c,
+        };
+        [settle (e |> Emit.set_names ((Emit.names e).[name => [:slot, k]])
+                   |> Emit.set_next (num.max (Emit.next e) (k + 1))), [:slot, k]]
     },
     at => [e, at],
+};
+
+/// The lowest slot from `k` up that neither map holds.
+let free_slot : :map -> :map -> :integer -> :integer;
+let rec free_slot occupied reserved !k =
+    if map.has k occupied || map.has k reserved { free_slot occupied reserved (k + 1) } else { k };
+
+/// The slots the arena's own names are bound to, anywhere in `t`: in a node
+/// kept from the arena, written as it was, or in one the driver rebuilt
+/// around a name it kept. Each is that name's slot, which nothing new may
+/// share: the driver may have put a new binding and the arena's on one path,
+/// where `lower` never put two.
+let reserved_slots : Emit -> Term -> :map;
+let reserved_slots e t = {
+    let origins = Emit.origins e;
+    let fixed m n = match fixed_slot n { () => m, k => m.[k => true] };
+    let rec walk t m = if map.has t origins { list.fold fixed m (bound_names t) } else {
+        match t {
+            Term.prim(_, _, _, _, _, cs) => list.fold (fn a c -> walk c a) m cs,
+            // A binding the driver rebuilt keeps its name, and so its slot,
+            // when the name is the arena's: that slot is as taken as a kept
+            // node's.
+            Term.block(_, ss) => list.fold (fn a st -> match st {
+                Stmt.bind(n, _, v) => walk v (fixed a n),
+                Stmt.expr(x) => walk x a,
+            }) m ss,
+            Term.trying(_, body, err, h) => walk h (walk body (fixed m err)),
+            _ => m,
+        }
+    };
+    if origins == () { %{} } else { walk t %{} }
+};
+
+/// The slot a renamed binding was read from: `b4.1` is 4.
+let renamed_from : :string -> :integer | :unit;
+let renamed_from name =
+    if str.starts_with "b" name {
+        match str.find "." name {
+            -1 => (),
+            dot => num.parse_int (str.slice 1 (dot - 1) name),
+        }
+    } else { () };
+
+/// The slot each name a function binds is given: what lets the branches of
+/// a `match`, and the bodies the driver unfolds into them, share their slots
+/// as `lower` made them share.
+///
+/// A slot may be bound at most once on any path through a call: a lazy
+/// binding reads its frame whenever it is forced, and a second binding of
+/// its slot on the way there would be read in its place. So two names
+/// interfere when one is bound where the other already is, on some path,
+/// and the alternatives of an `if` or a switch each start from the names
+/// bound before them, since only one runs. The names are then given slots
+/// greedily in the order they are first bound: the lowest one no
+/// interfering name has, and none a kept node binds (`reserved_slots`) --
+/// the slot a renamed name was renamed from (`renamed`) when that is free.
+///
+/// The driver copies terms into several branches, so one name can be bound
+/// in more than one place, and its slot must suit all of them. And a term is
+/// often reached twice -- a `match` lowers to a chain of tests whose tails
+/// its arms share -- and is walked once: met again, everything it binds
+/// interferes with the new path. Giving those names slots of their own
+/// instead left the supercompiled compiler's `match`-heavy functions with
+/// frames three times the size.
+let colours : Emit -> :integer -> :map -> Term -> :map;
+let colours e floor reserved body = {
+    let origins = Emit.origins e;
+    let kept t = origins != () && map.has t origins;
+    // State: [names bound on the path, interferences, names in order, terms
+    // met]. The path is a set: a term met again adds everything it binds.
+    let interfere n path edges = list.fold (fn m o -> linked m n o) edges (map.keys path);
+    let rec walk t st = {
+        let [path, edges, order, met] = st;
+        if kept t { st }
+        else if map.has t met {
+            // Met before, on another path: what it binds is bound after
+            // everything on this one too. How its names interfere with each
+            // other was found the first time, and is the same on every path.
+            let inside = list.filter (fn n -> fixed_slot n == () || origins == ()) (bound_names t);
+            [list.fold (fn m n -> m.[n => true]) path inside,
+             list.fold (fn m n -> interfere n path m) edges inside, order, met]
+        } else {
+            let st1 = [path, edges, order, met.[t => true]];
+            match t {
+                Term.block(_, ss) => list.fold (fn s2 stmt -> match stmt {
+                    Stmt.bind(n, _, v) => {
+                        let [p2, e2, o2, m2] = s2;
+                        let fresh = fixed_slot n == () || origins == ();
+                        let e3 = if fresh { interfere n p2 e2 } else { e2 };
+                        let o3 = if fresh { list.cons n o2 } else { o2 };
+                        walk v [p2.[n => true], e3, o3, m2]
+                    },
+                    Stmt.expr(x) => walk x s2,
+                }) st1 ss,
+                Term.trying(_, b, err, h) => {
+                    let [p2, e2, o2, m2] = walk b st1;
+                    walk h [p2.[err => true], interfere err p2 e2, list.cons err o2, m2]
+                },
+                Term.prim(op, _, _, _, _, cs) => {
+                    let n_cs = list.length cs;
+                    let alt k = match op {
+                        :if => k > 0,
+                        o if o == :switch_head || o == :switch_atom => k > 0 && (k % 2 == 0 || k == n_cs - 1),
+                        _ => false,
+                    };
+                    // Alternatives start from the path before the first of
+                    // them; what follows sees what any of them bound.
+                    let [s3, _, after] = list.fold (fn [s2, base, after] [k, c] ->
+                        if alt k {
+                            let [_, e2, o2, m2] = s2;
+                            let done = walk c [base, e2, o2, m2];
+                            let joined = list.fold (fn m n -> m.[n => true]) (match after { () => base, u => u })
+                                                   (map.keys (list.head done));
+                            [done, base, joined]
+                        } else {
+                            let done = walk c s2;
+                            [done, list.head done, after]
+                        }) [st1, path, ()] (list.enumerate cs);
+                    let [_, e3, o3, m3] = s3;
+                    match after { () => s3, joined => [joined, e3, o3, m3] }
+                },
+                _ => st1,
+            }
+        }
+    };
+    let [_, edges, order, _] = walk body [%{}, %{}, [], %{}];
+    let give = fn given n -> if map.has n given { given } else {
+        let taken = list.fold (fn m o -> match given.[o else ()] { () => m, k => m.[k => true] })
+                              %{} (map.keys (edges.[n else %{}]));
+        let wanted = renamed_from n;
+        let k = if wanted != () && wanted >= floor && not (map.has wanted taken) && not (map.has wanted reserved) { wanted }
+                else { free_slot taken reserved floor };
+        given.[n => k]
+    };
+    list.fold give %{} (list.reverse order)
+};
+
+/// `edges` with `n` and `o` each in the other's set. The sets are forced as
+/// they are stored: left as suspensions, every version of every set stayed
+/// reachable through the next, and colouring the supercompiled compiler's
+/// largest function ran a process out of its 4 GB.
+let linked : :map -> :string -> :string -> :map;
+let linked !edges n o = {
+    let mn = (edges.[n else %{}]).[o => true];
+    let mo = (edges.[o else %{}]).[n => true];
+    store_set (store_set edges n mn) o mo
+};
+
+let store_set : :map -> :string -> :map -> :map;
+let store_set !edges k !set = edges.[k => set];
+
+/// The names a term binds, not counting the functions it makes, whose frames
+/// are their own.
+let bound_names : Term -> [:string];
+let bound_names t = list.reverse (bound_into t []);
+
+let bound_into : Term -> [:string] -> [:string];
+let rec bound_into t !acc = match t {
+    Term.prim(_, _, _, _, _, cs) => list.fold (fn a c -> bound_into c a) acc cs,
+    Term.block(_, ss) => list.fold (fn a st -> match st {
+        Stmt.bind(n, _, v) => bound_into v (list.cons n a),
+        Stmt.expr(x) => bound_into x a,
+    }) acc ss,
+    Term.trying(_, body, err, h) => bound_into h (list.cons err (bound_into body acc)),
+    _ => acc,
 };
 
 /// The slot a name read from the arena is: `s4` is 4. A name the driver
@@ -409,7 +597,14 @@ let emit_fun !e f = {
     // driver made starts after them; a translation numbers them all anew.
     let first = if Emit.origins e == () { list.length (Fun.params f) }
                 else { num.max (list.length (Fun.params f)) ((Fun.record f).[:slots else 0]) };
-    let inside = settle (e |> Emit.set_names names |> Emit.set_next first |> Emit.set_emitted %{});
+    let floor = list.length (Fun.params f);
+    let reserved = reserved_slots e (Fun.body f);
+    let given = colours e floor reserved (Fun.body f);
+    // A name no colour was given -- one met only where it is read -- goes
+    // past every slot given.
+    let past = list.fold (fn m k -> num.max m (k + 1)) floor (map.values given);
+    let inside = settle (e |> Emit.set_names names |> Emit.set_next (num.max first past) |> Emit.set_emitted %{}
+                           |> Emit.set_floor floor |> Emit.set_reserved reserved |> Emit.set_colours given);
     let [after, body] = emit_at inside (Emit.origins e != ()) (Fun.body f);
     let had = (Fun.record f).[:slots else 0];
     [after, [body, if Emit.next after > had { Emit.next after } else { had }]]
@@ -584,41 +779,136 @@ let same_stmt rd a b = match [a, b] {
     _ => false,
 };
 
-/// Whether a body binds one slot in two places. The resolver gives the
+/// The names a body binds in more than one place. The resolver gives the
 /// branches of an `if` and the arms of a `match` the same slots, since only
 /// one of them runs in a call (scope.dr); but here a slot is a name, and a
 /// rewrite that moves a term from one branch to another, or remembers what a
-/// name was bound to, would read one binding as the other. Such a function
-/// is left as it is.
-let reuses_slots : Term -> :bool;
-let reuses_slots t = {
+/// name was bound to, would read one binding as the other.
+let names_bound_twice : Term -> %{:string => :bool};
+let names_bound_twice t = {
     let rec walk t acc = {
         let [seen, names, twice] = acc;
-        if twice || map.has t seen { acc }
+        if map.has t seen { acc }
         else {
             let here = [seen.[t => true], names, twice];
+            let bound n st a = {
+                let [sn, nm, tw] = a;
+                [sn, nm.[n => st], if map.has n nm && nm.[n] != st { tw.[n => true] } else { tw }]
+            };
             match t {
                 Term.prim(_, _, _, _, _, cs) => list.fold (fn a x -> walk x a) here cs,
-                Term.block(_, ss) => list.fold (fn a st -> {
-                    let [sn, nm, tw] = a;
-                    match st {
-                        Stmt.bind(n, _, x) => {
-                            let again = tw || (map.has n nm && nm.[n] != st);
-                            walk x [sn, nm.[n => st], again]
-                        },
-                        Stmt.expr(e) => walk e a,
-                    }
+                Term.block(_, ss) => list.fold (fn a st -> match st {
+                    Stmt.bind(n, _, x) => walk x (bound n st a),
+                    Stmt.expr(e) => walk e a,
                 }) here ss,
-                Term.trying(_, body, e, h) => {
-                    let [sn, nm, tw] = walk h (walk body here);
-                    [sn, nm.[e => t], tw || (map.has e nm && nm.[e] != t)]
-                },
+                Term.trying(_, body, e, h) => bound e t (walk h (walk body here)),
                 _ => here,
             }
         }
     };
-    list.nth 2 (walk t [%{}, %{}, false])
+    list.nth 2 (walk t [%{}, %{}, %{}])
 };
+
+/// `t` with each binding of a slot bound in more than one place given a name
+/// of its own -- `b4.0`, `b4.1` for slot 4 -- and every read of it renamed to
+/// match, so that a pass may move a term between branches or remember what a
+/// name was bound to (`names_bound_twice` says why). Until 2026-10-18 such a
+/// function was left alone by every pass, and that was most of the large
+/// ones -- the supercompiled compiler did 1.7% fewer reductions. The reading is
+/// shared per node, so a read of slot 4 is one term wherever it appears, and
+/// the names cannot be given there; they are given here, to one function at a
+/// time, as a pass takes it up.
+///
+/// The arena's sharing is kept: a term is renamed once for each assignment of
+/// names it is reached under, which for the switch chains a `match` lowers to
+/// is once. A term with nothing renamed in it is the term itself, so whatever
+/// of the body is not touched is still the node it was read from. A renamed
+/// name has no slot of its own (`fixed_slot`), so written back it is given a
+/// fresh one after the frame's.
+let renamed : Term -> Term;
+let renamed t = {
+    let twice = names_bound_twice t;
+    if map.size twice == 0 { t }
+    else { list.head (rename twice %{} t [%{}, %{}]) }
+};
+
+/// `[term, state]`, the state `[how many of each name were given, what each
+/// term was renamed to under each assignment]`.
+let rename : :map -> :map -> Term -> [:map, :map] -> [Term, [:map, :map]];
+let rec rename twice env t st = {
+    let [given, memo] = st;
+    match list.find (fn done -> list.head done == env) (memo.[t else []]) {
+        [_, out] => [out, st],
+        _ => {
+            let [out, [given2, memo2]] = rename_new twice env t st;
+            [out, [given2, memo2.[t => list.cons [env, out] (memo2.[t else []])]]]
+        },
+    }
+};
+
+let rename_new : :map -> :map -> Term -> [:map, :map] -> [Term, [:map, :map]];
+let rename_new twice env t st = match t {
+    Term.var(n, fl) => [match env.[n else ()] { () => t, m => Term.var m fl }, st],
+    Term.lam(op, fl, fi, cs) =>
+        [if list.any (fn c -> map.has c env) cs { Term.lam op fl fi (list.map (fn c -> env.[c else c]) cs) } else { t }, st],
+    Term.prim(op, fl, a, b, c, cs) => {
+        let [cs2, st2] = rename_all twice env cs st;
+        [if same_terms cs cs2 { t } else { Term.prim op fl a b c cs2 }, st2]
+    },
+    Term.block(fl, ss) => {
+        let [rev, _, st2] = list.fold (fn [out, e, s] stmt -> match stmt {
+            Stmt.expr(x) => {
+                let [x2, s2] = rename twice e x s;
+                [list.cons (if same_term x x2 { stmt } else { Stmt.expr x2 }) out, e, s2]
+            },
+            // Named before its value is read, as `lower` numbers it.
+            Stmt.bind(n, f, x) => {
+                let [m, e2, s2] = if map.has n twice { given_name n e s } else { [n, e, s] };
+                let [x2, s3] = rename twice e2 x s2;
+                [list.cons (if m == n && same_term x x2 { stmt } else { Stmt.bind m f x2 }) out, e2, s3]
+            },
+        }) [[], env, st] ss;
+        let ss2 = list.reverse rev;
+        [if list.all (fn [x, y] -> same_stmt_term x y) (list.zip ss ss2) { t } else { Term.block fl ss2 }, st2]
+    },
+    Term.trying(fl, body, err, h) => {
+        let [body2, st2] = rename twice env body st;
+        let [m, e2, st3] = if map.has err twice { given_name err env st2 } else { [err, env, st2] };
+        let [h2, st4] = rename twice e2 h st3;
+        [if m == err && same_term body body2 && same_term h h2 { t } else { Term.trying fl body2 m h2 }, st4]
+    },
+    _ => [t, st],
+};
+
+let rename_all : :map -> :map -> [Term] -> [:map, :map] -> [[Term], [:map, :map]];
+let rename_all twice env ts st = {
+    let [rev, st2] = list.fold (fn [out, s] x -> {
+        let [x2, s2] = rename twice env x s;
+        [list.cons x2 out, s2]
+    }) [[], st] ts;
+    [list.reverse rev, st2]
+};
+
+/// The next name for a binding of `n`, and the assignment with it in.
+let given_name : :string -> :map -> [:map, :map] -> [:string, :map, [:map, :map]];
+let given_name n env st = {
+    let [given, memo] = st;
+    let k = given.[n else 0];
+    let m = "b" + str.slice 1 (str.byte_length n - 1) n + "." + to_string k;
+    [m, env.[n => m], [given.[n => k + 1], memo]]
+};
+
+/// Whether a renaming handed a term back as it was: the same term, not an
+/// equal one, since the reading keys terms by identity -- which is also how
+/// this asks, a map keying a record by identity.
+let same_term : Term -> Term -> :bool;
+let same_term a b = (%{}).[a => true].[b else false];
+
+let same_terms : [Term] -> [Term] -> :bool;
+let same_terms xs ys = list.all (fn [x, y] -> same_term x y) (list.zip xs ys);
+
+let same_stmt_term : Stmt -> Stmt -> :bool;
+let same_stmt_term a b = (%{}).[a => true].[b else false];
 
 /// A function's own names: its parameters `s0`.., its captures `c0`...
 let fun_of : :map -> Term -> Fun;

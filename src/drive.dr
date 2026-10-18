@@ -77,8 +77,13 @@ mapping View {
     head
     tail
     match_fail
-    // Each function that binds a slot in two places (`sc.reuses_slots`):
-    // neither driven nor written out anywhere.
+    // Each function that binds a slot in two places -- the large ones, whose
+    // `match`es share slots between arms. Neither driven nor unfolded: read
+    // with a name per binding (`sc.renamed`) they could be, and on the
+    // compiler that saved 5% of the reductions for twice the allocation --
+    // the bodies the driver writes into them are runs of lazy bindings, each
+    // a slot of its own -- a release build eight times as long and an image
+    // twice the size. The passes that rewrite a shape take them renamed.
     reuses
 }
 
@@ -94,7 +99,7 @@ let view img = {
               (array.of_list (list.map (fn s -> strs.[s]) (ir.Image.atoms img)))
               (array.of_list (ir.Image.ints img))
               (id "_record_is") (id "_match_at") (id "_match_is_cons") (id "_match_head") (id "_match_tail") (id "_match_fail")
-              (array.of_list (list.map sc.reuses_slots (array.to_list bodies)))
+              (array.of_list (list.map (fn b -> map.size (sc.names_bound_twice b) > 0) (array.to_list bodies)))
 };
 
 /// How many nodes a term is.

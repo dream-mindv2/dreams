@@ -575,6 +575,8 @@ let show_time! o file = {
     // parts there is no `arena` to build.
     let co = compile_options o;
     let parted = compile.Options.optimize co;
+    // Shared once, as `compile.build!` shares it.
+    let l = if parted { vm.share! l } else { l };
     // Resolution is three steps when anything chose a member by its types,
     // and the `resolve` row is their sum; `resolve_rows!` below breaks it up.
     let declared = scope.declare! l;

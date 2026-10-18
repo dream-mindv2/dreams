@@ -246,8 +246,13 @@ let parted o = Options.parallel o && Options.optimize o;
 /// Resolve, lower, link and check the program. Lowering settles compile-time
 /// expressions and checking runs contracts on a VM.
 let build! : modules.Loader -> Options -> Build;
-let build! l o = {
+let build! l0 o = {
     let parallel = Options.parallel o;
+    // In parts, the loader is shared once, here: each resolution walk shares
+    // what its parts read, which holds the loader, and sharing the loader as
+    // it was each time copied its 10 MB twice in the root, on the critical
+    // path. Once it is shared, whatever holds it crosses with a pointer.
+    let l = if parallel && Options.optimize o { vm.share! l0 } else { l0 };
     // A parallel build resolves in parts, in several processes, and lowers
     // and checks each part in a process of its own against the part's
     // resolution (see "resolving in parts" in `scope`).
