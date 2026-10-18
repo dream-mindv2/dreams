@@ -25,6 +25,7 @@ import std.streams;
 import std.vm;
 
 import dreams.ast;
+import dreams.cache;
 import dreams.compile;
 import dreams.config;
 import dreams.diag;
@@ -357,7 +358,7 @@ let write_depfile! path out l payloads =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
-let build! l out shebang depfile specs said stats o = {
+let build! l out shebang depfile specs said stats kept o = {
     let named = list.map payload_spec specs;
     let payloads = list.map (fn e -> list.nth 1 e) named;
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
@@ -429,7 +430,7 @@ let build! l out shebang depfile specs said stats o = {
                             1
                         } else if not (write_depfile! depfile out l payloads) { 1 }
                         else {
-                            console.error! ("compiled -> " + out + " ("
+                            let said_line = "compiled -> " + out + " ("
                                         + to_string (str.byte_length bytes + payload_bytes)
                                         + " bytes, " + to_string (modules.module_count l)
                                         + " modules, " + to_string (list.length (ir.Image.nodes img))
@@ -440,8 +441,18 @@ let build! l out shebang depfile specs said stats o = {
                                         + (if list.is_empty payloads { "" }
                                            else { ", " + to_string (list.length payloads) + " payloads, "
                                                   + to_string payload_bytes + " payload bytes" })
-                                        + ")")
-                            print_diags! (compile.files b) (compile.diags b)
+                                        + ")";
+                            console.error! said_line
+                            let code = print_diags! (compile.files b) (compile.diags b);
+                            // Kept for the next build of the same program
+                            // (dreams/src/cache.dr): the image, what it read,
+                            // and what was printed, to be printed again.
+                            match kept {
+                                () => (),
+                                [d, key] => cache.keep! d key out (files_read l payloads) said_line
+                                                        (match compile.diags b { [] => "", ds => diag.render_all (compile.files b) ds }),
+                            }
+                            code
                         }
                     },
                 }
@@ -914,6 +925,7 @@ let rec parse_args args o =
         ["--remap-path-prefix", spec, ..rest] => parse_args rest (append_opt :remaps spec o),
         ["--units"] => with_opt :error "--units needs a directory" o,
         ["--units", dir, ..rest] => parse_args rest (with_opt :units dir o),
+        ["--cache", dir, ..rest] => parse_args rest (with_opt :cache dir o),
         ["--release", ..rest] => parse_args rest (append_opt :defines "release" o),
         ["--debug-cfg", ..rest] => parse_args rest (append_opt :defines "debug" o),
         ["-q", ..rest] => parse_args rest (with_opt :quiet true o),
@@ -982,6 +994,9 @@ let usage! () = {
         "                           record source paths that begin with FROM as",
         "                           beginning with TO, so the image does not depend on",
         "                           where it was built; may be given more than once",
+        "  --cache DIR              keep each build in DIR, and hand back the one already",
+        "                           made when nothing it read has changed; $DREAMS_CACHE",
+        "                           when not given",
         "  --units DIR              keep each module's walk and lowering in DIR, and",
         "                           read them back while nothing they depend on moved",
         "  --debug-cfg              define `debug`",
@@ -1026,6 +1041,37 @@ let read! o file =
 
 let load! o file = expansion.expand! (read! o file);
 
+/// A build, or the one already made of the same program from the same files
+/// (`--cache`, dreams/src/cache.dr): the image put where it was asked for,
+/// what the build printed printed again, its depfile written.
+let cached_build! o src = {
+    let built! kept = build! (load! o src) (opt o :output) (opt o :shebang) (opt o :depfile)
+                            (opt o :payloads) (opt o :said) (opt o :sc_stats == true) kept (compile_options o);
+    match (if opt o :output == () { () } else { cache.dir! (opt o :cache) }) {
+        () => built! (),
+        d => {
+            let key = cache.key! o;
+            match cache.fresh! d key {
+                () => built! [d, key],
+                [reads, said_line, diagnostics] => {
+                    let out = opt o :output;
+                    cache.place! d key out
+                    match opt o :shebang { () => (), _ => io.chmod! out 493 }
+                    console.error! said_line
+                    if diagnostics != "" { console.error! diagnostics }
+                    match opt o :depfile {
+                        () => 0,
+                        path => {
+                            file.write! path (depfile_text out (list.map list.head reads))
+                            0
+                        },
+                    }
+                },
+            }
+        },
+    }
+};
+
 let run_command! o file =
     match opt o :command {
         :tokens    => with_source! file (fn src -> tokenize! file src),
@@ -1034,9 +1080,7 @@ let run_command! o file =
         :fmt       => format_files! (list.cons file (o.[:more_files else []])) false,
         :fmt_check => format_files! (list.cons file (o.[:more_files else []])) true,
         :check     => check_program! (load! o file) (compile_options o),
-        :build     => build! (load! o file) (opt o :output) (opt o :shebang) (opt o :depfile)
-                             (opt o :payloads)
-                             (opt o :said) (opt o :sc_stats == true) (compile_options o),
+        :build     => cached_build! o file,
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),

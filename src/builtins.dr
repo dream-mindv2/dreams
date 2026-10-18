@@ -114,6 +114,9 @@ let names = [
     // `type_of` without the answer: true, its argument forced to WHNF.
     "_forced",
     "defer!",
+    // A list read into an array, anything else as it is: never written, put
+    // by the supercompiler where a loop indexes a list (dreams/src/hoist.dr).
+    "_indexed",
 
 ];
 
@@ -215,6 +218,7 @@ let signatures = %{
     "_str_rfind" => "haystack:string -> needle:string -> from:integer -> integer",
     "_settled" => "value -> true, once the value is forced all the way down",
     "_forced" => "value -> true, once the value is forced to its outermost constructor",
+    "_indexed" => "value -> an array of a list's elements, or the value itself when it is not a list",
 
 };
 

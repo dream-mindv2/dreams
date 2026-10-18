@@ -1,0 +1,118 @@
+// Whole builds kept between runs: `--cache DIR`, or `$DREAMS_CACHE`.
+//
+// A test suite compiles the same programs over and over -- every suite that
+// runs the examples compiles each of them, and each compile reads and walks
+// the whole standard library again -- and nearly every one of those builds
+// is a build already made. `--units` (unit.dr) makes a build that changed
+// cheap; this makes a build that did not change free. An entry is keyed by
+// what decides the image apart from the files: this compiler (its own
+// digest), the directory it ran in, the installation, and every option but
+// where the image goes. It holds the image, the digest of every file the
+// build read (`files_read`), and what the build printed. A build whose files
+// all still have those digests is that image: it is copied out, what was
+// printed is printed again, and nothing is compiled.
+//
+// The files are the depfile's, so an entry goes stale exactly when a depfile
+// would: an edited module, a package's manifest, a payload. A build that
+// failed is never kept, so a failure is always a fresh one.
+
+import std.file;
+import std.io;
+import std.list;
+import std.map;
+import std.os;
+import std.str;
+import std.vm;
+import std.wire;
+
+/// Where entries are kept, if anywhere: the option, then the environment.
+let dir! : :any -> :string | :unit;
+let dir! said = match said {
+    () => match os.env! "DREAMS_CACHE" {
+        () => (),
+        "" => (),
+        d => d,
+    },
+    d => d,
+};
+
+/// The key of a build: the compiler, where it runs, and what it was asked,
+/// without where its image goes -- two suites writing the same program to
+/// two places are one build.
+let key! : :map -> :string;
+let key! asked = io.digest (str.join_str "\n" [
+    vm.image_digest (),
+    os.cwd! (),
+    match os.env! "MINDV2_PATH" { () => "", p => p },
+    to_string (list.fold (fn m k -> map.remove k m) asked [:output, :depfile, :cache]),
+]);
+
+/// What an entry holds besides the image: `[path, digest]` for every file
+/// the build read, the line it printed, and its diagnostics as printed. A
+/// list, as it is written: what `wire` carries is data.
+type Entry = [[[:string, :string]], :string, :string];
+
+let entry_path : :string -> :string -> :string;
+let entry_path d key = d + "/" + key + ".entry";
+let image_path : :string -> :string -> :string;
+let image_path d key = d + "/" + key + ".dream";
+
+/// The digest of a file as it is now, or `()` when it cannot be read.
+let digest_of! : :string -> :string | :unit;
+let digest_of! p = match file.read! p {
+    () => (),
+    text => io.digest text,
+};
+
+/// The entry for `key`, when every file it read still reads the same.
+let fresh! : :string -> :string -> Entry | :unit;
+let fresh! d key = match file.read! (entry_path d key) {
+    () => (),
+    text => match wire.decode text {
+        Result.ok([reads, said, diagnostics]) if io.exists! (image_path d key)
+                        && unchanged! reads => [reads, said, diagnostics],
+        _ => (),
+    },
+};
+
+/// Whether every file still has the digest it had.
+let unchanged! : [[:string, :string]] -> :bool;
+let rec unchanged! reads = match reads {
+    [] => true,
+    [[p, dg], ..rest] => digest_of! p == dg && unchanged! rest,
+};
+
+/// Each file with its digest now, `""` for one that cannot be read.
+let digests! : [:string] -> [[:string, :string]] -> [[:string, :string]];
+let rec digests! paths !acc = match paths {
+    [] => list.reverse acc,
+    [p, ..rest] => {
+        let dg = match digest_of! p { () => "", d => d };
+        strict! dg
+        digests! rest (list.cons [p, dg] acc)
+    },
+};
+
+/// Put the image kept for `key` at `out`, as `place` in std.build does: a
+/// copy beside it renamed over it, so a VM running the old image keeps the
+/// pages it had.
+let place! : :string -> :string -> :string -> :unit;
+let place! d key out = {
+    let scratch = out + ".cached-" + file.scratch_suffix! ();
+    file.copy! (image_path d key) scratch
+    io.rename! scratch out
+};
+
+/// Keep a build: its image, the files it read and what it printed. Written
+/// beside the entry and renamed into place, so a reader never sees half of
+/// one and two builds of the same program at once each write a whole one.
+let keep! : :string -> :string -> :string -> [:string] -> :string -> :string -> :unit;
+let keep! d key out read said diagnostics = {
+    file.mkdir_all! d
+    let reads = digests! read [];
+    let suffix = file.scratch_suffix! ();
+    file.copy! out (image_path d key + "." + suffix)
+    io.rename! (image_path d key + "." + suffix) (image_path d key)
+    file.write! (entry_path d key + "." + suffix) (wire.encode [reads, said, diagnostics])
+    io.rename! (entry_path d key + "." + suffix) (entry_path d key)
+};
