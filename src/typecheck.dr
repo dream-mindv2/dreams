@@ -60,6 +60,7 @@ import std.list;
 import std.str;
 
 import dreams.ast;
+import dreams.builtins;
 import dreams.diag;
 import dreams.modules;
 import dreams.scope;
@@ -854,7 +855,7 @@ let name_type k h n sp = match scope.resolution (res k) (Here.mi h) (Here.source
     scope.Meaning.global(_, _, gi) => global_type k h gi,
     scope.Meaning.member(_, _, gi) => if gi == () { :any } else { global_type k h gi },
     scope.Meaning.builtin(b) => builtin_type b,
-    _ => (Here.locals h).[n else :any],
+    _ => (Here.locals h).[n else (Here.locals h).[builtins.pure_name n else :any]],
 };
 
 /// A global's signature, unless a test in scope has narrowed it.
