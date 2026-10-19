@@ -82,7 +82,7 @@ let binaries = [:add, :sub, :mul, :div, :mod, :eq, :ne, :lt, :le, :gt, :ge, :and
 let layout : :atom -> :atom;
 let layout op = match op {
     :field => :a, :force => :a, :neg => :a, :not => :a, :bnot => :a, :type_is => :a,
-    :list_tail => :a, :list_is_empty => :a,
+    :list_tail => :a, :list_is_empty => :a, :list_is_cons => :a, :list_head => :a,
     :apply => :a_kids, :switch_head => :a_kids, :switch_atom => :a_kids,
     :if => :abc, :get => :abc, :set => :abc,
     :make_list => :kids_ab, :make_array => :kids_ab, :record_make => :kids_ab,

@@ -401,6 +401,19 @@ let decide v cx t = match t {
         Term.prim(:make_list, fl, a, b, c, [_, ..rest]) => Term.prim :make_list fl a b c rest,
         _ => (),
     },
+    // `match`'s questions, as `opt` writes them: the same answers as the
+    // builtins they replace (`decide_builtin`).
+    Term.prim(:list_is_cons, _, _, _, _, [x]) => match known v cx x {
+        Term.prim(:make_list, _, _, _, _, cs) => boolean (not (list.is_empty cs)),
+        Term.prim(:cons, _, _, _, _, _) => boolean true,
+        Term.prim(:record_make, _, _, _, _, _) => boolean false,
+        _ => (),
+    },
+    Term.prim(:list_head, _, _, _, _, [x]) => match known v cx x {
+        Term.prim(:make_list, _, _, _, _, [first, .._]) => first,
+        Term.prim(:cons, _, _, _, _, [first, _]) => first,
+        _ => (),
+    },
     _ => (),
 };
 

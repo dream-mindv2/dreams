@@ -95,6 +95,7 @@ let node_edges = [
     [:force, [0]],
     [:type_is, [0]],
     [:cons, [0, 1]], [:list_tail, [0]], [:list_is_empty, [0]],
+    [:list_is_cons, [0]], [:list_head, [0]],
     [:neg, [0]], [:not, [0]],
     [:add, [0, 1]], [:sub, [0, 1]], [:mul, [0, 1]],
     [:div, [0, 1]], [:mod, [0, 1]],
@@ -428,14 +429,19 @@ let primitive_ops = %{
     52 => [:str_interp, 1],
 };
 
-/// The three list builtins that become opcodes of their own, keyed by the
-/// runtime ID of the builtin they replace. Looked up per `apply` the pass
+/// The list builtins that become opcodes of their own, keyed by the runtime
+/// ID of the builtin they replace. `match`'s three are most of what a
+/// compile runs: ninety million native calls of a self-compile's seven
+/// hundred million steps, each an opcode now. Looked up per `apply` the pass
 /// rebuilds, so the IDs are settled here once rather than asked of
 /// `builtins.id` three times a node.
 let list_ops = %{
     builtins.id "_list_cons" => [:cons, 2],
     builtins.id "_list_tail" => [:list_tail, 1],
     builtins.id "_list_is_empty" => [:list_is_empty, 1],
+    builtins.id "_match_is_cons" => [:list_is_cons, 1],
+    builtins.id "_match_head" => [:list_head, 1],
+    builtins.id "_match_tail" => [:list_tail, 1],
 };
 
 let type_of_id = builtins.id "type_of";
