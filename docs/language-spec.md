@@ -643,6 +643,26 @@ What counts as impure is spelled with a `!`: printing and IO, `spawn!`,
 function a program names with one. The rule holds across imports, and
 through `import m.{f!}` as through `m.f!`.
 
+A pure function can also be called impurely: when `f!` has no binding, it
+resolves to `f`, and `m.f!` similarly falls back to `m.f`. This lets one
+implementation serve both kinds of caller:
+
+```dream
+import std.list;
+import std.console;
+let positive! x = { console.print! x; x > 0 };
+let main! = {
+    let ok = list.all! positive! [1, 2, 3];
+    console.print! ok
+};
+```
+
+The `!` sequences the call even when its result is unused, and requires an
+impure context. It works with local functions, imported aliases and builtins
+too. An explicitly declared `f!` takes precedence over the fallback. The
+function's implementation and its lazy arguments keep their usual evaluation
+rules; `!` does not deeply force the returned value.
+
 Purity is what makes laziness safe to reason about. A pure expression can be
 computed late, early, once or not at all, and nothing observable changes.
 Statements in an impure block run in order, because an impure block is where

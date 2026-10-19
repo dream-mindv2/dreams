@@ -341,6 +341,13 @@ let id name = ids.[name else ()];
 let is_impure_name : :string -> :bool;
 let is_impure_name name = str.ends_with "!" name;
 
+/// The pure spelling of an effectful call. Resolution tries the written name
+/// first, so a declared `f!` always wins over calling `f` impurely.
+let pure_name : :string -> :string;
+let pure_name name =
+    if is_impure_name name { str.slice 0 (str.byte_length name - 1) name }
+    else { name };
+
 /// A primitive: a builtin `std` wraps, and only `std` should name. See the
 /// head of this file.
 let is_primitive : :string -> :bool;

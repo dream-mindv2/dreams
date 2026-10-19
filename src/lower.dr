@@ -492,14 +492,20 @@ let resolved_name found =
 /// that the VM sequences the effect rather than only the compiler knowing about
 /// it. `scope` refused the pure functions that reach an effect; this records
 /// which nodes *are* one.
-let lower_name name span l = lower_resolved name (as_value (lookup span l) l) span l;
+let lower_name name span l = {
+    let found = lookup span l;
+    // An import may rename `f!` to a name without `!`. Retain its effect
+    // marker even when the value rewrite replaces it with a pure builtin.
+    let marked = if builtins.is_impure_name (resolved_name found) { resolved_name found } else { name };
+    lower_resolved marked (as_value found l) span l
+};
 
 /// The same, for a caller that has already asked what the name resolves to.
 /// Applications ask, because a call of a wrapper is rewritten and one that is
 /// not should not pay for the question twice.
 let lower_resolved name found span l = {
     let got = emit_resolution_or found span l;
-    if builtins.is_impure_name name {
+    if builtins.is_impure_name name || builtins.is_impure_name (resolved_name found) {
         [set_flag (list.nth 1 got) ir.f_impure (list.head got), list.nth 1 got]
     }
     else { got }
@@ -704,14 +710,26 @@ let rec lower_expr e l =
         // A pipeline `scope` decided to fuse is a loop and a call of it, and
         // neither the producer nor the consumer is called at all. Asked first,
         // because everything below is about a call that still happens.
-        [:apply, callee, args, span] =>
-            match scope.fusion (res l) (ctx l) (source l) span {
+        [:apply, callee, args, span] => {
+            let got = match scope.fusion (res l) (ctx l) (source l) span {
                 () => match result_call e l {
                     () => lower_apply callee args span l,
                     [kind, _, _, _] => lower_result_chain e kind [] l,
                 },
                 p  => lower_fused p l,
-            },
+            };
+            // Wrapper and builtin rewrites may replace the callee entirely.
+            // The written `!` still sequences this call, including a binding
+            // whose answer is never read.
+            let written_effect = match callee {
+                [:name, n, _] => builtins.is_impure_name n,
+                [:field, _, n, _] => builtins.is_impure_name n,
+                _ => false,
+            };
+            let effect = written_effect || builtins.is_impure_name (resolved_name (callee_resolution callee l));
+            if effect { [set_flag (list.nth 1 got) ir.f_impure (list.head got), list.nth 1 got] }
+            else { got }
+        },
 
         // `x |> f a` is folded into the single call `f a x` rather than a call
         // of a call. That is what lets a variadic host function take everything
@@ -1005,7 +1023,10 @@ let lower_value_field obj field l = {
     let named = ir.intern_str field (prog (list.head o));
     let made = emit (ir.node :field (list.nth 1 o) (list.nth 1 named) ir.no_node)
                     (set_prog (list.head named) (list.head o));
-    [inherit (list.nth 1 made) [list.nth 1 o] (list.head made), list.nth 1 made]
+    let inherited = inherit (list.nth 1 made) [list.nth 1 o] (list.head made);
+    let done = if builtins.is_impure_name field { set_flag (list.nth 1 made) ir.f_impure inherited }
+               else { inherited };
+    [done, list.nth 1 made]
 };
 
 /// A module member written with a dot. When the object is a namespace the whole
