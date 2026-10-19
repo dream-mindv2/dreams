@@ -125,6 +125,12 @@ mapping Program {
     // Each function that updates an association list (`upsert_shape`), by
     // global.
     upserts
+    // Each function that looks up or replaces in an association list
+    // (`assoc_op`), and each small function that hands one to them
+    // (`composite`), by global: what a loop that keeps one is rewritten
+    // through (`designed`).
+    assocs
+    composites
 }
 
 /// The image with its slow accumulators written again.
@@ -142,12 +148,12 @@ let accum img0 = {
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
                          "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find",
                          "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop",
-                         "_trunk_of", "_trunk_to_list", "_trunk_lookup", "_trunk_at", "_trunk_push", "_trunk_set"];
+                         "_trunk_of", "_trunk_to_list", "_trunk_lookup", "_trunk_at", "_trunk_push", "_trunk_set", "_trunk_recall"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
                          (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
                          (global_named img strs "std.list" "last") (global_named img strs "std.list" "reverse_from")
                          (global_named img strs "std.list" "take") (global_named img strs "std.list" "sort") small %{}
-                         (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{} %{};
+                         (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{} %{} %{} %{};
     let ints = Program.ints p;
     let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
         () => m,
@@ -185,6 +191,16 @@ let accum img0 = {
         () => m,
         shape => m.[gi => shape],
     }) %{} functions) p;
+    let p = Program.set_assocs (list.fold (fn m [gi, g] -> match assoc_op p (g.[:target else -1]) gi {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions) p;
+    // A composite hands its list to an operation or to another composite, so
+    // they are found outward from the operations, a few rings deep.
+    let p = list.fold (fn q _ -> Program.set_composites (list.fold (fn m [gi, g] -> match composite_of q (g.[:target else -1]) gi {
+        () => m,
+        shape => m.[gi => shape],
+    }) (Program.composites q) functions) q) p [1, 2, 3];
     let n_funcs = array.length (Program.funcs p);
     let [changed, added_rev, globals_rev] = list.fold (fn [m, added, gs] fi ->
         match rewritten p fi (n_funcs + list.length added) (array.length globals + list.length gs) {
@@ -298,7 +314,7 @@ let rewritten p fi wfi wgi = {
         let body = sc.renamed (sc.body_of (Program.reading p) f);
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
-                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site, fn () -> upserted site,
+                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site, fn () -> upserted site, fn () -> designed site,
                   fn () -> memo_table site]
     }
 };
@@ -317,7 +333,7 @@ let rewritten_before p body = {
         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh",
          "_memo_cells", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find",
          "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop",
-         "_trunk_of", "_trunk_lookup", "_trunk_push", "_trunk_set"]);
+         "_trunk_of", "_trunk_lookup", "_trunk_push", "_trunk_set", "_trunk_recall"]);
     list.any (fn t -> match t {
         Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => list.contains b written,
         _ => false,
@@ -1058,7 +1074,8 @@ let queue_at site j = {
         Term.lam(_, _, _, caps) => not (list.any (fn n -> list.contains n caps) (list.append aliases rests)),
         Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x])
             if is_alias x && (b == ids.["_match_is_cons"] || b == ids.["_match_head"] || b == ids.["_match_tail"]) => true,
-        Term.prim(op, _, _, _, _, [x]) if is_alias x && (op == :type_is || op == :list_is_empty || op == :list_tail) => true,
+        Term.prim(op, _, _, _, _, [x]) if is_alias x && (op == :type_is || op == :list_is_empty || op == :list_tail
+                                                         || op == :list_is_cons || op == :list_head) => true,
         Term.prim(:get, _, _, _, _, [x, Term.prim(:const_int, _, i, _, _, _), Term.absent]) if is_alias x && (Program.ints p).[i] == 0 => true,
         // A `match` that fails names what it was handed. It fails only on
         // what is not a list, which the queue never is while anything is
@@ -2116,4 +2133,613 @@ let upserted_at site j = {
             ])]));
         [guarded, worker, global]
     }
+};
+
+// --- a design: an association list, whatever functions it passes through -----------
+//
+// A first design keeps its table as a list of `[key, value]` pairs: one
+// function adds to it, another searches it, a third replaces a pair, and a
+// loop threads it through all of them -- every step a scan, the program
+// quadratic, and no one loop of it the shape of anything. What is rewritten
+// here is the *list*, wherever it goes: a loop that hands one on through such
+// functions keeps it as a trunk instead, the functions that take it apart are
+// read as the operations they are (`assoc_op`) and run on the trunk, and the
+// small functions between them (`composite_of`) are taken in where they are
+// called, so that what they do to the list is done to the trunk. See "A
+// design, rewritten" in docs/notes/supercompilation.md.
+//
+// Exactly, an operation at a time rather than for the program as a whole,
+// which is what lets it apply to code that cannot be seen whole:
+//
+// - Every operation stands where it was written, with its arguments as lazy
+//   as they were, so it runs when the call it replaces would have. The list
+//   is "a trunk, or the list as written", and each operation looks at which
+//   it was handed: a list it does not know runs the code as written.
+// - A trunk is made only from `[]`, and grows only by the pairs the code
+//   writes, so every element is a pair and a lookup that passes over what is
+//   not one never meets one.
+// - A lookup forces what the scan forces, in its order: the trunk's search
+//   is that (`search` in dream/src/trunk.cpp).
+// - A replace finds its pair only through the lookup made just before it of
+//   the same key in the same version (`_trunk_recall`), which forced all its
+//   scan would; without one it takes the list as written, and the loop goes
+//   on with the list.
+// - Wherever else the list is read it is the list: the trunk's elements.
+
+/// What a function that takes an association list apart is: `:lookup`,
+/// answering `found` -- over the pair's key `k` and value `v`, the key asked
+/// for and the other parameters -- for the first pair with that key and
+/// `empty` when there is none; or `:replace`, the list with that pair
+/// replaced by `[key, value]`, unchanged when there is none, or with `[w,
+/// missing]` added when `missing` is not `()`. `li` and `wi` are the list's
+/// and the key's positions among `params`.
+group AssocOp { kind : :atom, li : :integer, wi : :integer, params, empty, found, key, value, missing, k, v }
+
+/// The steps from the subject `s` of a list pattern to a part of it, `:h` a
+/// head and `:t` a tail, or `()`.
+let pair_path : :string -> Term -> [:atom] | :unit;
+let rec pair_path s t = match t {
+    Term.var(n, _) => if n == s { [] } else { () },
+    Term.prim(op, _, _, _, _, [x]) if op == :list_head || op == :list_tail =>
+        match pair_path s x { () => (), steps => list.append steps [if op == :list_head { :h } else { :t }] },
+    _ => (),
+};
+
+/// A part's shape in a model of the subject: `:empty` is `[]`, `:pair` a cell
+/// whose head is `[k, v]`; `:cons`, `:nil`, or `()` for what it does not fix.
+let pair_shape : :atom -> [:atom] -> :atom | :unit;
+let pair_shape model steps = match [model, steps] {
+    [:empty, []] => :nil,
+    [:pair, []] => :cons,
+    [:pair, [:h]] => :cons,
+    [:pair, [:h, :t]] => :cons,
+    [:pair, [:h, :t, :t]] => :nil,
+    _ => (),
+};
+
+/// Whether a pattern's test holds in a model, when the model says.
+let pair_holds : :string -> :atom -> Term -> :bool | :unit;
+let rec pair_holds s model t = match t {
+    Term.prim(:and, _, _, _, _, [x, y]) => match [pair_holds s model x, pair_holds s model y] {
+        [true, true] => true,
+        [false, _] => false,
+        [_, false] => false,
+        _ => (),
+    },
+    Term.prim(:not, _, _, _, _, [x]) => match pair_holds s model x { () => (), b => not b },
+    Term.prim(:const_bool, _, b, _, _, _) => b == 1,
+    Term.prim(:type_is, _, _, 7, 0, [x]) => match pair_path s x {
+        () => (),
+        steps => match pair_shape model steps { () => (), _ => true },
+    },
+    Term.prim(op, _, _, _, _, [x]) if op == :list_is_cons || op == :list_is_empty => match pair_path s x {
+        () => (),
+        steps => match pair_shape model steps { () => (), sh => (sh == :cons) == (op == :list_is_cons) },
+    },
+    _ => (),
+};
+
+/// Whether `t` reads no name but `allowed`, binds nothing, makes no closure
+/// and names no global `gi` -- a term that can be moved into another frame.
+let movable : [:string] -> :integer -> Term -> :bool;
+let movable allowed gi t = {
+    let [terms, stmts] = hoist.parts t;
+    list.is_empty stmts && not (names gi t) && list.all (fn x -> match x {
+        Term.var(n, _) => list.contains n allowed,
+        Term.lam(_, _, _, _) => false,
+        Term.trying(_, _, _, _) => false,
+        Term.block(_, _) => false,
+        _ => true,
+    }) terms
+};
+
+/// Function `fi`, called through `gi`, read as an operation on an association
+/// list, or `()`. The `match` as it is lowered, as `upsert_shape` reads it,
+/// with any number of parameters that are handed on as they were.
+let assoc_op : Program -> :integer -> :integer -> AssocOp | :unit;
+let assoc_op p fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let arity = f.[:arity else 0];
+        if arity < 2 || f.[:n_captures else 0] > 0 || ir.has_flag (f.[:flags else 0]) ir.fn_impure { () }
+        else {
+            let params = list.map sc.slot_name (list.range 0 arity);
+            match unwrap (sc.body_of (Program.reading p) f) {
+                Term.block(_, [Stmt.bind(s, _, Term.var(ln, _)), Stmt.expr(e)]) if list.contains ln params =>
+                    assoc_read p gi params (list.find_index (fn n -> n == ln) params) s (unwrap e),
+                _ => (),
+            }
+        }
+    };
+
+let assoc_read : Program -> :integer -> [:string] -> :integer -> :string -> Term -> AssocOp | :unit;
+let assoc_read p gi params li s e = match e {
+    Term.prim(:if, _, _, _, _, [empty_test, empty_branch, rest])
+        if pair_holds s :empty empty_test == true && pair_holds s :pair empty_test == false => match unwrap rest {
+        Term.prim(:if, _, _, _, _, [pair_test, Term.block(_, stmts), _]) if pair_holds s :pair pair_test == true => {
+            let binds = list.take_while (fn st -> match st { Stmt.bind(_, _, _) => true, _ => false }) stmts;
+            let named = list.fold (fn m st -> match st {
+                Stmt.bind(n, _, x) => match pair_path s x {
+                    [:h, :h] => m.[:k => n],
+                    [:h, :t, :h] => m.[:v => n],
+                    [:t] => m.[:r => n],
+                    _ => m.[:other => n],
+                },
+                _ => m,
+            }) %{} binds;
+            let [k, v, r] = [named.[:k else ()], named.[:v else ()], named.[:r else ()]];
+            let ln = list.nth li params;
+            let others = list.filter (fn n -> n != ln) params;
+            match list.drop (list.length binds) stmts {
+                // A pattern that names no value, `[[n, _], ..rest]`, binds none.
+                [Stmt.expr(Term.prim(:if, _, _, _, _, [Term.prim(:eq, _, _, _, _, [a, b]), found, missed]))]
+                    if k != () && r != () && not (map.has :other named) => {
+                    let w = match [a, b] {
+                        [Term.var(x, _), Term.var(y, _)] if x == k && list.contains y others => y,
+                        [Term.var(x, _), Term.var(y, _)] if y == k && list.contains x others => x,
+                        _ => (),
+                    };
+                    let wi = list.find_index (fn n -> n == w) params;
+                    // A call of itself on the rest, every other parameter as it was.
+                    let again t = match unwrap t {
+                        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) =>
+                            g == gi && list.length args == list.length params
+                                && list.all (fn [i, x] -> if i == li { is_var r x } else { is_var (list.nth i params) x }) (list.enumerate args),
+                        _ => false,
+                    };
+                    let kept t = match unwrap t {
+                        Term.prim(:cons, _, _, _, _, [Term.prim(:make_list, _, _, _, _, [kx, vx]), rest_call]) =>
+                            is_var k kx && is_var v vx && again rest_call,
+                        _ => false,
+                    };
+                    if w == () { () }
+                    else if again missed && movable (list.concat [[k, if v == () { k } else { v }], others]) gi (unwrap found) && movable others gi (unwrap empty_branch) {
+                        AssocOp.make :lookup li wi params (unwrap empty_branch) (unwrap found) () () () k v
+                    }
+                    else if kept missed {
+                        let replaced = match unwrap found {
+                            Term.prim(:cons, _, _, _, _, [Term.prim(:make_list, _, _, _, _, [kt, vt]), Term.var(rn, _)])
+                                if rn == r && (is_var k kt || is_var w kt) && movable (list.concat [[k, v], others]) gi vt => [kt, vt],
+                            _ => (),
+                        };
+                        let missing = match unwrap empty_branch {
+                            Term.prim(:make_list, _, _, _, _, []) => [()],
+                            Term.prim(:make_list, _, _, _, _, [Term.prim(:make_list, _, _, _, _, [Term.var(n, _), x])])
+                                if n == w && movable others gi x => [x],
+                            _ => (),
+                        };
+                        match [replaced, missing] {
+                            [[kt, vt], [m]] => AssocOp.make :replace li wi params () () kt vt m k v,
+                            _ => (),
+                        }
+                    }
+                    else { () }
+                },
+                _ => (),
+            }
+        },
+        _ => (),
+    },
+    _ => (),
+};
+
+/// The largest body a composite may have: it is copied into each place it is
+/// called from.
+let composite_size : :integer;
+let composite_size = 400;
+
+/// Function `fi`, called through `gi`, as a composite: a small function, not
+/// recursive, that hands one of its parameters to an operation or to another
+/// composite. `[fi, its list parameter's position]`, or `()`.
+let composite_of : Program -> :integer -> :integer -> [:integer, :integer] | :unit;
+let composite_of p fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) || map.has gi (Program.assocs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        let fl = f.[:flags else 0];
+        let arity = f.[:arity else 0];
+        if arity == 0 || ir.has_flag fl ir.fn_rec || ir.has_flag fl ir.fn_impure || ir.has_flag fl ir.fn_thunk
+           || f.[:n_captures else 0] > 0 { () }
+        else {
+            let body = sc.body_of (Program.reading p) f;
+            if drive.size body > composite_size { () }
+            else {
+                let handed = list.concat (list.map (fn t -> match t {
+                    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match assoc_list_at p g {
+                        i if i >= 0 && i < list.length args => match list.nth i args { Term.var(n, _) => [n], _ => [] },
+                        _ => [],
+                    },
+                    _ => [],
+                }) (list.head (hoist.parts body)));
+                match list.find_index (fn j -> list.contains (sc.slot_name j) handed) (list.range 0 arity) {
+                    j if j >= 0 => [fi, j],
+                    _ => (),
+                }
+            }
+        }
+    };
+
+/// Where global `g` takes its association list: an operation's list
+/// parameter, a composite's, or -1.
+let assoc_list_at : Program -> :integer -> :integer;
+let assoc_list_at p g = match (Program.assocs p).[g else ()] {
+    () => match (Program.composites p).[g else ()] { [_, j] => j, _ => -1 },
+    op => AssocOp.li op,
+};
+
+/// A translation's context: the program, the loop's own global, the names
+/// that hold the list as a trunk or as written, the prefix this term's new
+/// names start with, and how deep composites have been taken in.
+group Tx { program, gi : :integer, vars : :map, at : :string, depth : :integer }
+
+let tx_at : Tx -> :string -> Tx;
+let tx_at x suffix = Tx.make (Tx.program x) (Tx.gi x) (Tx.vars x) (Tx.at x + suffix) (Tx.depth x);
+
+let tx_with : Tx -> :string -> Tx;
+let tx_with x n = Tx.make (Tx.program x) (Tx.gi x) ((Tx.vars x).[n => true]) (Tx.at x) (Tx.depth x);
+
+let trunk_code : :integer;
+let trunk_code = 19;
+
+let is_trunk_term : Term -> Term;
+let is_trunk_term x = Term.prim :type_is 0 ir.no_node trunk_code 0 [x];
+
+let if_term : Term -> Term -> Term -> Term;
+let if_term c y n = Term.prim :if 0 ir.no_node ir.no_node ir.no_node [c, y, n];
+
+/// A name that holds the list read where a list is wanted: the trunk's
+/// elements, or the list as it is.
+let as_list : Program -> Term -> Term;
+let as_list p x = if_term (is_trunk_term x) (builtin p "_trunk_to_list" [x]) x;
+
+/// Whether `t` makes the list an operation or a composite answers, or hands
+/// on one the context holds -- the value of a binding that should hold it
+/// too.
+let produces : Tx -> Term -> :bool;
+let rec produces x t = match t {
+    Term.var(n, _) => map.has n (Tx.vars x),
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => match (Program.assocs (Tx.program x)).[g else ()] {
+        () => match (Program.composites (Tx.program x)).[g else ()] {
+            [_, j] => j < list.length args && produces x (list.nth j args),
+            _ => appended x t != (),
+        },
+        op => AssocOp.kind op == :replace && produces x (list.nth (AssocOp.li op) args),
+    },
+    Term.prim(:add, _, _, _, _, _) => appended x t != (),
+    Term.prim(:if, _, _, _, _, [_, y, z]) => produces x y || produces x z,
+    Term.block(_, ss) => match list.reverse ss { [Stmt.expr(l), .._] => produces x l, _ => false },
+    _ => false,
+};
+
+/// `l + [pair]` or `list.append l [pair]`, with `l` a list the context
+/// holds: `[l, pair]`, or `()`.
+let appended : Tx -> Term -> [Term, Term] | :unit;
+let appended x t = match t {
+    Term.prim(:add, _, _, _, _, [l, Term.prim(:make_list, _, _, _, _, [pair])]) if pair_literal pair && produces x l => [l, pair],
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), l, Term.prim(:make_list, _, _, _, _, [pair])])
+        if g == Program.append (Tx.program x) && g >= 0 && pair_literal pair && produces x l => [l, pair],
+    _ => (),
+};
+
+let pair_literal : Term -> :bool;
+let pair_literal t = match t { Term.prim(:make_list, _, _, _, _, [_, _]) => true, _ => false };
+
+/// `t` translated where the list is wanted as it is: a name holding it read
+/// as a list (`as_list`), an operation on it run on the trunk when it is one.
+let tr : Tx -> Term -> Term;
+let rec tr x t = match t {
+    Term.var(n, _) => if map.has n (Tx.vars x) { as_list (Tx.program x) t } else { t },
+    Term.prim(:apply, fl, a, b, c, [Term.prim(:global, gfl, g, ga, gb, gc), ..args]) => {
+        let p = Tx.program x;
+        match (Program.assocs p).[g else ()] {
+            op if op != () && AssocOp.kind op == :lookup => lookup_term (tx_at x "l") g op args,
+            op if op != () => as_list p (replace_term (tx_at x "r") g op args),
+            _ => match (Program.composites p).[g else ()] {
+                [fi, j] if Tx.depth x < 3 => as_list p (inlined (tx_at x "c") fi j args false),
+                _ => match appended x t {
+                    [l, pair] => as_list p (push_term (tx_at x "a") l pair),
+                    _ if g == Tx.gi x => Term.prim :apply fl a b c (list.cons (Term.prim :global gfl g ga gb gc)
+                        (list.map (fn [i, arg] -> tp (tx_at x ("_" + to_string i)) arg) (list.enumerate args))),
+                    _ => Term.prim :apply fl a b c (list.cons (Term.prim :global gfl g ga gb gc)
+                        (list.map (fn [i, arg] -> tr (tx_at x ("_" + to_string i)) arg) (list.enumerate args))),
+                },
+            },
+        }
+    },
+    Term.prim(:add, fl, a, b, c, cs) => match appended x t {
+        [l, pair] => as_list (Tx.program x) (push_term (tx_at x "a") l pair),
+        _ => Term.prim :add fl a b c (list.map (fn [i, k] -> tr (tx_at x ("_" + to_string i)) k) (list.enumerate cs)),
+    },
+    Term.prim(op, fl, a, b, c, cs) => Term.prim op fl a b c (list.map (fn [i, k] -> tr (tx_at x ("_" + to_string i)) k) (list.enumerate cs)),
+    Term.block(fl, ss) => tr_block x fl ss false,
+    Term.lam(op, fl, fi, caps) => {
+        // A closure capturing the list captures it as a list.
+        let held = list.filter (fn n -> map.has n (Tx.vars x)) caps;
+        if list.is_empty held { t }
+        else {
+            let renamed = list.map (fn n -> if map.has n (Tx.vars x) { Tx.at x + "_cap_" + n } else { n }) caps;
+            Term.block 0 (list.append (list.map (fn n -> Stmt.bind (Tx.at x + "_cap_" + n) 0 (as_list (Tx.program x) (Term.var n 0))) held)
+                                      [Stmt.expr (Term.lam op fl fi renamed)])
+        }
+    },
+    Term.trying(fl, body, e, h) => Term.trying fl (tr (tx_at x "t") body) e (tr (tx_at x "h") h),
+    _ => t,
+};
+
+/// `t` translated where the list may stay a trunk: what a binding that holds
+/// it is, or a loop's next list.
+let tp : Tx -> Term -> Term;
+let rec tp x t = match t {
+    Term.var(n, _) if map.has n (Tx.vars x) => t,
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => {
+        let p = Tx.program x;
+        match (Program.assocs p).[g else ()] {
+            op if op != () && AssocOp.kind op == :replace => replace_term (tx_at x "r") g op args,
+            _ => match (Program.composites p).[g else ()] {
+                [fi, j] if Tx.depth x < 3 => inlined (tx_at x "c") fi j args true,
+                _ => match appended x t {
+                    [l, pair] => push_term (tx_at x "a") l pair,
+                    _ => tr x t,
+                },
+            },
+        }
+    },
+    Term.prim(:add, _, _, _, _, _) => match appended x t {
+        [l, pair] => push_term (tx_at x "a") l pair,
+        _ => tr x t,
+    },
+    Term.prim(:if, fl, a, b, c, [cond, y, z]) =>
+        Term.prim :if fl a b c [tr (tx_at x "_c") cond, tp (tx_at x "_y") y, tp (tx_at x "_z") z],
+    Term.block(fl, ss) => tr_block x fl ss true,
+    _ => tr x t,
+};
+
+/// A block, each binding of a list the context holds held so too, the last
+/// statement `tp`'s when `keep`.
+let tr_block : Tx -> :integer -> [Stmt] -> :bool -> Term;
+let tr_block x fl ss keep = {
+    let n = list.length ss;
+    let [out, _] = list.fold (fn [acc, cx] [i, st] -> {
+        let here = tx_at cx ("b" + to_string i);
+        match st {
+            Stmt.bind(name, bf, v) => if produces cx v {
+                [list.cons (Stmt.bind name bf (tp here v)) acc, tx_with cx name]
+            } else {
+                [list.cons (Stmt.bind name bf (tr here v)) acc, cx]
+            },
+            // A strict read of the list forces it, which a trunk is already.
+            Stmt.expr(Term.var(m, _)) if map.has m (Tx.vars cx) && i + 1 < n => [list.cons st acc, cx],
+            Stmt.expr(e) => [list.cons (Stmt.expr (if keep && i + 1 == n { tp here e } else { tr here e })) acc, cx],
+        }
+    }) [[], x] (list.enumerate ss);
+    Term.block fl (list.reverse out)
+};
+
+/// The arguments of an operation's call bound to names of its own, lazily, as
+/// the call would have bound them: `[stmts, the list's name, the key's name,
+/// what each parameter is now named]`.
+let bound_args : Tx -> AssocOp -> [Term] -> [[Stmt], :string, :string, :map];
+let bound_args x op args = {
+    let params = AssocOp.params op;
+    let names = list.fold (fn m [i, n] -> m.[n => Tx.at x + "_p" + to_string i]) %{} (list.enumerate params);
+    let stmts = list.map (fn [i, arg] -> {
+        let here = tx_at x ("_a" + to_string i);
+        Stmt.bind (Tx.at x + "_p" + to_string i) 0 (if i == AssocOp.li op { tp here arg } else { tr here arg })
+    }) (list.enumerate args);
+    [stmts, Tx.at x + "_p" + to_string (AssocOp.li op), Tx.at x + "_p" + to_string (AssocOp.wi op), names]
+};
+
+/// A term of the operation's own, read in the loop: its parameters by the
+/// names they are bound to, the found pair's key and value read out of
+/// `pair`.
+let moved_in : :map -> AssocOp -> :string -> Term -> Term;
+let moved_in names op pair t = {
+    list.head (hoist.rewrite (fn y -> match y {
+        Term.var(n, _) => if n == AssocOp.k op && AssocOp.k op != () { pair_get pair 0 }
+                          else if n == AssocOp.v op && AssocOp.v op != () { pair_get pair 1 }
+                          else { match names.[n else ()] { () => (), to => Term.var to 0 } },
+        _ => (),
+    }) %{} t)
+};
+
+/// `pair.[i]`, for `i` 0 or 1, as a list pattern reads the parts of a pair:
+/// its head, and the head of its tail.
+let pair_get : :string -> :integer -> Term;
+let pair_get pair i = {
+    let cell = Term.var pair 0;
+    if i == 0 { Term.prim :list_head 0 ir.no_node ir.no_node ir.no_node [cell] }
+    else { Term.prim :list_head 0 ir.no_node ir.no_node ir.no_node [Term.prim :list_tail 0 ir.no_node ir.no_node ir.no_node [cell]] }
+};
+
+/// The call `g args`, by the names its arguments are bound to.
+let call_as : :integer -> AssocOp -> :string -> [Term] -> Term;
+let call_as g op at args = call g (list.map (fn i -> Term.var (at + "_p" + to_string i) 0) (list.range 0 (list.length args)));
+
+/// Whether a list the context holds is one the trunk can stand for: a trunk,
+/// or `[]`, which a trunk is made of.
+let trunkable : Term -> Term;
+let trunkable l = Term.prim :or 0 ir.no_node ir.no_node ir.no_node [is_trunk_term l, Term.prim :list_is_empty 0 ir.no_node ir.no_node ir.no_node [l]];
+
+/// The trunk a list the context holds stands for, once it is `trunkable`.
+let the_trunk : Program -> Term -> Term;
+let the_trunk p l = if_term (is_trunk_term l) l (builtin p "_trunk_of" [nil]);
+
+let lookup_term : Tx -> :integer -> AssocOp -> [Term] -> Term;
+let lookup_term x g op args = {
+    let p = Tx.program x;
+    let [stmts, l, w, names] = bound_args x op args;
+    let t = Tx.at x + "_t";
+    let i = Tx.at x + "_i";
+    let pair = Tx.at x + "_pair";
+    let zero = Term.prim :const_int 0 ((Program.small_ints p).[0]) ir.no_node ir.no_node [];
+    let on_trunk = Term.block 0 [
+        Stmt.bind t 0 (the_trunk p (Term.var l 0)),
+        Stmt.bind i ir.f_strict (builtin p "_trunk_lookup" [Term.var w 0, Term.var t 0]),
+        Stmt.expr (if_term (Term.prim :lt 0 ir.no_node ir.no_node ir.no_node [Term.var i 0, zero])
+            (moved_in names op pair (AssocOp.empty op))
+            (Term.block 0 [Stmt.bind pair 0 (builtin p "_trunk_at" [Term.var i 0, Term.var t 0]),
+                           Stmt.expr (moved_in names op pair (AssocOp.found op))])),
+    ];
+    Term.block 0 (list.append stmts [Stmt.expr (if_term (trunkable (Term.var l 0)) on_trunk (call_as g op (Tx.at x) args))])
+};
+
+let replace_term : Tx -> :integer -> AssocOp -> [Term] -> Term;
+let replace_term x g op args = {
+    let p = Tx.program x;
+    let [stmts, l, w, names] = bound_args x op args;
+    let t = Tx.at x + "_t";
+    let i = Tx.at x + "_i";
+    let pair = Tx.at x + "_pair";
+    let zero = Term.prim :const_int 0 ((Program.small_ints p).[0]) ir.no_node ir.no_node [];
+    let pair2 a b = Term.prim :make_list 0 ir.no_node 2 ir.no_node [a, b];
+    let absent = match AssocOp.missing op {
+        () => Term.var t 0,
+        m => builtin p "_trunk_push" [pair2 (Term.var w 0) (moved_in names op pair m), Term.var t 0],
+    };
+    // Without the lookup before it to say where the pair is, the list as
+    // written: the trunk's elements, and the call.
+    let as_written = Term.block 0 [Stmt.bind l 0 (builtin p "_trunk_to_list" [Term.var t 0]), Stmt.expr (call_as g op (Tx.at x) args)];
+    let on_trunk = Term.block 0 [
+        Stmt.bind t 0 (the_trunk p (Term.var l 0)),
+        Stmt.bind i ir.f_strict (builtin p "_trunk_recall" [Term.var w 0, Term.var t 0]),
+        Stmt.expr (if_term (Term.prim :type_is 0 ir.no_node 0 0 [Term.var i 0])
+            (if_term (Term.prim :lt 0 ir.no_node ir.no_node ir.no_node [Term.var i 0, zero])
+                absent
+                (Term.block 0 [Stmt.bind pair 0 (builtin p "_trunk_at" [Term.var i 0, Term.var t 0]),
+                               Stmt.expr (builtin p "_trunk_set" [Term.var i 0,
+                                   pair2 (moved_in names op pair (AssocOp.key op)) (moved_in names op pair (AssocOp.value op)),
+                                   Term.var t 0])]))
+            as_written),
+    ];
+    Term.block 0 (list.append stmts [Stmt.expr (if_term (trunkable (Term.var l 0)) on_trunk (call_as g op (Tx.at x) args))])
+};
+
+let push_term : Tx -> Term -> Term -> Term;
+let push_term x l pair = {
+    let p = Tx.program x;
+    let lname = Tx.at x + "_l";
+    let pname = Tx.at x + "_pair";
+    Term.block 0 [
+        Stmt.bind lname 0 (tp (tx_at x "_l") l),
+        Stmt.bind pname 0 (tr (tx_at x "_v") pair),
+        Stmt.expr (if_term (trunkable (Term.var lname 0))
+            (builtin p "_trunk_push" [Term.var pname 0, the_trunk p (Term.var lname 0)])
+            (call (Program.append p) [Term.var lname 0, Term.prim :make_list 0 ir.no_node 1 ir.no_node [Term.var pname 0]])),
+    ]
+};
+
+/// Composite `fi`'s body where it is called, its arguments bound lazily to
+/// names of their own and its own names prefixed so they meet none of the
+/// loop's: a call of a pure function, by need.
+let inlined : Tx -> :integer -> :integer -> [Term] -> :bool -> Term;
+let inlined x fi j args keep = {
+    let p = Tx.program x;
+    let f = (Program.funcs p).[fi];
+    let body = sc.renamed (sc.body_of (Program.reading p) f);
+    let pre = Tx.at x + "_";
+    let [terms, stmts] = hoist.parts body;
+    let own = list.concat [list.map sc.slot_name (list.range 0 (list.length args)),
+                           list.concat (list.map (fn st -> match st { Stmt.bind(n, _, _) => [n], _ => [] }) stmts)];
+    let renaming = list.fold (fn m n -> m.[n => pre + n]) %{} own;
+    let named = list.head (hoist.rewrite (fn y -> match y {
+        Term.var(n, fl) => match renaming.[n else ()] { () => (), to => Term.var to fl },
+        Term.block(fl, ss) => (),
+        _ => (),
+    }) %{} body);
+    let renamed = rename_binds renaming named;
+    let binds = list.map (fn [i, arg] -> {
+        let here = tx_at x ("_a" + to_string i);
+        Stmt.bind (pre + sc.slot_name i) 0 (if i == j { tp here arg } else { tr here arg })
+    }) (list.enumerate args);
+    let inner = Tx.make p (Tx.gi x) ((Tx.vars x).[pre + sc.slot_name j => true]) (Tx.at x + "i") (Tx.depth x + 1);
+    Term.block 0 (list.append binds [Stmt.expr (if keep { tp inner renamed } else { tr inner renamed })])
+};
+
+/// `t` with every binding's name renamed as `renaming` says.
+let rename_binds : :map -> Term -> Term;
+let rename_binds renaming t = list.head (hoist.rewrite (fn y -> match y {
+    Term.block(fl, ss) => Term.block fl (list.map (fn st -> match st {
+        Stmt.bind(n, bf, v) => Stmt.bind (renaming.[n else n]) bf (rename_binds renaming v),
+        Stmt.expr(e) => Stmt.expr (rename_binds renaming e),
+    }) ss),
+    _ => (),
+}) %{} t);
+
+/// A loop that hands parameter `j` on through what `assoc_op` and
+/// `composite_of` read, rewritten so the list it hands on can be a trunk. The
+/// function itself, its callers and its arity unchanged: what it answers is a
+/// list, wherever it ends.
+let designed : Site -> [Fun, [Fun], :unit] | :unit;
+let designed site =
+    if map.size (Program.assocs (Site.program site)) == 0 { () }
+    else { first_of (list.map (fn j -> fn () -> designed_at site j) (list.range 0 (Site.k site))) };
+
+let designed_at : Site -> :integer -> [Fun, [Fun], :unit] | :unit;
+let designed_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let acc = sc.slot_name j;
+    let body = Site.body site;
+    let x = Tx.make p gi (%{ acc => true }) "dz" 0;
+    // Each call of itself hands on, as `j`, what an operation or a composite
+    // makes of the list -- through bindings, as a loop that chooses between
+    // them writes it.
+    let rec through cx t = match t {
+        Term.block(_, ss) => {
+            let [cx2, found] = list.fold (fn [c, f] st -> match st {
+                Stmt.bind(n, _, v) => if produces c v { [tx_with c n, f || doing c v] } else { [c, f] },
+                Stmt.expr(e) => [c, f || through c e],
+            }) [cx, false] ss;
+            found
+        },
+        Term.prim(:if, _, _, _, _, [_, y, z]) => through cx y || through cx z,
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) if g == gi && list.length args > j =>
+            doing cx (list.nth j args),
+        _ => false,
+    };
+    if not (through x body) { () }
+    else {
+        let f = (Program.funcs p).[Site.fi site];
+        [sc.fun_of f (tr x body), [], ()]
+    }
+};
+
+let is_var_any : Term -> :bool;
+let is_var_any t = match t { Term.var(_, _) => true, _ => false };
+
+/// Whether `t` does something to the list on the way to its answer: an
+/// operation, a composite, an append.
+let doing : Tx -> Term -> :bool;
+let rec doing x t = match t {
+    Term.var(n, _) => false,
+    Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), ..args]) => produces x t && not (is_var_any t),
+    Term.prim(:add, _, _, _, _, _) => appended x t != (),
+    Term.prim(:if, _, _, _, _, [_, y, z]) => doing x y || doing x z,
+    Term.block(_, ss) => match list.reverse ss { [Stmt.expr(l), .._] => doing x l, _ => false },
+    _ => false,
+};
+
+/// What the pass reads of an image's association lists, for looking at by
+/// hand: the globals it takes for operations and for composites.
+let debug_assocs : ir.Image -> :any;
+let debug_assocs img0 = {
+    let [img, small] = with_small_ints img0;
+    let rd = sc.read img;
+    let globals = array.of_list (ir.Image.globals img);
+    let strs = array.of_list (ir.Image.strs img);
+    let global_of = %{};
+    let id name = match builtins.id name { () => -1, i => i };
+    let ids = list.fold (fn m n -> m.[n => id n]) %{} ["_match_is_cons", "_match_head", "_match_tail"];
+    let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
+                         (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
+                         (global_named img strs "std.list" "last") (global_named img strs "std.list" "reverse_from")
+                         (global_named img strs "std.list" "take") (global_named img strs "std.list" "sort") small %{}
+                         (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{} %{} %{} %{};
+    let functions = list.filter (fn [_, g] -> g.[:kind else -1] == ir.global_function) (list.enumerate (ir.Image.globals img));
+    let named gi = strs.[(globals.[gi]).[:name else 0]];
+    list.filter (fn x -> x != ()) (list.map (fn [gi, g] -> match assoc_op p (g.[:target else -1]) gi {
+        () => (),
+        op => [named gi, AssocOp.kind op],
+    }) functions)
 };
