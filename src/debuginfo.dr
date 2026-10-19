@@ -1,0 +1,100 @@
+// What a debugger can be told that the program itself never needs: the name
+// each slot of each function was written as. Written into an image only when
+// a build asks -- `--debug-info`, or `debug = true` in a manifest's `[build]`
+// or profile, which is how `mind` asks -- so a program built for running
+// carries none of it. The VM's debugger (`dream --debug`, dream/src/debug.hpp)
+// shows a frame by these names when they are there, and by slot when not.
+//
+// Read off the resolution rather than threaded through lowering: every use of
+// a local is resolved to its slot and the span of its binder
+// (`scope.Meaning.local`), the binder's text is the name, and the function
+// the slot belongs to is the innermost one whose span holds the binder. A
+// build in parts keeps each part's references in the part
+// (`scope.merge_parts`), so they are read from every part. A
+// local nothing reads is never resolved, and has no name here -- nor any
+// value worth showing.
+
+import std.char;
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.ast;
+import dreams.diag;
+import dreams.ir;
+import dreams.modules;
+import dreams.scope;
+
+/// `[function, slot, name]` for every local a function's body reads, in
+/// order. A function is its index in the image, which is its index in the
+/// resolution (`lower.link_funcs`).
+let local_names : modules.Loader -> scope.Resolution -> [[:integer, :integer, :string]];
+let local_names l r = {
+    let by_source = list.fold (fn m [i, f] -> {
+        let s = scope.Function.source f;
+        m.[s => list.cons [i, f] (m.[s else []])]
+    }) %{} (list.enumerate (scope.funcs r));
+    let named = list.fold (fn acc [key, meaning] -> match meaning {
+        scope.Meaning.local(slot, bound) => {
+            // The file the use is in: a key is `(context, source, start)`
+            // packed (`scope.ref_key`), and a binder is in the same file.
+            let source = (key / 4294967296) % 65536;
+            match [innermost (by_source.[source else []]) (ast.span_start bound), name_at l source bound] {
+                [fi, name] if fi >= 0 && name != "" => acc.[[fi, slot] => name],
+                _ => acc,
+            }
+        },
+        _ => acc,
+    }) %{} (list.concat (list.map (fn part -> map.pairs (scope.Resolution.refs part))
+                                  (match scope.Resolution.parts r { () => [r], ps => list.cons r ps })));
+    list.sort (list.map (fn [[fi, slot], name] -> [fi, slot, name]) (map.pairs named))
+};
+
+/// The smallest function's index whose span holds offset `at`, or -1.
+let innermost : [[:integer, :any]] -> :integer -> :integer;
+let innermost fs at = {
+    let holding = list.filter (fn [_, f] -> {
+        let sp = scope.Function.span f;
+        ast.span_start sp <= at && at < ast.span_end sp
+    }) fs;
+    match list.sort_on (fn [_, f] -> ast.span_end (scope.Function.span f) - ast.span_start (scope.Function.span f)) holding {
+        [] => -1,
+        [[i, _], .._] => i,
+    }
+};
+
+/// The text of a binder in file `source`: a name, or `""` when the span is
+/// not one -- a pattern, or text a macro made that is not in the file.
+let name_at : modules.Loader -> :integer -> ast.Span -> :string;
+let name_at l source bound = match modules.file_at l source {
+    () => "",
+    src => {
+        let text = diag.source_text src;
+        let [from, to] = [ast.span_start bound, ast.span_end bound];
+        if from < 0 || to > str.byte_length text || to <= from || to - from > 64 { "" }
+        else {
+            let name = str.slice from (to - from) text;
+            if list.all (fn c -> char.is_alnum c || c == '_' || c == '!' || c == '?') (str.chars name) { name } else { "" }
+        }
+    },
+};
+
+/// The image with its locals' names: each name in the string table once, and
+/// a record per local naming it (`emit.locl_section`).
+let with_local_names : ir.Image -> [[:integer, :integer, :string]] -> ir.Image;
+let with_local_names img names = {
+    let strs = ir.Image.strs img;
+    let fresh = list.unique (list.map (fn [_, _, n] -> n) names);
+    let index = list.fold (fn m [i, n] -> m.[n => list.length strs + i]) %{} (list.enumerate fresh);
+    img |> ir.Image.set_strs (list.append strs fresh)
+        |> ir.Image.set_locals (list.map (fn [fi, slot, n] -> [fi, slot, index.[n]]) names)
+};
+
+when test {
+    import std.test;
+    let tests = [
+        test.case "a function's locals, by slot"
+            $( test.eq! [0, -1] [innermost [[0, scope.Function.new () |> scope.Function.set_span [0, 10]]] 5,
+                                 innermost [[0, scope.Function.new () |> scope.Function.set_span [0, 10]]] 12] ),
+    ];
+}

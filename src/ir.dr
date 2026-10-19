@@ -289,6 +289,9 @@ mapping Image {
     integer_params = []
     // `[key, value]` per VM setting the root package asks for; see `emit.vm_sections`.
     vm_options = []
+    // `[function, slot, name string]` per local, for a debugger, when a build
+    // asks for it (`debuginfo`); see `emit.locl_section`.
+    locals = []
 }
 
 /// `Node(op, flags, a, b, c)`. The VM's record also carries a 16-bit `aux`

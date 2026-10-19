@@ -28,6 +28,7 @@ import std.list;
 import std.str;
 import std.path;
 
+import dreams.debuginfo;
 import dreams.diag;
 import dreams.emit;
 import dreams.ir;
@@ -89,6 +90,9 @@ mapping Options {
     // done in between (`--sc-roundtrip`, `dreams/src/sc.dr`), `:drive` to
     // drive it (`--supercompile`, `dreams/src/drive.dr`).
     supercompile = ()
+    // Write what a debugger reads -- the name of each function's locals
+    // (`--debug-info`, `dreams/src/debuginfo.dr`) -- into the image.
+    debug_info = false
 }
 
 /// The defaults: checked, shared, no payload.
@@ -98,7 +102,7 @@ let options = Options.new ();
 /// The REPL's: a scratch image that runs once, compiled as `lower` left it and
 /// held to nothing a session has not always been held to.
 let scratch : Options;
-let scratch = Options.make false false [] false [] () false [] ();
+let scratch = Options.make false false [] false [] () false [] () false;
 
 // --- a build --------------------------------------------------------------------
 
@@ -562,8 +566,15 @@ let finish b built = {
         |> ir.Image.set_float_params (hints typecheck.Analysis.float_params)
         |> ir.Image.set_integer_params (hints typecheck.Analysis.integer_params)
         |> ir.Image.set_vm_options (vm_options (Build.loader b))
+        |> named_locals b
         |> remap_sources (Options.remap o)
 };
+
+/// The image with its locals' names, when the build asked for them.
+let named_locals : Build -> ir.Image -> ir.Image;
+let named_locals b img =
+    if not (Options.debug_info (Build.options b)) { img }
+    else { debuginfo.with_local_names img (debuginfo.local_names (Build.loader b) (Build.resolution b)) };
 
 // --- reproducible paths -----------------------------------------------------------
 //

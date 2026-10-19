@@ -171,7 +171,7 @@ let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 /// here: they are measured, which takes the files, and only a build does that.
 let compile_options o =
     compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true)
-                         (list.map remap_spec (o.[:remaps else []])) (supercompiling o);
+                         (list.map remap_spec (o.[:remaps else []])) (supercompiling o) (opt o :debug_info == true);
 
 /// What the supercompiler is asked to do. A release build drives by default
 /// -- `--release`, or `-D release`, which is how `mind build --release` says
@@ -223,7 +223,7 @@ let show_packages! ps = {
 
 /// The execution trees the program lowers to.
 let show_ir! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] ());
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] () false);
     let low = lower.lower_program r;
     let ds = list.append (modules.diags l) (lower.all_diags r low);
     if diag.error_count ds > 0 { print_diags! (modules.files l) ds }
@@ -484,7 +484,7 @@ let build! l out shebang depfile specs said stats kept o = {
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
 let show_stats! l = {
-    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] ());
+    let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] () false);
     let lowered = lower.image (lower.lower_program r);
     let img = optimizer.optimize lowered;
     let count! label n = console.print! (label + str.repeat (12 - str.byte_length label) " "
@@ -942,6 +942,7 @@ let rec parse_args args o =
         ["--no-opt", ..rest] => parse_args rest (with_opt :no_opt true o),
         ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :supercompile :roundtrip o),
         ["--supercompile", ..rest] => parse_args rest (with_opt :supercompile :drive o),
+        ["--debug-info", ..rest] => parse_args rest (with_opt :debug_info true o),
         ["--no-supercompile", ..rest] => parse_args rest (with_opt :supercompile :none o),
         ["--sc-stats", ..rest] => parse_args rest (with_opt :sc_stats true o),
         ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,
@@ -1015,6 +1016,7 @@ let usage! () = {
         "  --no-supercompile        compile the program as written, even for a release",
         "  --sc-roundtrip           take the image through the supercompiler's core and back",
         "  --sc-stats               say what the supercompiler decided, and where code grew",
+        "  --debug-info             name each function's locals in the image, for `dream --debug`",
         "  --remap-path-prefix FROM=TO",
         "                           record source paths that begin with FROM as",
         "                           beginning with TO, so the image does not depend on",

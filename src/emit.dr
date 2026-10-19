@@ -157,6 +157,7 @@ let t_lnam = tag 76 78 65 77;   // LNAM
 let t_ityp = tag 73 84 89 80;   // ITYP
 let t_type = tag 84 89 80 69;   // TYPE
 let t_vmop = tag 86 77 79 80;   // VMOP
+let t_locl = tag 76 79 67 76;   // LOCL
 
 /// The keys of `VMOP` records. The VM ignores a key it does not know, so a
 /// setting added here is one an older VM runs without.
@@ -314,6 +315,16 @@ let vm_sections options =
                  (list.length options)]
     };
 
+/// `LOCL`, or nothing: one 12-byte record per local a debug build names --
+/// the function, the slot and the name's string -- and nothing at all for a
+/// build that asked for none (`--debug-info`, `dreams/src/debuginfo.dr`).
+let locl_section locals =
+    if list.is_empty locals { [] }
+    else {
+        [section t_locl (concat_map (fn e -> u32 (list.nth 0 e) + u32 (list.nth 1 e) + u32 (list.nth 2 e)) locals)
+                 (list.length locals)]
+    };
+
 /// Every section, in the order a reader meets them.
 let sections_of img = {
     let strs = ir.Image.strs img;
@@ -338,6 +349,7 @@ let sections_of img = {
     list.concat [base, type_sections t_type (ir.Image.float_params img),
                  type_sections t_ityp (ir.Image.integer_params img),
                  vm_sections (ir.Image.vm_options img),
+                 locl_section (ir.Image.locals img),
                  data_sections (ir.Image.payloads img) (ir.Image.payload_names img)]
 };
 
