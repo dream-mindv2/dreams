@@ -1,0 +1,48 @@
+// A design, not a loop: an inventory kept as a list of [name, quantity]
+// pairs, added to by one function, searched by two, replaced in by a third,
+// and threaded through a loop that chooses between two more -- quadratic as
+// written, and no one function of it the shape of anything. The supercompiler
+// keeps the list as a trunk wherever it goes ("A design, rewritten" in
+// docs/notes/supercompilation.md).
+//
+// And exactly: a loop that does not start from `[]` runs as written, and a
+// key filed by a single step is never evaluated, as it never is as written.
+import std.console;
+import std.list;
+
+let rec find_qty name items = match items {
+    [] => 0,
+    [[n, q], ..rest] => if n == name { q } else { find_qty name rest },
+};
+let rec has_item name items = match items {
+    [] => false,
+    [[n, _], ..rest] => if n == name { true } else { has_item name rest },
+};
+let rec set_qty name q items = match items {
+    [] => [],
+    [[n, old], ..rest] => if n == name { list.cons [n, q] rest } else { list.cons [n, old] (set_qty name q rest) },
+};
+let add_stock name q items =
+    if has_item name items { set_qty name (find_qty name items + q) items }
+    else { list.append items [[name, q]] };
+let take_stock name q items = {
+    let have = find_qty name items;
+    if have >= q { set_qty name (have - q) items } else { items }
+};
+let rec run i n !items =
+    if i >= n { items }
+    else {
+        let name = "item" + to_string ((i * 7919) % (n / 3 + 1));
+        let next = if i % 5 == 4 { take_stock name 1 items } else { add_stock name 2 items };
+        run (i + 1) n next
+    };
+let rec once i n key !items = if i >= n { items } else { once (i + 1) n key (add_stock key 1 items) };
+let main! = {
+    let items = run 0 4000 [];
+    console.print! (list.length items);
+    console.print! (list.fold (fn total [_, q] -> total + q) 0 items);
+    console.print! (find_qty "item7" items);
+    console.print! (run 0 20 [["item3", 100], ["kept", 1]]);
+    let none = list.length (list.filter (fn x -> x > 9) [1, 2]);
+    console.print! (list.length (once 0 1 (1 / none) []))
+};

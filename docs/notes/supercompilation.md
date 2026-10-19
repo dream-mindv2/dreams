@@ -512,3 +512,62 @@ a slot without knowing when each thunk dies. That is a liveness analysis
 over suspensions, and until there is one, functions that share slots are
 not driven (`View.reuses`). The supercompiler's 5% of the compiler's
 reductions was not worth its frames.
+
+## A design, rewritten (2026-10-19)
+
+Everything above rewrites a loop: one function, a shape it has, the shape
+made fast. A program designed badly is slow in a way no loop of it shows.
+`tests/sc/inventory` keeps an inventory as a list of `[name, quantity]`
+pairs: `add_stock` asks `has_item` and then calls `set_qty` or appends,
+`take_stock` asks `find_qty` and calls `set_qty`, and `run` threads the list
+through one or the other a step at a time. Every step is a scan, and none of
+the five functions is a loop with an accumulator in it.
+
+`accum.designed` rewrites the list, wherever it goes:
+
+- `assoc_op` reads a function as an operation on an association list from
+  the `match` it is lowered to: a *lookup* (`find_qty`, `has_item`: the
+  first pair whose key is `w`, the value for none) or a *replace*
+  (`set_qty`; with `[w, init]` added when there is none it is `bump`). Its
+  tests are read by evaluating them on the two lists they must tell apart,
+  `[]` and `[[k, v], ..rest]`, not by matching how they are written.
+- `composite_of` finds the small functions between them -- not recursive,
+  pure, handing a parameter to an operation or another composite -- and the
+  rewrite takes each in where it is called, its arguments bound lazily, so
+  what it does to the list is done to the trunk.
+- The loop's list is "a trunk, or the list as written": every operation
+  looks at which it was given, and the loop's body is translated term by
+  term (`tr`, `tp`) with each operation standing where it was written, its
+  arguments as lazy as they were.
+
+Exact an operation at a time, which is what lets it apply to code that
+cannot be proved anything about as a whole. A trunk is made only from `[]`
+and grows only by the pairs the program writes. A lookup forces what the
+scan forces. A replace finds its pair through the lookup made before it of
+the same key in the same version, which the version remembers
+(`TrunkObj::memo_key`, `_trunk_recall`); without one it hands the list as
+written to the function as written, and the loop goes on as written.
+
+Three things the measurement found, each a quadratic of its own:
+
+- **The memo belongs to the version, not the process.** First it was the
+  process's last lookup. The program's laziness defeats that: `set_qty`'s
+  new quantity is `find_qty name items + q`, a suspension that is forced
+  steps later and looks its key up in the version it was made against --
+  an old one, which no index covers, so the trunk rerooted onto it and the
+  next write copied it back. A version remembers its own last lookup, so
+  that lookup is answered without a search.
+- **Hand the trunk a pair already made.** `_trunk_set` takes its value
+  lazily, and a suspension written in the middle of an index can only drop
+  it: every replace dropped the index and every lookup rebuilt it. Making a
+  list of two forces nothing, and its key was forced by the lookup that
+  found it.
+- **A pattern that binds no value**, `[[n, _], ..rest]`, binds nothing for
+  it; `has_item` was taken for no lookup at all until the value became
+  optional, and every step turned the trunk back into a list.
+
+| inventory, n steps | as written | supercompiled |
+|---|---|---|
+| 4,000 | 1,020 ms | 10 ms |
+| 16,000 | -- | 50 ms |
+| 200,000 | -- | 800 ms |
