@@ -68,4 +68,4 @@ let plan ctx =
                |> build.check "sc_roundtrip" (suite ctx "sc_roundtrip" (under_test ctx) "dreams/tests/sc.sh" [])
                |> build.check "bootstrap" (suite ctx "bootstrap" (%{}) "sh" ["-c", bootstrap])
                |> build.check "corpus" (suite ctx "corpus" (under_test ctx) "sh" ["-c", corpus]))
-              ["macros", "optional_types", "static_types", "bitwise", "type_codegen", "contracts", "core_primitives", "modules", "pitfall_warnings"];
+              ["macros", "optional_types", "static_types", "bitwise", "type_codegen", "contracts", "core_primitives", "modules", "pitfall_warnings", "impure_calls"];

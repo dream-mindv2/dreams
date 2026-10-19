@@ -204,6 +204,11 @@ let is_lent e n = map.has n (Environment.lent e);
 
 let has_global : Environment -> :string -> :bool;
 let has_global e n = map.has n (globals e);
+
+/// An explicitly declared effectful member wins; otherwise its pure
+/// implementation can be called with the same `!` spelling.
+let member_name : Environment -> :string -> :string;
+let member_name e n = if has_global e n { n } else { builtins.pure_name n };
 let alias_of e n   = (aliases e).[n else ()];
 let only_of e n    = (only e).[n else ()];
 
@@ -466,7 +471,7 @@ let rec declare_import_names mi r p names span s =
         let bound = default_alias [list.nth 0 sel] (list.nth 1 sel);
         let inaccessible = match r {
             Ref.dream(target) => target != mi && has_env acc target
-                && is_private (env_at acc target) (list.nth 0 sel),
+                && is_private (env_at acc target) (member_name (env_at acc target) (list.nth 0 sel)),
             _ => false,
         };
         if inaccessible {
@@ -494,7 +499,7 @@ let rec declare_import l mi imp s = {
        && list.length written > 1 && modules.find l parent != () {
         let owner = modules.find l parent;
         let member = list.last written;
-        if has_env s owner && not (has_global (env_at s owner) member) {
+        if has_env s owner && not (has_global (env_at s owner) (member_name (env_at s owner) member)) {
             complain span ("module `" + parent + "` has no member `" + member + "`")
                      (env_source e) s
         }
@@ -1646,16 +1651,17 @@ let check_member c r_ref shown field span r = {
         match r_ref {
             Ref.dream(target) => {
                 let e = env_of c r target;
-                if is_private e field && not (encloses (ctx_env c r) (ctx_mi c) target) {
+                let actual = member_name e field;
+                if is_private e actual && not (encloses (ctx_env c r) (ctx_mi c) target) {
                     report c span ("member `" + shown + "." + field + "` is private") r
                 }
-                else if has_global e field {
+                else if has_global e actual {
                     // The global index, so lowering has nothing left to look
                     // up: a cross-module call is one index by the time the
                     // image is written, which is the whole point of compiling
                     // the program as a whole.
                     record (ctx_mi c) (ctx_source c) span
-                           (Meaning.member r_ref field (global_index e field)) r
+                           (Meaning.member r_ref field (global_index e actual)) r
                 }
                 else {
                     report_note c span
@@ -1837,8 +1843,17 @@ let primitive_named c name span r =
              }) r
     };
 
-let check_name c name span r = {
+/// Try the exact spelling across the whole scope before dropping `!`. This
+/// keeps existing effectful functions and imports ahead of the fallback.
+let bound_name : Environment -> Resolution -> :string -> :bool;
+let bound_name e r n = in_scope r n || has_global e n || builtins.is_builtin n
+    || only_of e n != () || (Environment.overloads e).[n else ()] != () || alias_of e n != ();
+
+let check_name c written span r = {
     let e = ctx_env c r;
+    let name = if builtins.is_impure_name written && not (bound_name e r written) {
+        builtins.pure_name written
+    } else { written };
     let found = resolve_in_frames name r;
     let r0 = list.head found;
     let r1 =
@@ -1875,7 +1890,7 @@ let check_name c name span r = {
                                 // the name does not exist.
                                 Ref.dream(_) => not_a_value c (Ref.dream 0) name span r0,
                                 _ => report c span
-                                         ("cannot find `" + name + "` in this scope") r0,
+                                         ("cannot find `" + written + "` in this scope") r0,
                             },
                         },
                         sel => check_member c (list.nth 0 sel) (list.nth 2 sel) (list.nth 1 sel)
@@ -1884,10 +1899,10 @@ let check_name c name span r = {
                 },
             local => record (ctx_mi c) (ctx_source c) span local r0,
         };
-    if builtins.is_impure_name name {
+    if builtins.is_impure_name written {
         // `receive!` is syntax, and what it becomes calls this; say what was
         // written (see `syntax.receive_e`).
-        let shown = if name == "__receive_start!" { "a `receive!`" } else { "the impure function `" + name + "`" };
+        let shown = if written == "__receive_start!" { "a `receive!`" } else { "the impure function `" + written + "`" };
         note_effect c span shown r1
     }
     else { r1 }
