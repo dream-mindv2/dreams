@@ -1,0 +1,38 @@
+// An inventory kept as a list of [name, quantity] pairs, the database of a
+// first design: added to by one function, searched by another, changed by a
+// third, reported by a fourth, and threaded through all of them.
+import std.console;
+import std.list;
+
+let rec find_qty name items = match items {
+    [] => 0,
+    [[n, q], ..rest] => if n == name { q } else { find_qty name rest },
+};
+let rec has_item name items = match items {
+    [] => false,
+    [[n, _], ..rest] => if n == name { true } else { has_item name rest },
+};
+let rec set_qty name q items = match items {
+    [] => [],
+    [[n, old], ..rest] => if n == name { list.cons [n, q] rest } else { list.cons [n, old] (set_qty name q rest) },
+};
+let add_stock name q items =
+    if has_item name items { set_qty name (find_qty name items + q) items }
+    else { list.append items [[name, q]] };
+let take_stock name q items = {
+    let have = find_qty name items;
+    if have >= q { set_qty name (have - q) items } else { items }
+};
+let rec run i n !items =
+    if i >= n { items }
+    else {
+        let name = "item" + to_string ((i * 7919) % (n / 3 + 1));
+        let next = if i % 5 == 4 { take_stock name 1 items } else { add_stock name 2 items };
+        run (i + 1) n next
+    };
+let main! = {
+    let items = run 0 N [];
+    console.print! (list.length items);
+    console.print! (list.fold (fn total [_, q] -> total + q) 0 items);
+    console.print! (find_qty "item7" items)
+};
