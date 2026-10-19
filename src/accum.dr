@@ -49,6 +49,11 @@
 //   first beside it and turned around once when the front runs out, the
 //   queue of two lists (`queue`).
 //
+// - **An association list kept by a function that updates it**, `go ..
+//   (bump w acc)` where `bump` finds `w`'s pair and replaces it, or adds one
+//   at the end: a scan each step. The list is a trunk instead, and each
+//   update is a lookup through its index (`upserted`).
+//
 // And one that is worse than quadratic: **tree recursion**, `fib (n - 1) +
 // fib (n - 2)`, the same smaller calls made again under each call. Its
 // values are kept in a lazy table, one cell for each, so each is made once
@@ -117,6 +122,9 @@ mapping Program {
     // so: `[parameter, path, value first]` (`searcher_shape`).
     keyed
     searchers
+    // Each function that updates an association list (`upsert_shape`), by
+    // global.
+    upserts
 }
 
 /// The image with its slow accumulators written again.
@@ -133,12 +141,13 @@ let accum img0 = {
     let ids = list.fold (fn m n -> m.[n => id n]) %{}
                         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh", "to_string", "len",
                          "_memo_cells", "_match_is_cons", "_match_head", "_match_tail", "_match_fail", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find",
-                         "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop"];
+                         "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop",
+                         "_trunk_of", "_trunk_to_list", "_trunk_lookup", "_trunk_at", "_trunk_push", "_trunk_set"];
     let p = Program.make rd (array.of_list (ir.Image.funcs img)) globals global_of ids
                          (global_named img strs "std.list" "contains") (global_named img strs "std.list" "append")
                          (global_named img strs "std.list" "last") (global_named img strs "std.list" "reverse_from")
                          (global_named img strs "std.list" "take") (global_named img strs "std.list" "sort") small %{}
-                         (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{};
+                         (array.of_list (ir.Image.ints img)) %{} %{} %{} %{} %{} %{};
     let ints = Program.ints p;
     let scans = list.fold (fn m [gi, g] -> match scan_shape p ints g.[:target else -1] gi {
         () => m,
@@ -169,6 +178,10 @@ let accum img0 = {
         shape => m.[gi => shape],
     }) %{} functions) p;
     let p = Program.set_aggregates (list.fold (fn m [gi, g] -> match aggregate_shape p folds (g.[:target else -1]) {
+        () => m,
+        shape => m.[gi => shape],
+    }) %{} functions) p;
+    let p = Program.set_upserts (list.fold (fn m [gi, g] -> match upsert_shape p (g.[:target else -1]) gi {
         () => m,
         shape => m.[gi => shape],
     }) %{} functions) p;
@@ -285,7 +298,7 @@ let rewritten p fi wfi wgi = {
         let body = sc.renamed (sc.body_of (Program.reading p) f);
         let site = Site.make p fi wfi wgi gi k body;
         first_of [fn () -> grown_accumulator site, fn () -> appended_result site, fn () -> member_set site,
-                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site,
+                  fn () -> tallied site, fn () -> indexed site, fn () -> consed_last site, fn () -> prefix_folded site, fn () -> heaped site, fn () -> queue site, fn () -> upserted site,
                   fn () -> memo_table site]
     }
 };
@@ -303,7 +316,8 @@ let rewritten_before p body = {
     let written = list.filter (fn b -> b >= 0) (list.map (fn n -> ids.[n else -1])
         ["_append_rev", "_rev_onto", "_str_append_rev", "_set_of", "_set_add", "_set_lookup", "_set_refresh",
          "_memo_cells", "_tally", "_tally_lookup", "_list_drop", "_index_new", "_index_find",
-         "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop"]);
+         "_heap_of", "_heap_push", "_heap_empty", "_heap_min", "_heap_pop",
+         "_trunk_of", "_trunk_lookup", "_trunk_push", "_trunk_set"]);
     list.any (fn t -> match t {
         Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), .._]) => list.contains b written,
         _ => false,
@@ -1044,7 +1058,8 @@ let queue_at site j = {
         Term.lam(_, _, _, caps) => not (list.any (fn n -> list.contains n caps) (list.append aliases rests)),
         Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x])
             if is_alias x && (b == ids.["_match_is_cons"] || b == ids.["_match_head"] || b == ids.["_match_tail"]) => true,
-        Term.prim(op, _, _, _, _, [x]) if is_alias x && (op == :type_is || op == :list_is_empty || op == :list_tail) => true,
+        Term.prim(op, _, _, _, _, [x]) if is_alias x && (op == :type_is || op == :list_is_empty || op == :list_tail
+                                                         || op == :list_is_cons || op == :list_head) => true,
         Term.prim(:get, _, _, _, _, [x, Term.prim(:const_int, _, i, _, _, _), Term.absent]) if is_alias x && (Program.ints p).[i] == 0 => true,
         // A `match` that fails names what it was handed. It fails only on
         // what is not a list, which the queue never is while anything is
@@ -1827,5 +1842,279 @@ let heaped_at site j = {
         let params = list.map (fn i -> if i == j { builtin p "_heap_of" [Term.var q 0] } else { Term.var (sc.slot_name i) 0 }) (list.range 0 k);
         let wrapper = sc.fun_of f (Term.block 0 (list.append (hoist.strict_reads body) [Stmt.expr (call (Site.wgi site) params)]));
         [wrapper, worker, ((Program.globals p).[gi]).[:target => Site.wfi site]]
+    }
+};
+
+// --- an association list kept by a function that updates it ------------------------
+
+/// What `upsert_shape` reads of a function that updates an association list:
+/// its list and key parameters' positions, the value a new pair starts with,
+/// and the key and value of the pair that replaces one found -- each a term
+/// over `k`, `v` and `w`, the names the found pair's key and value and the
+/// key asked for have in its body.
+group Upsert { li : :integer, wi : :integer, init, key, value, k : :string, v : :string, w : :string }
+
+/// Whether function `fi`, called through global `gi`, is the update of an
+/// association list a first draft writes:
+///
+///     let rec bump w xs = match xs {
+///         [] => [[w, 1]],
+///         [[k, n], ..rest] => if k == w { [k, n + 1] :: rest } else { [k, n] :: bump w rest },
+///     }
+///
+/// Read off the `match` as it is lowered: the list bound strictly, a test
+/// that holds of `[]` and not of a pair's cell, a test that holds of a cell
+/// whose head is a pair (each made of type and cell tests along heads and
+/// tails, and evaluated on both to say so, rather than matched as written),
+/// the pair taken apart, and the comparison. What a new pair starts with and
+/// what a found one becomes may read only the key and the found pair, and
+/// bind nothing, since they are moved into another function's frame.
+let upsert_shape : Program -> :integer -> :integer -> Upsert | :unit;
+let upsert_shape p fi gi =
+    if fi < 0 || fi >= array.length (Program.funcs p) { () }
+    else {
+        let f = (Program.funcs p).[fi];
+        if f.[:arity else 0] != 2 || f.[:n_captures else 0] > 0 || ir.has_flag (f.[:flags else 0]) ir.fn_impure { () }
+        else {
+            let ids = Program.ids p;
+            let [hd, tl, is_cons] = [ids.["_match_head"], ids.["_match_tail"], ids.["_match_is_cons"]];
+            // The steps from the list to a term -- `:h` a head, `:t` a tail --
+            // or `()` for a term that is not one.
+            let rec path s t = match t {
+                Term.var(n, _) => if n == s { [] } else { () },
+                Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x]) if b == hd || b == tl =>
+                    match path s x { () => (), steps => list.append steps [if b == hd { :h } else { :t }] },
+                Term.prim(op, _, _, _, _, [x]) if op == :list_head || op == :list_tail =>
+                    match path s x { () => (), steps => list.append steps [if op == :list_head { :h } else { :t }] },
+                _ => (),
+            };
+            // What the list's part at those steps is, in a model: `:empty`, the
+            // list `[]`, or `:pair`, a cell whose head is `[k, v]`. `:cons`,
+            // `:nil`, or `()` for a part whose shape the model does not fix.
+            let shape model steps = match [model, steps] {
+                [:empty, []] => :nil,
+                [:pair, []] => :cons,
+                [:pair, [:h]] => :cons,
+                [:pair, [:h, :t]] => :cons,
+                [:pair, [:h, :t, :t]] => :nil,
+                _ => (),
+            };
+            let rec holds s model t = match t {
+                Term.prim(:and, _, _, _, _, [x, y]) => match [holds s model x, holds s model y] {
+                    [true, true] => true,
+                    [false, _] => false,
+                    [_, false] => false,
+                    _ => (),
+                },
+                Term.prim(:not, _, _, _, _, [x]) => match holds s model x { () => (), b => not b },
+                Term.prim(:const_bool, _, b, _, _, _) => b == 1,
+                Term.prim(:type_is, _, _, 7, 0, [x]) => match path s x {
+                    () => (),
+                    steps => match shape model steps { () => (), _ => true },
+                },
+                Term.prim(:list_is_empty, _, _, _, _, [x]) => match path s x {
+                    () => (),
+                    steps => match shape model steps { () => (), sh => sh == :nil },
+                },
+                Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x]) if b == is_cons => match path s x {
+                    () => (),
+                    steps => match shape model steps { () => (), sh => sh == :cons },
+                },
+                Term.prim(:list_is_cons, _, _, _, _, [x]) => match path s x {
+                    () => (),
+                    steps => match shape model steps { () => (), sh => sh == :cons },
+                },
+                _ => (),
+            };
+            let [l, w] = [sc.slot_name 0, sc.slot_name 1];
+            // The list is either parameter; the key is the other.
+            let entry = match unwrap (sc.body_of (Program.reading p) f) {
+                Term.block(_, [Stmt.bind(s, _, Term.var(n, _)), Stmt.expr(e)]) => [s, n, unwrap e],
+                _ => (),
+            };
+            match entry {
+                () => (),
+                [s, ln, e] => {
+                    let li = if ln == l { 0 } else if ln == w { 1 } else { -1 };
+                    let wn = if li == 0 { w } else { l };
+                    let bindless t = {
+                        let [terms, stmts] = hoist.parts t;
+                        list.is_empty stmts && list.all (fn x -> match x {
+                            Term.lam(_, _, _, _) => false,
+                            Term.trying(_, _, _, _) => false,
+                            Term.block(_, _) => false,
+                            _ => true,
+                        }) terms
+                    };
+                    let only allowed t = bindless t && list.all (fn x -> match x {
+                        Term.var(n, _) => list.contains n allowed,
+                        _ => true,
+                    }) (list.head (hoist.parts t)) && not (names gi t);
+                    match e {
+                        Term.prim(:if, _, _, _, _, [empty_test, empty_branch, rest]) if li >= 0
+                            && holds s :empty empty_test == true && holds s :pair empty_test == false => {
+                            let init = match unwrap empty_branch {
+                                Term.prim(:make_list, _, _, _, _, [Term.prim(:make_list, _, _, _, _, [Term.var(n, _), x])]) if n == wn && only [wn] x => x,
+                                _ => (),
+                            };
+                            match unwrap rest {
+                                Term.prim(:if, _, _, _, _, [pair_test, Term.block(_, stmts), _]) if init != () && holds s :pair pair_test == true => {
+                                    let binds = list.take_while (fn st -> match st { Stmt.bind(_, _, _) => true, _ => false }) stmts;
+                                    let named = list.fold (fn m st -> match st {
+                                        Stmt.bind(n, _, x) => match path s x {
+                                            [:h, :h] => m.[:k => n],
+                                            [:h, :t, :h] => m.[:v => n],
+                                            [:t] => m.[:r => n],
+                                            _ => m.[:other => n],
+                                        },
+                                        _ => m,
+                                    }) %{} binds;
+                                    let [k, v, r] = [named.[:k else ()], named.[:v else ()], named.[:r else ()]];
+                                    let compared x y = (is_var k x && is_var wn y) || (is_var wn x && is_var k y);
+                                    match list.drop (list.length binds) stmts {
+                                        [Stmt.expr(Term.prim(:if, _, _, _, _, [Term.prim(:eq, _, _, _, _, [a, b]), found, missed]))]
+                                            if k != () && v != () && r != () && not (map.has :other named) && compared a b => {
+                                            let replaced = match unwrap found {
+                                                Term.prim(:cons, _, _, _, _, [Term.prim(:make_list, _, _, _, _, [kt, vt]), Term.var(rn, _)])
+                                                    if rn == r && (is_var k kt || is_var wn kt) && only [k, v, wn] vt => [kt, vt],
+                                                _ => (),
+                                            };
+                                            let passed = match unwrap missed {
+                                                Term.prim(:cons, _, _, _, _, [Term.prim(:make_list, _, _, _, _, [kx, vx]),
+                                                                              Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), a0, a1])]) =>
+                                                    g == gi && is_var k kx && is_var v vx
+                                                        && is_var r (if li == 0 { a0 } else { a1 }) && is_var wn (if li == 0 { a1 } else { a0 }),
+                                                _ => false,
+                                            };
+                                            match replaced {
+                                                [kt, vt] if passed => Upsert.make li (1 - li) init kt vt k v wn,
+                                                _ => (),
+                                            }
+                                        },
+                                        _ => (),
+                                    }
+                                },
+                                _ => (),
+                            }
+                        },
+                        _ => (),
+                    }
+                },
+            }
+        }
+    };
+
+/// A loop that hands parameter `j` on as it was or through an update of an
+/// association list (`upsert_shape`), reading it nowhere but where it ends:
+/// the list is a trunk instead, and each update finds its key through the
+/// trunk's index rather than by a scan of the list.
+///
+/// Exact, where it applies. It applies when the loop starts from `[]` --
+/// anything else runs as written, so every element is a pair the loop made
+/// -- and either forces the list at every step (`!acc`) or answers the list
+/// itself wherever it ends. The update as written forces each key it is
+/// given when its own answer is forced, comparing the key with the first
+/// pair's: at the next step, when the list is strict, and all of them in
+/// order when the answer is wanted, when it is lazy -- `std`'s `fold` -- since
+/// each update takes apart the one before. So looking each key up at once
+/// forces nothing the loop would not, but for the very first, which is filed
+/// unevaluated, as `[[w, 1]]` files it (the lookup of an empty trunk forces
+/// nothing). A loop as lazy as that runs only once its answer is wanted. What
+/// moves is when two failures are met against each other: a key that raises
+/// is met before a list being walked that raises later, where as written
+/// the walk raised first. A found pair is replaced by the pair as written, its key and
+/// value read out of the pair found; a new one is pushed at the end, where
+/// the list as written adds it. Where the loop ends, the list is the trunk's
+/// elements.
+let upserted : Site -> [Fun, Fun, :map] | :unit;
+let upserted site =
+    if map.size (Program.upserts (Site.program site)) == 0 { () }
+    else { first_of (list.map (fn j -> fn () -> upserted_at site j) (list.range 0 (Site.k site))) };
+
+let upserted_at : Site -> :integer -> [Fun, Fun, :map] | :unit;
+let upserted_at site j = {
+    let p = Site.program site;
+    let gi = Site.gi site;
+    let acc = sc.slot_name j;
+    let body = Site.body site;
+    let ups = Program.upserts p;
+    let strict = list.any (fn st -> match st {
+        Stmt.expr(Term.var(n, fl)) => n == acc && ir.has_flag fl ir.f_strict,
+        Stmt.expr(Term.prim(:force, _, _, _, _, [Term.var(n, _)])) => n == acc,
+        _ => false,
+    }) (hoist.strict_reads body);
+    let update arg = match arg {
+        Term.prim(:apply, _, _, _, _, [Term.prim(:global, _, g, _, _, _), a0, a1]) => match ups.[g else ()] {
+            () => (),
+            u => {
+                let args = [a0, a1];
+                let key = list.nth (Upsert.wi u) args;
+                if is_var acc (list.nth (Upsert.li u) args) && not (reads acc key) && not (names gi key) { [u, key] } else { () }
+            },
+        },
+        _ => (),
+    };
+    let ls = leaves body;
+    let self_calls = list.filter (fn l -> hoist.self_call gi l) ls;
+    // Or the loop answers the list itself wherever it ends, so whatever
+    // forces its answer forces every update made, and with them every key.
+    let answered = list.all (fn l -> hoist.self_call gi l || is_var acc l) ls;
+    let fits = (strict || answered) && not (list.is_empty self_calls) && list.all (fn l -> {
+        let args = self_args l;
+        let arg = list.nth j args;
+        (is_var acc arg || update arg != ())
+            && list.all (fn [i, x] -> i == j || not (reads acc x)) (list.enumerate args)
+            && list.all (fn [i, x] -> i == j || not (names gi x)) (list.enumerate args)
+    }) self_calls
+        && list.all (fn x -> not (reads acc x) && not (names gi x)) (around body)
+        && list.all (fn l -> hoist.self_call gi l || not (names gi l)) ls;
+    let updates = list.filter (fn u -> u != ()) (list.map (fn l -> update (list.nth j (self_args l))) self_calls);
+    if not fits || list.is_empty updates { () }
+    else {
+        let t = "acc_trunk";
+        let zero = Term.prim :const_int 0 ((Program.small_ints p).[0]) ir.no_node ir.no_node [];
+        let one = Term.prim :const_int 0 ((Program.small_ints p).[1]) ir.no_node ir.no_node [];
+        let pair_part i = Term.prim :get 0 ir.no_node ir.no_node ir.no_node [Term.var "up_pair" 0, i, Term.absent];
+        let pair2 x y = Term.prim :make_list 0 ir.no_node 2 ir.no_node [x, y];
+        // A term of the update's, read in the loop: its names as the found
+        // pair's parts and the key looked up.
+        let moved u x = list.head (hoist.rewrite (fn y -> match y {
+            Term.var(n, _) => if n == Upsert.k u { pair_part zero } else if n == Upsert.v u { pair_part one }
+                              else if n == Upsert.w u { Term.var "up_w" 0 } else { () },
+            _ => (),
+        }) %{} x);
+        let updated [u, key] = Term.block 0 [
+            Stmt.bind "up_w" 0 key,
+            Stmt.bind "up_i" ir.f_strict (builtin p "_trunk_lookup" [Term.var "up_w" 0, Term.var t 0]),
+            Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [
+                Term.prim :lt 0 ir.no_node ir.no_node ir.no_node [Term.var "up_i" 0, zero],
+                builtin p "_trunk_push" [pair2 (Term.var "up_w" 0) (moved u (Upsert.init u)), Term.var t 0],
+                Term.block 0 [Stmt.bind "up_pair" 0 (builtin p "_trunk_at" [Term.var "up_i" 0, Term.var t 0]),
+                              Stmt.expr (builtin p "_trunk_set" [Term.var "up_i" 0,
+                                                                pair2 (moved u (Upsert.key u)) (moved u (Upsert.value u)),
+                                                                Term.var t 0])],
+            ]),
+        ];
+        let leaf l = if hoist.self_call gi l {
+            let args = self_args l;
+            let kept = match update (list.nth j args) { () => Term.var t 0, u => updated u };
+            call (Site.wgi site) (list.append args [kept])
+        } else if reads acc l {
+            Term.block 0 [Stmt.bind "acc_whole" 0 (builtin p "_trunk_to_list" [Term.var t 0]),
+                          Stmt.expr (list.head (hoist.rewrite (fn x -> if is_var acc x { Term.var "acc_whole" 0 } else { () }) %{} l))]
+        } else { l };
+        let [wrapper, worker, global] = built site t true (map_leaves leaf body) (builtin p "_trunk_of" [nil]);
+        // The worker only from `[]`: a list the loop did not start empty may
+        // hold what is not a pair, which the update as written raises on and
+        // a lookup passes over.
+        let f = (Program.funcs p).[Site.fi site];
+        let params = list.map (fn i -> Term.var (sc.slot_name i) 0) (list.range 0 (Site.k site));
+        let guarded = sc.fun_of f (Term.block 0 (list.append (hoist.strict_reads body) [
+            Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [
+                Term.prim :list_is_cons 0 ir.no_node ir.no_node ir.no_node [Term.var acc 0],
+                body,
+                call (Site.wgi site) (list.append params [builtin p "_trunk_of" [nil]]),
+            ])]));
+        [guarded, worker, global]
     }
 };

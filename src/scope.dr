@@ -26,6 +26,7 @@
 // then every body is checked against the finished environments.
 
 import std.progress;
+import std.proc;
 import std.list;
 import std.map;
 import std.vm;
@@ -3199,8 +3200,7 @@ let resolve_parts_from! l d cache selections previous keep = {
     // is then nothing a part's walk depends on, so adding one does not make
     // every part another part (see "a part as a unit").
     let base = vm.share! (declared_base |> Resolution.set_next_global invent_base);
-    let common = match cache { () => "", _ => common_key l base };
-    let under = match cache { () => %{}, _ => modules_under l };
+    let keys = match cache { () => (), _ => vm.share! (part_keys! l base) };
     let all = pending declared;
     let numbered = list.zip (list.range 0 (list.length all)) all;
     // One part per module whose bodies it walks, in the order of the modules:
@@ -3213,10 +3213,6 @@ let resolve_parts_from! l d cache selections previous keep = {
     }) (%{}) numbered;
     let slices = strict! (map (fn mi -> list.reverse (by_module.[mi]))
                                    (list.sort (map list.head (map.pairs by_module))));
-    let key_of slice = match cache {
-        () => "",
-        _ => part_key under base common (list.head (list.nth 1 (list.head slice))),
-    };
     let choosing = fold (fn m key -> m.[key / 281474976710656 => true]) %{} (map.keys selections);
     let kept : [Option Resolution] = match previous {
         ps if ps != () && list.length ps == list.length slices =>
@@ -3229,7 +3225,7 @@ let resolve_parts_from! l d cache selections previous keep = {
     // Heaviest first: started in the modules' order, the largest module's walk
     // waited behind lighter ones, and it is the phase's critical path.
     let fresh = progress.join_heaviest_first! "resolving" slice_weight
-                    (fn slice -> walk_elsewhere! cache shared_l base (key_of slice) slice) walking;
+                    (fn slice -> walk_elsewhere! cache shared_l base keys slice) walking;
     stubbed_to (merge_parts declared seeded declared_base (in_order kept fresh)) stubbed
 };
 
@@ -3243,13 +3239,37 @@ let rec in_order kept fresh = match kept {
 };
 
 /// A process walking one part. Its own function so that the suspension
-/// `spawn!` copies holds the loader, the state and the slice -- all shared, or
-/// small -- and nothing else. The cache and the key are strict for the same
-/// reason: handed in unforced, the key was a suspension of the caller's frame,
-/// and every part's process was given a copy of the whole resolution with it
-/// -- 1.7 GB more copied on a self-compile, and twice the time, with no cache
-/// at all.
-let walk_elsewhere! !cache l base !base_key slice = spawn! $( vm.share! (walk_unit! cache l base base_key slice) );
+/// `spawn!` copies holds the loader, the state, what keys are made of and the
+/// slice -- all shared, or small -- and nothing else. The part's key is made
+/// in that process too: made in the root, before each start, the keys of a
+/// warm build were most of its serial time.
+let walk_elsewhere! !cache l base keys slice = spawn! $( vm.share! (walk_unit! cache l base (key_in keys base slice) slice) );
+
+/// What every part's key is made of, made once: the digest every part
+/// shares, the modules under each module, each module's environment as a
+/// digest -- a part's key holds those of every module it can see, and
+/// digested per part the same environments were encoded once for each part
+/// that could see them -- and the selections, by module. Shared by the
+/// caller, which forces all of it.
+let part_keys! : modules.Loader -> :map -> :map;
+let part_keys! l base = {
+    let count = modules.module_count l;
+    let digests = proc.map! (fn t -> unit.digest (env_at base t)) (list.range 0 count);
+    %{
+        :common => common_key l base,
+        :under => modules_under l,
+        :envs => list.fold (fn m [t, d] -> m.[t => d]) (%{}) (list.zip (list.range 0 count) digests),
+        :chosen => chosen_by_module base,
+    }
+};
+
+/// A part's key, in the part's own process; `""` for a build that keeps no
+/// units.
+let key_in : (:map | :unit) -> :map -> [[:any]] -> :string;
+let key_in keys base slice = match keys {
+    () => "",
+    _ => part_key keys base (list.head (list.nth 1 (list.head slice))),
+};
 
 // --- a part as a unit ---------------------------------------------------------------
 //
@@ -3292,23 +3312,32 @@ let common_key l base = unit.digest [
 /// module moves the parts that can see it and not the rest, as long as it
 /// moves no other module's globals: globals are numbered in module order, so
 /// one added early in the program is still seen by nearly every part.
-let part_key : :map -> :map -> :string -> :integer -> :string;
-let part_key under base common mi = {
+let part_key : :map -> :map -> :integer -> :string;
+let part_key keys base mi = {
+    let under = keys.[:under];
     let seen = reached_modules (env_at base mi) (%{ mi => true });
     let visible = list.fold (fn acc key -> list.fold (fn a i -> a.[i => true]) acc (under.[key else []]))
                             seen (map.keys seen);
     let ordered = list.sort (filter (fn t -> type_of t == :integer) (map.keys visible));
-    unit.key ["base", common, unit.digest (map (fn t -> [t, env_at base t]) ordered),
-              unit.digest (chosen_in base mi)]
+    let envs = keys.[:envs];
+    unit.key ["base", keys.[:common], unit.digest (map (fn t -> [t, envs.[t else ""]]) ordered),
+              unit.digest (keys.[:chosen].[mi else []])]
 };
 
-/// The selections made at calls in module `mi`, in key order: all a part's
+/// The selections made at calls in each module, in key order: all a part's
 /// walk reads of them, since a call is looked up by its own module's
 /// `ref_key`, and that key is the module's index above its 48 low bits.
-let chosen_in : :map -> :integer -> [[:integer, :any]];
-let chosen_in base mi =
-    list.sort_on list.head (filter (fn [key, _] -> key / 281474976710656 == mi)
-                                   (map.pairs (Resolution.selections base)));
+/// Grouped once: filtered for each module, it was every selection in the
+/// program read once per module.
+let chosen_by_module : :map -> :map;
+let chosen_by_module base = {
+    let pairs = list.sort_on list.head (map.pairs (Resolution.selections base));
+    let grouped = list.fold (fn m [key, v] -> {
+        let mi = key / 281474976710656;
+        m.[mi => list.cons [key, v] (m.[mi else []])]
+    }) (%{}) pairs;
+    map.map_values list.reverse grouped
+};
 
 /// The modules under each module and each namespace, by the module's index or
 /// the namespace's name: `std` and `std.list` lead to `std.list.sorted`, if

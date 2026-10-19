@@ -138,6 +138,14 @@ let names = [
     "_heap_empty",
     "_heap_min",
     "_heap_pop",
+    // A list the supercompiler keeps as a trunk instead (`upserted`).
+    "_trunk_of",
+    "_trunk_to_list",
+    "_trunk_lookup",
+    "_trunk_at",
+    "_trunk_push",
+    "_trunk_set",
+    "_trunk_recall",
 
 ];
 
@@ -258,6 +266,13 @@ let signatures = %{
     "_heap_empty" => "heap -> whether the list it stands for is empty",
     "_heap_min" => "heap -> the head of the list it stands for, sorted",
     "_heap_pop" => "heap -> the heap of the tail of the list it stands for, sorted",
+    "_trunk_of" => "list -> the trunk of its elements",
+    "_trunk_to_list" => "trunk -> its elements, as a list",
+    "_trunk_lookup" => "key -> trunk -> the position of the first [key, value] element, or -1",
+    "_trunk_at" => "integer -> trunk -> the element there",
+    "_trunk_push" => "value -> trunk -> the trunk with the value after its last element",
+    "_trunk_set" => "integer -> value -> trunk -> the trunk with that element replaced",
+    "_trunk_recall" => "key -> trunk -> what the last lookup found when it was of this key in this version, or ()",
 
 };
 

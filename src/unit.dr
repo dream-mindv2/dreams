@@ -115,7 +115,10 @@ let refresh! at bytes = match io.stat! at {
 
 /// Keep `v` under `kind` and `k`. Written beside and renamed into place, so a
 /// build reading the cache while another writes it sees a whole unit or none,
-/// and two builds writing the same unit write the same bytes.
+/// and two builds writing the same unit write the same bytes. Packed
+/// (`wire.pack`): a part shares its syntax trees between its tables, and
+/// packed, each is written and read back once, a quarter of the bytes, and
+/// shared again in the build that reads it.
 let keep! : Cache -> :string -> :string | :unit -> :any -> :unit;
 let keep! cache kind k v = match cache {
     () => (),
@@ -123,7 +126,7 @@ let keep! cache kind k v = match cache {
         () => (),
         named => {
             file.mkdir_all! dir
-            file.replace! (path dir kind named) (vm.wire_encode v)
+            file.replace! (path dir kind named) (wire.pack v)
         },
     },
 };

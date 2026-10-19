@@ -144,6 +144,9 @@ let ops = [
     /// once per key. See `lower.fuse_set`.
     [:set_many, 82, "set_many"],
     [:ensure, 83, "ensure"],
+    /// What a list pattern asks of `a`: whether it is a cell, and its head,
+    /// entered. `_match_is_cons` and `_match_head` become these (`opt`).
+    [:list_is_cons, 84, "list_is_cons"], [:list_head, 85, "list_head"],
 
 ];
 
