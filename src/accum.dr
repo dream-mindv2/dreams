@@ -1883,6 +1883,8 @@ let upsert_shape p fi gi =
                 Term.var(n, _) => if n == s { [] } else { () },
                 Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x]) if b == hd || b == tl =>
                     match path s x { () => (), steps => list.append steps [if b == hd { :h } else { :t }] },
+                Term.prim(op, _, _, _, _, [x]) if op == :list_head || op == :list_tail =>
+                    match path s x { () => (), steps => list.append steps [if op == :list_head { :h } else { :t }] },
                 _ => (),
             };
             // What the list's part at those steps is, in a model: `:empty`, the
@@ -1914,6 +1916,10 @@ let upsert_shape p fi gi =
                     steps => match shape model steps { () => (), sh => sh == :nil },
                 },
                 Term.prim(:apply, _, _, _, _, [Term.prim(:builtin, _, b, _, _, _), x]) if b == is_cons => match path s x {
+                    () => (),
+                    steps => match shape model steps { () => (), sh => sh == :cons },
+                },
+                Term.prim(:list_is_cons, _, _, _, _, [x]) => match path s x {
                     () => (),
                     steps => match shape model steps { () => (), sh => sh == :cons },
                 },
@@ -2104,7 +2110,7 @@ let upserted_at site j = {
         let params = list.map (fn i -> Term.var (sc.slot_name i) 0) (list.range 0 (Site.k site));
         let guarded = sc.fun_of f (Term.block 0 (list.append (hoist.strict_reads body) [
             Stmt.expr (Term.prim :if 0 ir.no_node ir.no_node ir.no_node [
-                builtin p "_match_is_cons" [Term.var acc 0],
+                Term.prim :list_is_cons 0 ir.no_node ir.no_node ir.no_node [Term.var acc 0],
                 body,
                 call (Site.wgi site) (list.append params [builtin p "_trunk_of" [nil]]),
             ])]));

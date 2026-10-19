@@ -145,6 +145,7 @@ let names = [
     "_trunk_at",
     "_trunk_push",
     "_trunk_set",
+    "_trunk_recall",
 
 ];
 
@@ -271,6 +272,7 @@ let signatures = %{
     "_trunk_at" => "integer -> trunk -> the element there",
     "_trunk_push" => "value -> trunk -> the trunk with the value after its last element",
     "_trunk_set" => "integer -> value -> trunk -> the trunk with that element replaced",
+    "_trunk_recall" => "key -> trunk -> what the last lookup found when it was of this key in this version, or ()",
 
 };
 
