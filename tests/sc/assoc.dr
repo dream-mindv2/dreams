@@ -1,0 +1,39 @@
+// Counts kept in an association list by a function that updates it, the way a
+// first draft writes a word count: a scan of the list at every step, so
+// quadratic as written -- and lazily, a chain of updates nothing forces until
+// the end. The supercompiler keeps the list as a trunk and finds each key
+// through its index (`upserted` in dreams/src/accum.dr).
+//
+// The rest is what keeps it exact. A loop that does not start from `[]` runs
+// as written. A key `1 / 0` filed by the only step is never forced, as the
+// list as written never forces it; `1.0` finds the pair `1` made, as `==`
+// does, and the pair keeps the key it was made with, or takes the new one,
+// as the update says. Through `std`'s fold the accumulator is lazy, and
+// the loop answers it wherever it ends, which is as exact: forcing the
+// answer as written forces every update and every key.
+import std.console;
+import std.list;
+let rec bump w xs = match xs {
+    [] => [[w, 1]],
+    [[k, n], ..rest] => if k == w { list.cons [k, n + 1] rest } else { list.cons [k, n] (bump w rest) },
+};
+let rec renamed w xs = match xs {
+    [] => [[w, 1]],
+    [[k, n], ..rest] => if w == k { list.cons [w, n + 10] rest } else { list.cons [k, n] (renamed w rest) },
+};
+let rec count i n !acc = if i >= n { acc } else { count (i + 1) n (bump ("w" + to_string ((i * 31) % 500)) acc) };
+let rec each xs !acc = match xs { [] => acc, [x, ..rest] => each rest (bump x acc) };
+let rec each_renamed xs !acc = match xs { [] => acc, [x, ..rest] => each_renamed rest (renamed x acc) };
+let rec once i !acc = if i >= 1 { acc } else { once (i + 1) (bump (1 / i) acc) };
+let main! = {
+    let counts = count 0 3000 [];
+    console.print! (list.length counts);
+    console.print! (list.take 3 counts);
+    console.print! (each [1, 2, 1.0, 3, 2] []);
+    console.print! (each_renamed [1, 2, 1.0, 3, 2] []);
+    console.print! (each [7, 1] [[1, 5], [9, 9]]);
+    console.print! (list.length (once 0 []));
+    // The same through `std`'s fold, whose accumulator is lazy.
+    let words = list.map (fn i -> "w" + to_string ((i * 7) % 300)) (list.range 0 3000);
+    console.print! (list.take 2 (list.fold (fn acc w -> bump w acc) [] words))
+};
