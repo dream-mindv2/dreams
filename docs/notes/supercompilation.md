@@ -571,3 +571,67 @@ Three things the measurement found, each a quadratic of its own:
 | 4,000 | 1,020 ms | 10 ms |
 | 16,000 | -- | 50 ms |
 | 200,000 | -- | 800 ms |
+
+## Many passes, one walk (2026-10-19)
+
+`tests/sc/stats` computes a count, a sum, a sum of squares, a minimum and a
+maximum with separate folds over the same 200,000-element list, then prints
+its mean, population variance and extrema. `accum.tupled` reads the folds
+through `fold_shape` and `aggregate_shape`, including a headed aggregate
+whose wrapper the driver has already unfolded, and carries all five
+accumulators through one loop. The rewrite runs in `accum.finishing`, after
+the driver has specialised each fold on its step.
+
+The calls must all be demanded on the same path. The analysis follows
+arithmetic, explicit strict parameters and strict statements through lazy
+bindings; it does not take calls from an unchosen branch, a constructor's
+lazy fields or an exception scope. Rewriting follows those same edges, even
+when an arena node is shared with a lazy arm. Starts may read only the
+caller's parameters, so a seed depending on another fold's result is left
+alone. A fold that reads the remaining tail instead of just this cell's head
+is left alone too. For now this takes pure functions without captures, a
+list parameter, at most eight folds and bodies of at most 400 distinct
+terms. Larger or unproved cases keep their original code.
+
+Each component executes its original step and carries its next accumulator
+lazily, with its own strict parameter reads on entry to the next iteration.
+There is no change to arithmetic order. Headed folds seed from the first
+head and keep their original empty-list answer. All selected results are
+demanded, so the finished accumulators are forced after the spine ends;
+forcing them earlier would break a lazy fold that discards an invalid older
+accumulator. What may change is which of two independent failures is met
+first, as with the other shapes. `tests/sc/tupled` covers those discarded
+accumulators, unread invalid heads, floating-point rounding, empty and
+singleton lists, lazy fields of an infinite input, short circuits,
+dependent seeds, retained inputs and invariant arguments.
+
+There were three costs hidden in the first version:
+
+- Returning lazy tuple fields hid a lazy numeric fold's final demand from
+  the JIT. Forcing its completed accumulator after the walk makes that
+  demand visible without making its steps strict.
+- A waiting caller pinned the list the worker was walking. When the caller
+  reads the list only through the selected folds, the worker tail-calls a
+  small continuation that runs the caller's remaining body. Its branch
+  bindings stay out of the hot loop's frame. Otherwise calls read their
+  components from a shared tuple, as usual.
+- Following every use of a shared binding multiplied the demand analysis.
+  Names are unique after `sc.renamed`, so an identity memo visits each term
+  once, and the analysis remains a walk of the graph.
+
+The same VM with its default JIT, seven interleaved runs, median wall times
+including process startup, `DREAMS_CACHE=` and a 120-second timeout per run:
+
+| list length | as written | supercompiled before this change | tupled |
+|---|---|---|---|
+| 200,000 | 98 ms | 89 ms | 67 ms |
+| 400,000 | 161 ms | 108 ms | 82 ms |
+
+The outputs agree in all three builds: at 200,000,
+`[100000.5, 3333333333.25, 1, 200000]`; at 400,000,
+`[200000.5, 13333333333.25, 1, 400000]`. The handoff's proposed threefold
+wall-time gain was not reached. These folds are already linear and the
+benchmark includes generating the input and JIT startup. The measured gain
+is 1.46x at 200,000 and 1.96x at 400,000; `stats.ratio` records `3 4 time`
+(a quarter less wall time), leaving room for scheduling noise rather than
+claiming the unmeasured `1 3 time` target.

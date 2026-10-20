@@ -543,7 +543,7 @@ let finished b = match Options.supercompile (Build.options b) {
                           // Again, over what the driver made: a specialisation
                           // of `fold` on a closure is the loop the closure's
                           // accumulator was in.
-                          |> Result.and_then hoist.hoist |> Result.and_then accum.accum),
+                          |> Result.and_then hoist.hoist |> Result.and_then accum.finishing),
     _ => Result.ok (finish b (shared_image b)),
 };
 

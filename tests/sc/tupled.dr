@@ -1,0 +1,105 @@
+import std.console;
+import std.list;
+
+let fold : (b -> a -> b) -> b -> [a] -> b;
+let rec fold step !acc xs =
+    if list.is_empty xs { acc } else { fold step (step acc (xs.[0])) (list.tail xs) };
+
+let lazy_fold : (b -> a -> b) -> b -> [a] -> b;
+let rec lazy_fold step acc xs =
+    if list.is_empty xs { acc } else { lazy_fold step (step acc (xs.[0])) (list.tail xs) };
+
+let both : a -> b -> [a | b];
+let both !a !b = [a, b];
+let all : a -> b -> c -> d -> [a | b | c | d];
+let all !a !b !c !d = [a, b, c, d];
+
+// Both heads are ignored by these steps. Neither may start forcing them.
+let ignored : [:any] -> [:integer];
+let ignored xs = both (fold (fn n _ -> n + 1) 0 xs) (fold (fn n _ -> n + 2) 0 xs);
+
+// A later lazy step discards the division by zero in the first step.
+let discarded : [:integer] -> [:integer];
+let discarded xs = both (lazy_fold (fn _ x -> if x == 1 { bad 0 } else { x }) 0 xs)
+                         (fold (fn n _ -> n + 1) 0 xs);
+
+// Reassociation of these floating-point additions would change the answer.
+let rounding : [:float] -> [(:float | :integer)];
+let rounding xs = both (lazy_fold (fn a x -> a + x) 0.0 xs) (fold (fn n _ -> n + 1) 0 xs);
+
+// Whole and headed folds have different seeds and different empty answers.
+let extremes : [a] -> [:any];
+let extremes xs = all (fold (fn n _ -> n + 1) 0 xs) (list.minimum xs)
+                       (list.maximum xs) (fold (fn n _ -> n + 2) 0 xs);
+
+// Only the chosen arm is demanded. The other fold must never join its walk.
+let conditional : :bool -> [:integer] -> :integer;
+let conditional choose xs =
+    if choose { fold (fn n _ -> n + 1) 0 xs }
+    else { fold (fn n x -> n + x) 0 xs };
+let lazy_result : [:integer] -> [:integer];
+let lazy_result xs = [fold (fn n _ -> n + 1) 0 xs, fold (fn n x -> n + x) 0 xs];
+let short_circuit : [:integer] -> :bool;
+let short_circuit xs = (fold (fn n _ -> n + 1) 0 xs > 0) || (fold (fn n x -> n + x) 0 xs > 0);
+
+// A lazy arm stays lazy when another fold of the same list is demanded.
+// The discarded arm would force an invalid head.
+let shared_arm : :bool -> [:integer] -> [:integer];
+let shared_arm choose xs = both (fold (fn n _ -> n + 1) 0 xs)
+    (if choose { 7 } else { fold (fn n x -> n + x) 0 xs });
+
+// The second fold's seed depends on the first result. Such calls cannot be
+// tupled together, even though their list parameter is the same.
+let dependent : [:integer] -> [:integer];
+let dependent xs = {
+    let n = fold (fn n _ -> n + 1) 0 xs;
+    both n (fold (fn a x -> a + x) n xs)
+};
+
+// A fold shape that inspects the remaining tail is not a local step.
+let suffixes : :integer -> [a] -> :integer;
+let rec suffixes !n xs = if list.is_empty xs { n }
+    else { suffixes (n + len xs) (list.tail xs) };
+let nonlocal : [:integer] -> [:integer];
+let nonlocal xs = both (suffixes 0 xs) (fold (fn n _ -> n + 1) 0 xs);
+
+// A strict seed on an empty list still raises, and exception scopes keep
+// their original walks. The handler returns without demanding its payload.
+let raises : [:integer] -> [:integer];
+let raises xs = both (fold (fn a x -> a + x) (bad 0) xs) (fold (fn n _ -> n + 1) 0 xs);
+
+let bad : :integer -> :integer;
+let bad n = 1 / n;
+
+let retained : [:integer] -> [:any];
+let retained xs = {
+    let keep : :integer -> :integer -> [:any];
+    let keep !a !b = [a, b, xs];
+    keep (fold (fn a x -> a + x) 0 xs) (fold (fn n _ -> n + 1) 0 xs)
+};
+
+let invariant : :integer -> [:integer] -> [:integer];
+let invariant delta xs = both (fold (fn a x -> a + x + delta) 0 xs)
+    (fold (fn n _ -> n + delta) 0 xs);
+
+let from : :integer -> [:integer];
+let rec from n = n :: from (n + 1);
+
+let main! () = {
+    console.print! (to_string (ignored [bad 0, bad 0, bad 0]))
+    console.print! (to_string (discarded [1, 2]))
+    console.print! (to_string (rounding [1.0e16, -1.0e16, 1.0]))
+    console.print! (to_string (extremes []))
+    console.print! (to_string (extremes [4]))
+    console.print! (to_string (extremes [3, 1, 3, 2]))
+    console.print! (to_string (conditional true [bad 0, bad 0]))
+    console.print! (to_string ((lazy_result [bad 0, bad 0]).[0]))
+    console.print! (to_string (short_circuit [bad 0, bad 0]))
+    console.print! (to_string (shared_arm true [bad 0, bad 0]))
+    console.print! (to_string (dependent [1, 2, 3]))
+    console.print! (to_string (nonlocal [1, 2, 3]))
+    console.print! (to_string (len (lazy_result (from 0))))
+    console.print! (to_string (retained [1, 2, 3]))
+    console.print! (to_string (invariant 2 [1, 2, 3]))
+    console.print! (try! { to_string (raises []) } catch _ { "caught" })
+};

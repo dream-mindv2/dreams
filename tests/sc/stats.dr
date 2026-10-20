@@ -1,0 +1,27 @@
+import std.console;
+import std.list;
+
+// Each statistic walks the same list again. These folds are independent,
+// and every result is demanded in this block before the answer is made.
+let fold : (b -> a -> b) -> b -> [a] -> b;
+let rec fold step !acc xs =
+    if list.is_empty xs { acc }
+    else { fold step (step acc (xs.[0])) (list.tail xs) };
+
+let finish : (:integer | :float) -> :integer -> :integer -> :integer -> :integer -> [:any];
+let finish !total !n !sq !lo !hi = {
+    let mean = total / (n * 1.0);
+    [mean, sq / (n * 1.0) - mean * mean, lo, hi]
+};
+
+let stats : [:integer] -> [:any];
+let stats xs = {
+    let total = fold (fn a x -> a + x) 0 xs;
+    let n = fold (fn n _ -> n + 1) 0 xs;
+    let sq = fold (fn a x -> a + x * x) 0 xs;
+    let lo = list.minimum xs;
+    let hi = list.maximum xs;
+    finish total n sq lo hi
+};
+
+let main! () = console.print! (to_string (stats (list.range 1 200001)));
