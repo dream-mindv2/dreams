@@ -1349,8 +1349,14 @@ let load! file roots cfg test_mode =
 /// compile is also the one that may be handed a unit cache.
 let load_shared! : :string -> [:string] -> :any -> :bool -> unit.Cache -> Loader;
 let load_shared! file roots cfg test_mode units =
+    load_shared_with_hosts! file roots cfg test_mode units [];
+
+/// The embedding form preserves explicitly declared host modules through
+/// package discovery and parallel parsing.
+let load_shared_with_hosts! : :string -> [:string] -> :any -> :bool -> unit.Cache -> [:string] -> Loader;
+let load_shared_with_hosts! file roots cfg test_mode units hosts =
     load_root! (Loader.set_units units (Loader.set_share_parses true
-                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) [])))
+                    (loader (package.discover! file roots) cfg (default_search_paths! file roots) hosts)))
                file test_mode;
 
 /// The same, reading `ov` -- a map of path to text -- instead of the disk for
