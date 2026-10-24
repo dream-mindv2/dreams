@@ -311,6 +311,21 @@ macro wrap e = helper e;
     assert 'cannot run macro' in result.stderr, result.stderr
     count += 1
 
+    # A macro is expanded to check a program, and checking runs nothing: a
+    # foreign function declared pure is still a foreign function, and `--check`
+    # (what the language server runs on whatever an editor opens) must not
+    # call it. The marker file says whether it did.
+    marker = temp / 'ran'
+    failure(f'''
+import std.console;
+foreign libc from "libc.so.6" {{
+    system : :cstr -> :int
+}}
+macro boom e = {{ let r = libc.system "touch {marker}"; [:int, r, [0, 0]] }};
+let main! = console.print! (to_string (expand boom 1));
+''', 'a macro cannot call a foreign library')
+    assert not marker.exists(), 'a macro ran a foreign function while compiling'
+
     # Embedded macro VMs must preserve the REPL's already-open input handle.
     session = subprocess.run(
         [vm, compiler, '--repl', '-L', str(root / 'mind'), '-L', str(root)],
