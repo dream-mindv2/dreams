@@ -45,13 +45,20 @@ import std.map;
 /// runtime lookup rather than to Dream source. This must match the runtime's
 /// registry exactly.
 ///
+/// `std.browser` is the one only some VMs provide: the browser VM's bridge to
+/// its page (dream/browser/host.cpp), which `std.graphics.browser` is written
+/// on. Every VM compiles a program that imports it, so a frontend needs no
+/// flag and a sweep of the whole library still compiles; a VM without a page
+/// says so at the first call, as it does for any module it lacks.
+///
 /// An embedder can add to this list for one compilation with `--host-module`,
 /// which is what makes a program importing a module registered at run time
 /// compilable. It is deliberately not a wildcard: naming the module is what
 /// keeps a typo in an import an error rather than a mystery later.
 let native_modules : [:string];
 let native_modules =
-    ["std.crypto", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls", "std.vm"];
+    ["std.browser", "std.crypto", "std.ffi", "std.io", "std.math", "std.net", "std.os", "std.tensor", "std.tls",
+     "std.vm"];
 
 let is_native : :string -> :bool;
 let is_native p = list.contains p native_modules;
