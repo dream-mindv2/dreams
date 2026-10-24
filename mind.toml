@@ -2,7 +2,7 @@
 # build.dr beside this declares the checks `mind test dreams` runs.
 [package]
 name = "dreams"
-version = "0.1.0"
+version = "0.2.0"
 repository = "https://github.com/dream-mindv2/dreams"
 description = "The Dream compiler: .dr source to .dream bytecode"
 
