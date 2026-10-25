@@ -49,7 +49,7 @@ import dreams.typecheck;
 import std.map;
 import std.num;
 
-let version = "0.2.0";
+let version = "0.2.2";
 
 /// What `--shebang` writes when it is not given a line. `env` so that it finds
 /// whichever `dream` is on the PATH rather than one fixed place.
