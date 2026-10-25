@@ -1,8 +1,9 @@
 # The compiler. Its modules are in src/, and `dreams.main` is the program;
 # build.dr beside this declares the checks `mind test dreams` runs.
 [package]
+license = "MIT OR Apache-2.0"
 name = "dreams"
-version = "0.2.0"
+version = "0.2.1"
 repository = "https://github.com/dream-mindv2/dreams"
 description = "The Dream compiler: .dr source to .dream bytecode"
 
