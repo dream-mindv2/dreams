@@ -244,11 +244,14 @@ let show_ir! l = {
 
 /// `NAME=FILE`, or `FILE` alone, as `[name, path]`. A file given no name is
 /// called by its last path component, so `--payload lib/libz.so` is
-/// `"libz.so"`. What is in front of the first `=` is a name only when it could
-/// not be a path, so a file whose own name has an `=` in it still works.
-let payload_spec spec = {
+/// `"libz.so"`. A name may hold `/` -- `graphics/assets/logo.png`, a page's
+/// files each carried under its path -- so what tells the two apart is the
+/// file system: a spec that names a file as written is that file, which is
+/// how a file whose own name has an `=` in it still works, and anything else
+/// is split at its first `=`.
+let payload_spec! spec = {
     let at = str.find "=" spec;
-    if at > 0 && not (str.contains_str "/" (str.slice 0 at spec)) {
+    if at > 0 && not (file.is_file! spec) {
         [str.slice 0 at spec, str.slice (at + 1) (str.byte_length spec - at - 1) spec]
     } else { [path.basename spec, spec] }
 };
@@ -372,7 +375,8 @@ let write_depfile! path out l payloads =
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
 let build! l out shebang depfile specs said stats kept o = {
-    let named = list.map payload_spec specs;
+    let named = list.map payload_spec! specs;
+    strict! named
     let payloads = list.map (fn e -> list.nth 1 e) named;
     let sizes = list.map (fn pth -> payload_size! pth) payloads;
     strict! sizes
