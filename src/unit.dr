@@ -91,8 +91,8 @@ let recall! cache kind k = match cache {
     dir => match k {
         () => (),
         named => match file.read! (path dir kind named) {
-            () => (),
-            bytes => match wire.decode bytes {
+            Option.none => (),
+            Option.some(bytes) => match wire.decode bytes {
                 Result.ok(v) => {
                     refresh! (path dir kind named) bytes
                     v

@@ -233,8 +233,8 @@ let root_modules l = {
         let file = modules.module_path (modules.module_at l mi);
         // `[depth inside, package]` for each package around the file.
         let around = list.concat (map (fn [i, dir] -> match path.relative_to dir file {
-            () => [],
-            inside => [[list.length inside, i]],
+            Option.none => [],
+            Option.some(inside) => [[list.length inside, i]],
         }) dirs);
         match list.sort_on list.head around {
             [] => acc.[mi => true],

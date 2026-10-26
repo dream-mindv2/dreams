@@ -39,7 +39,8 @@ import std.str;
 import std.list;
 
 let segs ss = str.join_str "|" ss;
-let opt v = match v { () => "<none>", ss => segs ss };
+let opt : Option [:string] -> :string;
+let opt v = match v { Option.none => "<none>", Option.some(ss) => segs ss };
 let b x = if x { "T" } else { "F" };
 
 let one p = str.join_str "\t" [
@@ -60,7 +61,7 @@ let two line = match str.split "\t" line {
 };
 
 let lines_of! name =
-    list.filter (fn l -> l != "") (str.split "\n" (match file.read! name { () => "", t => t }));
+    list.filter (fn l -> l != "") (str.split "\n" (match file.read! name { Option.none => "", Option.some(t) => t }));
 
 let main! = {
     file.write! "one.out" (str.join_str "\n" (list.map one (lines_of! "paths.txt")) + "\n")

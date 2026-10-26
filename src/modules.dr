@@ -943,7 +943,7 @@ let rec load_file! l filename name at from_source =
         // The overlay first: a file that is open in an editor is whatever the
         // editor says it is, and what is on disk is out of date by definition.
         let text = match ((overlay l)).[filename else ()] {
-            () => file.read! filename,
+            () => Option.or_unit (file.read! filename),
             t => t,
         };
         match text {
@@ -1031,7 +1031,7 @@ let fetched l = Loader.prefetch l;
 
 /// The text a file would be loaded with: the editor's buffer, then the disk.
 let text_of! l filename = match ((overlay l)).[filename else ()] {
-    () => file.read! filename,
+    () => Option.or_unit (file.read! filename),
     t => t,
 };
 

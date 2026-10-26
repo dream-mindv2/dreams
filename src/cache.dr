@@ -60,15 +60,15 @@ let image_path d key = d + "/" + key + ".dream";
 /// The digest of a file as it is now, or `()` when it cannot be read.
 let digest_of! : :string -> :string | :unit;
 let digest_of! p = match file.read! p {
-    () => (),
-    text => io.digest text,
+    Option.none => (),
+    Option.some(text) => io.digest text,
 };
 
 /// The entry for `key`, when every file it read still reads the same.
 let fresh! : :string -> :string -> Entry | :unit;
 let fresh! d key = match file.read! (entry_path d key) {
-    () => (),
-    text => match wire.decode text {
+    Option.none => (),
+    Option.some(text) => match wire.decode text {
         Result.ok([reads, said, diagnostics]) if io.exists! (image_path d key)
                         && unchanged! reads => [reads, said, diagnostics],
         _ => (),

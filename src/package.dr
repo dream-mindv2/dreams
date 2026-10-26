@@ -150,8 +150,8 @@ let is_noise dir = {
 let module_name : :string -> :string -> :string | :unit;
 let module_name base file =
     match path.relative_to base (path.drop_extension file) {
-        () => (),
-        segs => dotted_inside segs,
+        Option.none => (),
+        Option.some(segs) => dotted_inside segs,
     };
 
 /// The same, for a file and a directory already taken apart into the segments
@@ -159,8 +159,8 @@ let module_name base file =
 /// reads, against every package, with the packages' halves worked out once.
 let module_name_in : [:string] -> [:string] -> :string | :unit;
 let module_name_in base_segs file_segs = match path.strip_segments base_segs file_segs {
-    () => (),
-    segs => dotted_inside segs,
+    Option.none => (),
+    Option.some(segs) => dotted_inside segs,
 };
 
 let dotted_inside : [:string] -> :string | :unit;
@@ -268,8 +268,8 @@ priv let size_of v = match type_of v {
 let load_manifest! : :string -> Result Package :string | [:none];
 let load_manifest! filename =
     match file.read! filename {
-        () => Result.error ("cannot read " + filename),
-        text =>
+        Option.none => Result.error ("cannot read " + filename),
+        Option.some(text) =>
             match toml.parse text {
                 Result.error(why) => Result.error (filename + ": " + why),
                 Result.ok(doc) => {

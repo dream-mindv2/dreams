@@ -1041,11 +1041,11 @@ let usage! () = {
 /// that name would shadow it.
 let with_source! filename k =
     match file.read! filename {
-        () => {
+        Option.none => {
             console.error! ("dreams: cannot read " + filename)
             1
         },
-        text => k text,
+        Option.some(text) => k text,
     };
 
 /// The configuration a compile starts from: the machine, then the target if
