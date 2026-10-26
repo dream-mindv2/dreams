@@ -16,3 +16,9 @@ nursery_max = "64M"
 # and a release self-compile runs within a few hundred megabytes of the VM's
 # 1 GB guard: see "Milestone 2, step 6" in docs/notes/supercompilation.md.
 max_heap = "4G"
+
+# `mind release`: the version is printed by `dreams --version` as well, and a
+# new version moves the seed, which is rebuilt until it reproduces itself.
+[release]
+files = ["src/main.dr"]
+run = ["cd .. && just reseed"]
