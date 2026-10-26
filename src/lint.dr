@@ -236,6 +236,14 @@ let rec literal_zero e = match e {
     _ => false,
 };
 
+/// `file.read! P`, `read_bytes!` or `lines!`, anywhere in `e`, of the file
+/// `target` names -- the same expression, spans aside.
+let rec reads_from target e = type_of e == :list && match e {
+    [:apply, [:field, [:name, "file", _], r, _], [arg, .._], _]
+        if (r == "read!" || r == "read_bytes!" || r == "lines!") && ast.show arg == ast.show target => true,
+    _ => list.any (reads_from target) e,
+};
+
 /// A `Hit` for each, in source traversal order. Walk each body once so
 /// nested functions and literals are checked without duplicate diagnostics.
 let pitfalls : :any -> [:any];
@@ -247,6 +255,16 @@ let rec pitfalls_in e acc =
         let here = match e {
             [:map, pairs, _] => duplicate_keys pairs %{} acc,
             [:match, _, arms, _] => unreachable_arms arms false %{} acc,
+            // `file.write! p (f (file.read! p))`: the contents are a suspension
+            // the write forces after it has truncated the file, so the read
+            // finds it empty and the file is written as nothing. It went
+            // unnoticed twice in `mind release` before this was here.
+            [:apply, [:field, [:name, "file", _], w, _], [target, contents], _]
+                if (w == "write!" || w == "append!") && reads_from target contents =>
+                list.cons (Hit.make (ast.span contents)
+                                    ("`file." + w + "` writes what it reads from the same file, and the read is lazy")
+                                    ("the write truncates the file before the read happens, so the read finds it "
+                                     + "empty: read it into a `let` and `strict!` that first")) acc,
             [:binary, op, _, divisor, _] if (op == :div || op == :mod) && literal_zero divisor =>
                 list.cons (Hit.make (ast.span divisor)
                                     ((if op == :div { "division" } else { "remainder" }) + " by a literal zero")
@@ -290,6 +308,11 @@ when test {
         test.case "an arm after a catch-all, or after the same unguarded literal"
             $( test.eq! [unreachable, unreachable]
                         (pitfalls_of "let f x = match x { 1 => 0, 1 => 1, y => y, :b => 2 };") ),
+        test.case "a write of what is read from the same file, lazily"
+            $( test.eq! ["`file.write!` writes what it reads from the same file, and the read is lazy"]
+                        (pitfalls_of "let f! p = file.write! p (str.upper (match file.read! p { () => \"\", t => t }));") ),
+        test.case "another file, or contents read into a let first, are not"
+            $( test.eq! [] (pitfalls_of "let f! p q = { file.write! p (file.read! q); let t = file.read! p; strict! t; file.write! p t };") ),
         test.case "a guarded arm hides nothing"
             $( test.eq! [] (pitfalls_of "let f x = match x { 1 if x > 0 => 0, 1 => 1, _ => 2 };") ),
         test.case "a force in a list is suspended"
