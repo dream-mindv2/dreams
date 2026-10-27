@@ -242,7 +242,7 @@ let renamed_from name =
     if str.starts_with "b" name {
         match str.find "." name {
             -1 => (),
-            dot => num.parse_int (str.slice 1 (dot - 1) name),
+            dot => Option.or_unit (num.parse_int (str.slice 1 (dot - 1) name)),
         }
     } else { () };
 
@@ -374,7 +374,7 @@ let rec bound_into t !acc = match t {
 /// made has none, and is given the next slot after the frame's own.
 let fixed_slot : :string -> :integer | :unit;
 let fixed_slot name =
-    if str.starts_with "s" name { num.parse_int (str.slice 1 (str.byte_length name - 1) name) } else { () };
+    if str.starts_with "s" name { Option.or_unit (num.parse_int (str.slice 1 (str.byte_length name - 1) name)) } else { () };
 
 /// The slot `name` is, giving it one if it has none. A name a binding binds
 /// is never a capture: a closure's captures are read, not rebound.

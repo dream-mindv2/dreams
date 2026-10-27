@@ -862,9 +862,8 @@ let parse_position text = {
     if list.length parts != 2 { () }
     else {
         match [num.parse_int (list.nth 0 parts), num.parse_int (list.nth 1 parts)] {
-            [(), _] => (),
-            [_, ()] => (),
-            both => both,
+            [Option.some(a), Option.some(b)] => [a, b],
+            _ => (),
         }
     }
 };

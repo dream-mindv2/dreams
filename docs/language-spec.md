@@ -819,7 +819,7 @@ which is how a value that is not there becomes an error worth reporting:
 ```dream
 let port config = {
     let? text = Option.of config.["port" else ()] else Result.error :no_port;
-    num.parse_int text |> Option.of |> Option.ok_or :bad_port
+    num.parse_int text |> Option.ok_or :bad_port
 };
 ```
 

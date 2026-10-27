@@ -384,7 +384,7 @@ let number s i = {
         let after_exp = exponent s after_frac;
         if dotted || after_exp != after_frac {
             let raw = str.slice i (after_exp - i) s;
-            [:float, num.parse_float (str.filter (fn c -> c != '_') raw), after_exp]
+            [:float, Option.or_unit (num.parse_float (str.filter (fn c -> c != '_') raw)), after_exp]
         }
         else {
             let d = digits s i 10 0 0;

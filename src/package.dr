@@ -254,7 +254,7 @@ let vm_settings entries =
 priv let size_of : :any -> :integer | :unit;
 priv let size_of v = match type_of v {
     :integer => if v > 0 { v } else { () },
-    :string => num.parse_size v,
+    :string => Option.or_unit (num.parse_size v),
     _ => (),
 };
 
