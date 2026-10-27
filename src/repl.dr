@@ -145,8 +145,8 @@ let complete text =
 /// missing brace is a prompt with no way out.
 let rec read_entry! h acc =
     match read_line! h {
-        () => if str.is_empty (str.trim acc) { () } else { acc },
-        line => {
+        Option.none => if str.is_empty (str.trim acc) { () } else { acc },
+        Option.some(line) => {
             let text = if str.is_empty acc { line } else { acc + "\n" + line };
             if str.is_empty (str.trim line) && not (str.is_empty acc) { text }
             else if str.is_empty (str.trim text) { text }

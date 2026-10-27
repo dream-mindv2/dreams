@@ -189,8 +189,8 @@ let supercompiling o = match [opt o :supercompile, opt o :no_opt] {
 /// `FROM=TO` as `[from, to]`. The split is at the last `=`, since a path may
 /// hold one and a package name never does.
 let remap_spec text = match str.split_last "=" text {
-    () => [text, ""],
-    [from, to] => [from, to],
+    Option.none => [text, ""],
+    Option.some([from, to]) => [from, to],
 };
 
 /// The modules a program pulls in, in the order a later pass must walk them:
