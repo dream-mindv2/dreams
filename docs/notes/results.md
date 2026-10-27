@@ -124,8 +124,15 @@ answers `alt` instead of passing the failure on.
 an `Option` now), and `std.result` keeps short spellings -- `result.ok`,
 `result.err`, `result.map` -- as wrappers, which compile to the member call.
 
-The library's own "nothing there" is still `()` (`list.find`, `map` lookups
-with `else ()`); `Option.of` and `Option.or_unit` cross between the two.
+The library's own "nothing there" was `()` until 2026-10-26, when it moved to
+`Option` in phases: `file.read!` and the path lookups, the number and
+character parsers, `str`/`regex`/`version`/`console`, then `list.find`,
+`find_map`, `array.find` and `http.header`/`query_value`/`param`
+(`map.lookup` is the map's). A builtin still answers `()`, and its wrapper
+crosses with `Option.of`; `Option.or_unit` goes back where a private helper
+still says `()`. `list.find` is a fusion sink, so changing its answer took a
+staged seed: the old seed wrote every fused `find` with the old meaning
+(`make_variant` in lower.dr writes the new one).
 
 ## Fusion and block cleanup
 

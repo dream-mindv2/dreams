@@ -1059,8 +1059,8 @@ let declare_module l mi s0 = {
             let v = list.nth 1 oi;
             match list.find
                 (fn od -> decl_name (list.nth 1 od) == virtual_name v) (list.head filled) {
-                () => acc,
-                od => check_virtual_impl l v od acc,
+                Option.none => acc,
+                Option.some(od) => check_virtual_impl l v od acc,
             }
         },
         _ => acc,

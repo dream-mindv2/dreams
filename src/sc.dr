@@ -838,7 +838,7 @@ let rename : :map -> :map -> Term -> [:map, :map] -> [Term, [:map, :map]];
 let rec rename twice env t st = {
     let [given, memo] = st;
     match list.find (fn done -> list.head done == env) (memo.[t else []]) {
-        [_, out] => [out, st],
+        Option.some([_, out]) => [out, st],
         _ => {
             let [out, [given2, memo2]] = rename_new twice env t st;
             [out, [given2, memo2.[t => list.cons [env, out] (memo2.[t else []])]]]

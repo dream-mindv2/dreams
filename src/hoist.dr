@@ -237,7 +237,7 @@ let replace_reads p arrays t =
 
 let array_read : Program -> [[:integer, :string]] -> Term -> Term | :unit;
 let array_read p arrays t = {
-    let swap n = match list.find (fn a -> sc.slot_name (list.head a) == n) arrays { () => (), a => list.nth 1 a };
+    let swap n = match list.find (fn a -> sc.slot_name (list.head a) == n) arrays { Option.none => (), Option.some(a) => list.nth 1 a };
     match t {
         Term.prim(:get, fl, a, b, c, [Term.var(n, vf), ..rest]) if swap n != () =>
             Term.prim :get fl a b c (list.cons (Term.var (swap n) vf) rest),

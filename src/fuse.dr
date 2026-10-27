@@ -103,8 +103,8 @@ let roles = %{
     "any" => Role.sink :any 2 false,
     "all" => Role.sink :all 2 false,
     "none" => Role.sink :none 2 false,
-    // `find` is `any` answering the element that decided it, and `()` when
-    // nothing did.
+    // `find` is `any` answering the element that decided it, as
+    // `Option.some`, and `Option.none` when nothing did.
     "find" => Role.sink :find 2 false,
     "count" => Role.sink :count 2 true,
     "length" => Role.sink :length 1 true,

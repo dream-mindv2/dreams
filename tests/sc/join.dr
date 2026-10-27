@@ -8,7 +8,7 @@ import std.str;
 // than the scan would: the customer past the last one asked for is an error
 // nothing reaches.
 let name_of : [[:any]] -> :integer -> :string;
-let name_of customers o = match list.find (fn c -> list.head c == o) customers { () => "?", c => list.nth 1 c };
+let name_of customers o = match list.find (fn c -> list.head c == o) customers { Option.none => "?", Option.some(c) => list.nth 1 c };
 
 let main! () = {
     let n = 12000;
@@ -17,5 +17,5 @@ let main! () = {
     console.print! (to_string (list.sum (list.map (fn o -> str.byte_length (name_of customers o)) orders)))
     // A key that is not there, and keys a map cannot hold, answer as written.
     console.print! (to_string (list.map (fn o -> name_of [[1, "a"], [2, "b"]] o) [2, 3, 1]))
-    console.print! (to_string (list.map (fn o -> list.find (fn c -> list.head c == o) [[[1], "x"], [[2], "y"]]) [[2], [5]]))
+    console.print! (to_string (list.map (fn o -> Option.or_unit (list.find (fn c -> list.head c == o) [[[1], "x"], [[2], "y"]])) [[2], [5]]))
 };

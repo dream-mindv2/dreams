@@ -587,6 +587,16 @@ let result_id kind ok = "std.prelude." + kind + "." +
     if kind == "Result" { if ok { "ok" } else { "error" } }
     else { if ok { "some" } else { "none" } };
 
+/// A prelude `Result` or `Option` built in place, as its constructor would
+/// build it: `ok`'s variant around `payload`, or -- for `Option.none`, which
+/// carries nothing -- no fields at all.
+let make_variant kind ok payload l = {
+    let placed = kids (if kind == "Option" && not ok { [] } else { [payload] }) l;
+    let [program, id] = ir.intern_atom (result_id kind ok) (prog (list.head placed));
+    emit (ir.node :record_make (list.nth 1 placed) (if kind == "Option" && not ok { 0 } else { 1 })
+                 (id + ir.record_variant)) (set_prog program (list.head placed))
+};
+
 let node_block nodes l = {
     let placed = kids nodes l;
     let made = emit (ir.node :block (list.nth 1 placed) (list.length nodes) ir.no_node) (list.head placed);
@@ -639,12 +649,7 @@ let rec result_branch value kind stages slot l = {
 /// Passing that node through preserves the input record on either untouched
 /// branch, including the differently typed failure of `Result.map`.
 let rec result_continue kind ok payload original stages l = match stages {
-    [] => if ir.is_node original { [l, original] } else {
-        let placed = kids (if kind == "Option" && not ok { [] } else { [payload] }) l;
-        let [program, id] = ir.intern_atom (result_id kind ok) (prog (list.head placed));
-        emit (ir.node :record_make (list.nth 1 placed) (if kind == "Option" && not ok { 0 } else { 1 })
-                     (id + ir.record_variant)) (set_prog program (list.head placed))
-    },
+    [] => if ir.is_node original { [l, original] } else { make_variant kind ok payload l },
     [[tag, arg, slot], ..rest] => match tag {
         :map => if ok {
             let mapped = emit_apply arg [payload] l;
@@ -1334,7 +1339,7 @@ let fused_body p l = {
         :any => const_bool false (list.head done),
         :all => const_bool true (list.head done),
         :none => const_bool true (list.head done),
-        :find => emit_leaf :unit (list.head done),
+        :find => make_variant "Option" false ir.no_node (list.head done),
         _ => local_node fuse.acc_slot (list.head done),
     };
 
@@ -1430,10 +1435,13 @@ let deciding_turn p stag sink l = {
         fuse.Step.written(body, ps) => fused_written p body ps l,
         fuse.Step.op(_) => const_bool false l,
     };
-    // `find` answers the element itself, read again where it is answered:
-    // a `map`'s output is computed a second time, for the one element found.
-    let on = if sink == :find { emit_local (fuse.Plan.elem p) (list.head asked) }
-             else { const_bool (sink == :any) (list.head asked) };
+    // `find` answers the element itself, read again where it is answered --
+    // a `map`'s output is computed a second time, for the one element found --
+    // as `Option.some`, as `list.find` answers it.
+    let on = if sink == :find {
+                 let x = emit_local (fuse.Plan.elem p) (list.head asked);
+                 make_variant "Option" true (list.nth 1 x) (list.head x)
+             } else { const_bool (sink == :any) (list.head asked) };
     let next = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0) (list.head on);
     let [yes, no] = if sink == :all { [list.nth 1 next, list.nth 1 on] } else { [list.nth 1 on, list.nth 1 next] };
     let made = emit (ir.node :if (list.nth 1 asked) yes no) (list.head next);

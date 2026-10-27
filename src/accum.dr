@@ -296,8 +296,8 @@ let rec unwrap t = match t {
 /// that called it would call that.
 let global_named : ir.Image -> #[:string] -> :string -> :string -> :integer;
 let global_named img strs module name = match list.find (fn m -> strs.[m.[:name else 0]] == module) (ir.Image.modules img) {
-    () => -1,
-    m => {
+    Option.none => -1,
+    Option.some(m) => {
         let from = m.[:globals_start else 0];
         let gs = array.of_list (ir.Image.globals img);
         let funcs = array.of_list (ir.Image.funcs img);
@@ -306,8 +306,8 @@ let global_named img strs module name = match list.find (fn m -> strs.[m.[:name 
             _ => false,
         };
         match list.find (fn gi -> strs.[(gs.[gi]).[:name else 0]] == name) (list.range from (from + m.[:globals_count else 0])) {
-            () => -1,
-            gi => if reached gi { gi } else { -1 },
+            Option.none => -1,
+            Option.some(gi) => if reached gi { gi } else { -1 },
         }
     },
 };
@@ -1511,7 +1511,7 @@ let prefix_folded site = {
             _ => (),
         };
         let found = list.concat (list.map (fn i -> list.concat (list.map (fn xs ->
-            match list.find (fn t -> asked i xs t != ()) terms { () => [], t => [asked i xs t] })
+            match list.find (fn t -> asked i xs t != ()) terms { Option.none => [], Option.some(t) => [asked i xs t] })
             (list.filter (fn xs -> xs != i && kept xs) (list.range 0 k))))
             (list.filter stepped (list.range 0 k)));
         // Carried already, by a round before.
@@ -2009,7 +2009,7 @@ let indexed_at site j = {
             // rewritten too.
             let reads = list.head (hoist.rewrite (fn t -> match t {
                 Term.prim(:apply, fl, a, b, c, [Term.prim(:global, _, g, _, _, _), ..args]) if g != gi => match list.find (fn [h, _] -> h == g) copies {
-                    [_, cfi] if is_var xs (list.nth (list.head ((Program.searchers p).[g])) args) =>
+                    Option.some([_, cfi]) if is_var xs (list.nth (list.head ((Program.searchers p).[g])) args) =>
                         Term.prim :apply fl a b c (list.cons (Term.lam :make_closure 0 cfi []) (list.append args [index])),
                     _ => (),
                 },

@@ -58,7 +58,7 @@ let origin_span s sp = {
         let i = last_starting ranges at 0 (trunk.length ranges) - 1;
         if i >= 0 && holds (trunk.at i ranges) { list.nth 2 (trunk.at i ranges) } else { sp }
     } else {
-        match list.find holds (list.reverse (trunk.to_list ranges)) { () => sp, r => list.nth 2 r }
+        match list.find holds (list.reverse (trunk.to_list ranges)) { Option.none => sp, Option.some(r) => list.nth 2 r }
     }
 };
 
