@@ -31,6 +31,7 @@ group Gen {
     place : :string,
     rt : %{:string => :string},
     names : %{:string => :string},
+    conts : %{:integer => :integer},
 }
 
 let args_text : [:string] -> :string;
@@ -132,6 +133,25 @@ let checked intrinsic a b g = {
 /// `op` on two fixnums, or the slow path for anything else, overflow included. On
 /// the tagged words `2a+1` and `2b+1`, so that a sum needs no untagging: taking one
 /// tag off leaves the tagged answer.
+/// Allocation, in line: a call for this was a tenth of a run. Only the end of the chunk is the
+/// runtime's. 0 and 8 are `ctx_hp` and `ctx_limit` in `rt/main.dr`.
+let bump_alloc : :integer -> Gen -> [:string, Gen];
+let bump_alloc bytes g = {
+    let [hp, g1] = load_at "%p" 0 g;
+    let [next, g2] = instr (str.concat_all ["add i64 ", hp, ", ", to_string bytes]) g1;
+    let [limit, g3] = load_at "%p" 8 g2;
+    let [over, g4] = instr (str.concat_all ["icmp ugt i64 ", next, ", ", limit]) g3;
+    let [fits, g5] = label_of "fits" g4;
+    let [more, g6] = label_of "more" g5;
+    let [done, g7] = label_of "got" g6;
+    let g8 = start fits (emit (str.concat_all ["  br i1 ", over, ", label %", more, ", label %", fits]) g7);
+    let g9 = store_at "%p" 0 next g8;
+    let g10 = start more (emit ("  br label %" + done) g9);
+    let [slow, g11] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g10 "alloc!", "(i64 %p, i64 ", to_string bytes, ")"]) g10;
+    let g12 = start done (emit ("  br label %" + done) g11);
+    instr (str.concat_all ["phi i64 [ ", hp, ", %", fits, " ], [ ", slow, ", %", more, " ]"]) g12
+};
+
 let tagged_arith : :string -> :string -> :string -> :string -> Gen -> [:string, Gen];
 let tagged_arith sp op a b g = {
     let [both, g1] = instr (str.concat_all ["and i64 ", a, ", ", b]) g;
@@ -257,8 +277,7 @@ let rhs r env sp g = {
         core.Rhs.peek(name, args) => instr (str.concat_all ["call tailcc i64 ", rt_symbol g name, "(",
                                                  args_text (list.cons "%p" (list.map text args)), ")"]) g,
         core.Rhs.alloc(info, args) => {
-            let [o, g1] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g "alloc!", "(i64 %p, i64 ",
-                                                 to_string (8 * (1 + list.length args)), ")"]) g;
+            let [o, g1] = bump_alloc (8 * (1 + list.length args)) g;
             let g2 = store_at o 0 (str.concat_all ["ptrtoint (ptr ", info_symbol info, " to i64)"]) g1;
             [o, list.fold (fn st [i, a] -> store_at o (8 * (i + 1)) (text a) st) g2 (list.enumerate args)]
         },
@@ -342,6 +361,30 @@ let expr e env sp g = match e {
         let g10 = start else_ (jump (rt_symbol g "not_bool!") ["%p", sp, v, "0", "0", "0"] g9);
         expr no env sp g10
     },
+    core.Expr.seq(x, live, core.Expr.enter(a), rest) => {
+        // Most of what is entered has already been evaluated, and asking costs a load. What
+        // then follows runs here, with no frame stored and no jump through a pointer. A long
+        // `rest` is not worth a second copy, and takes the frame to go straight to its code.
+        let v = atom_text env a;
+        let [low, g1] = instr (str.concat_all ["and i64 ", v, ", 7"]) g;
+        let [is_object, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g1;
+        let [object, g3] = label_of "object" g2;
+        let [ready, g4] = label_of "ready" g3;
+        let [waits, g5] = label_of "waits" g4;
+        let g6 = start object (emit (str.concat_all ["  br i1 ", is_object, ", label %", object, ", label %", ready]) g5);
+        let [info, g7] = load_at v 0 g6;
+        let [kind, g8] = load_at info 8 g7;
+        let [done, g9] = instr (str.concat_all ["icmp ugt i64 ", kind, ", 2"]) g8;
+        let g10 = start ready (emit (str.concat_all ["  br i1 ", done, ", label %", ready, ", label %", waits]) g9);
+        let small = core_within rest inline_budget >= 0;
+        let g11 = if small { expr rest env.[x => v] sp g10 } else {
+            let [below, symbol, h1] = frame_for x live rest env sp g10;
+            jump symbol ["%p", below, v, "0", "0", "0"] h1
+        };
+        let g12 = start waits g11;
+        let [below, _, g13] = frame_for x live rest env sp g12;
+        jump (rt_symbol g13 "enter!") ["%p", below, v] g13
+    },
     core.Expr.seq(x, live, inner, rest) => {
         let n = Gen.next g;
         let symbol = "@k" + to_string n;
@@ -374,6 +417,41 @@ let expr e env sp g = match e {
     },
     core.Expr.raised(a) => jump (rt_symbol g "raise!") ["%p", sp, str.concat_all ["ptrtoint (ptr ", Gen.place g, " to i64)"], atom_text env a, "0", "0"] g,
     core.Expr.raise_text(text) => jump (rt_symbol g "native_failed!") ["%p", sp, "0", "0", "0", "0"] g,
+};
+
+/// A frame for `rest` to return to, stored: where it is, and `rest`'s code.
+let frame_for : :integer -> [:integer] -> core.Expr -> :map -> :string -> Gen -> [:string, :string, Gen];
+let frame_for x live rest env sp g = {
+    // One function per `seq`, however many copies of the code before it branch there: `x` is
+    // fresh for each, and without this a chain of them doubles at every link.
+    let size = 1 + list.length live;
+    let [n, g2] = match map.lookup x (Gen.conts g) {
+        Option.some(known) => [known, g],
+        Option.none => {
+            let m = Gen.next g;
+            let g1 = g |> Gen.set_next (m + 1) |> Gen.set_conts ((Gen.conts g).[x => m]);
+            [m, g1 |> Gen.set_data (list.cons (info_with ("@i_k" + to_string m) ("@k" + to_string m) 0 size 0 "null" "null" 0 (Gen.place g1)) (Gen.data g1))
+                   |> Gen.set_pending (list.cons [("@k" + to_string m), live, x, rest] (Gen.pending g1))]
+        },
+    };
+    let [below, g3] = reserve sp size g2;
+    let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr @i_k", to_string n, " to i64)"]) g3;
+    [below, "@k" + to_string n, list.fold (fn st [i, v] -> store_at below (8 * (i + 1)) env.[v] st) g4 (list.enumerate live)]
+};
+
+let inline_budget = 32;
+
+/// What is left of `budget` after `e`, below zero when it does not fit. It stops counting there,
+/// since a function's chain of statements may be long and this is asked at each.
+let core_within : core.Expr -> :integer -> :integer;
+let core_within e !budget = if budget < 0 { budget } else {
+    match e {
+        core.Expr.choose(_, yes, no) => core_within no (core_within yes (budget - 1)),
+        core.Expr.seq(_, _, inner, rest) => core_within rest (core_within inner (budget - 2)),
+        core.Expr.catching(_, _, _, _, _) => 0 - 1,
+        core.Expr.bind(_, _, rest) => core_within rest (budget - 1),
+        _ => budget - 1,
+    }
 };
 
 let header : :string -> :string;
@@ -409,7 +487,11 @@ let drain g = match Gen.pending g {
 /// are on the stack, and the frame takes them in.
 let safepoint : :string -> :integer -> Gen -> Gen;
 let safepoint symbol extra g = {
-    let [guard, g1] = load_at "%p" 16 g;
+    // Volatile: another thread sets this, and a function that calls itself and allocates nothing
+    // becomes a loop, out of which LLVM would otherwise lift the load and never see it change.
+    let [guard_at, g0a] = instr "add i64 %p, 16" g;
+    let [guard_ptr, g0b] = instr (str.concat_all ["inttoptr i64 ", guard_at, " to ptr"]) g0a;
+    let [guard, g1] = instr ("load volatile i64, ptr " + guard_ptr) g0b;
     let [asked, g2] = instr (str.concat_all ["icmp ult i64 %sp0, ", guard]) g1;
     let [collect, g3] = label_of "collect" g2;
     let [go_on, g4] = label_of "go" g3;
@@ -641,7 +723,7 @@ let assemble user st unit_ lib_names entry = {
         (list.fold (fn m name -> m.["@m_" + name => (dialect.Unit.symbols unit_).[name]])
             %{"@raise!" => (dialect.Unit.symbols unit_).["raise!"]} (map.keys core.machine_natives))
         (map.keys (core.St.needed_lib st));
-    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names;
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{};
     let g = list.fold (fn g1 f -> function f g1) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
     let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));

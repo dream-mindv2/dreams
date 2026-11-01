@@ -228,6 +228,156 @@ let node_kids img n = {
     }
 };
 
+// --- strictness -----------------------------------------------------------------------------
+//
+// Which parameters of a pure function are always forced when a call to it is. A caller can then
+// evaluate such an argument itself rather than allocate a suspension that the callee forces at
+// once, which was the largest cost a lazy program had here. The answer is a mask per function,
+// the greatest fixed point: every parameter is assumed strict, and that is taken back until
+// nothing changes, so that a recursive function's own calls can count as forcing.
+//
+// What this gives up is which of two errors is seen, when a call has two arguments that raise.
+// That is all it gives up: a parameter is only strict if the call would have forced it, so a
+// program that finished still finishes. It is why an impure function has no mask, since there
+// an effect could come first, and why nothing under a `try!` counts, since the raise would then
+// happen outside it.
+
+/// The parameters `i` forces, as a mask. `lets` says what forcing a local forces.
+let forced_by : image.Image -> :map -> :integer -> :map -> :integer;
+let forced_by img masks i lets = if i == image.no_node { 0 } else {
+    let n = image.node img i;
+    let op = image.Node.op n;
+    let a = image.Node.a n;
+    let b = image.Node.b n;
+    let c = image.Node.c n;
+    let of_ = fn k -> forced_by img masks k lets;
+    match op {
+        8 => match map.lookup a lets {
+            Option.some(m) => m,
+            Option.none => if a < 60 { 1 << a } else { 0 },
+        },
+        13 => forced_by_call img masks a (image.kids img b c) lets,
+        14 => of_ a | (of_ b & (if c == image.no_node { 0 } else { of_ c })),
+        15 => forced_by_block img masks (image.kids img a b) lets 0,
+        20 => of_ a,
+        o if o == 32 || o == 33 => of_ a,
+        o if o == 34 || o == 35 || o == 43 || o == 45 || o == 46 || o == 84 || o == 85 || o == 78 => of_ a,
+        o if o >= 21 && o <= 31 => of_ a | of_ b,
+        o if o == 75 || o == 76 || o == 77 || o == 79 || o == 80 => of_ a | of_ b,
+        39 => of_ a,
+        41 => forced_by_arms img masks (of_ a) (image.kids img b c) lets,
+        42 => forced_by_arms img masks (of_ a) (image.kids img b c) lets,
+        _ => 0,
+    }
+};
+
+let forced_by_call : image.Image -> :map -> :integer -> [:integer] -> :map -> :integer;
+let forced_by_call img masks callee args lets = {
+    let n = image.node img callee;
+    match image.Node.op n {
+        10 => {
+            let g = image.global img (image.Node.a n);
+            let wanted = if image.Global.kind g == 0 && image.Func.arity (image.func img (image.Global.target g)) == list.length args {
+                masks.[image.Global.target g else 0]
+            } else { 0 };
+            list.fold (fn acc [k, arg] ->
+                if k < 60 && (wanted >> k) & 1 == 1 { acc | forced_by img masks arg lets } else { acc })
+                0 (list.enumerate args)
+        },
+        8 => forced_by img masks callee lets,
+        _ => 0,
+    }
+};
+
+/// A switch forces its subject, and what every arm and its fallback force.
+let forced_by_arms : image.Image -> :map -> :integer -> [:integer] -> :map -> :integer;
+let forced_by_arms img masks subject kids lets = {
+    let rec arms rest !acc = match rest {
+        [fallback] => acc & forced_by img masks fallback lets,
+        [_, target, ..more] => arms more (acc & forced_by img masks target lets),
+        _ => 0,
+    };
+    subject | arms kids (0 - 1)
+};
+
+let forced_by_block : image.Image -> :map -> [:integer] -> :map -> :integer -> :integer;
+let forced_by_block img masks statements lets acc = match statements {
+    [] => acc,
+    [i, ..rest] => {
+        let n = image.node img i;
+        let strict = image.Node.flags n & flag_strict != 0;
+        if image.Node.op n == 16 {
+            let m = forced_by img masks (image.Node.b n) lets;
+            forced_by_block img masks rest lets.[image.Node.a n => m] (if strict { acc | m } else { acc })
+        } else if rest == [] || strict {
+            forced_by_block img masks rest lets (acc | forced_by img masks i lets)
+        } else { forced_by_block img masks rest lets acc }
+    },
+};
+
+/// The masks of an image's functions, by function.
+let strict_masks : image.Image -> :map;
+let strict_masks img = {
+    let eligible = list.filter (fn f -> {
+        let fr = image.func img f;
+        image.Func.arity fr > 0 && image.Func.captures fr == 0 && image.Func.flags fr & image.func_impure == 0
+    }) (list.range 0 (image.count img "FUNC"));
+    let start = list.fold (fn m f -> {
+        let arity = image.Func.arity (image.func img f);
+        m.[f => (1 << (if arity > 60 { 60 } else { arity })) - 1]
+    }) %{} eligible;
+    let rec round masks = {
+        let [next, changed] = list.fold (fn [m, ch] f -> {
+            let old = m.[f];
+            if old == 0 { [m, ch] } else {
+                let now = old & forced_by img m (image.Func.body (image.func img f)) %{};
+                if now == old { [m, ch] } else { [m.[f => now], true] }
+            }
+        }) [masks, false] eligible;
+        if changed { round next } else { next }
+    };
+    round start
+};
+
+/// Whether evaluating `i` now rather than later could not be seen, in a function with effects:
+/// only pure calls and arithmetic on what it has. A pure function's arguments are all like that.
+let effect_free : image.Image -> :integer -> :bool;
+let effect_free img i = {
+    let n = image.node img i;
+    let op = image.Node.op n;
+    match op {
+        o if o <= 9 && o >= 1 => true,
+        o if o >= 21 && o <= 31 => effect_free img (image.Node.a n) && effect_free img (image.Node.b n),
+        o if o == 34 || o == 35 => effect_free img (image.Node.a n),
+        13 => {
+            let callee = image.node img (image.Node.a n);
+            image.Node.op callee == 10 && {
+                let g = image.global img (image.Node.a callee);
+                image.Global.kind g == 0 && image.Func.flags (image.func img (image.Global.target g)) & image.func_impure == 0
+            } && list.all (effect_free img) (image.kids img (image.Node.b n) (image.Node.c n))
+        },
+        _ => false,
+    }
+};
+
+/// Each of `args` as an atom, those `mask` names evaluated. A slot not yet bound is `let rec`,
+/// and only suspending can read that.
+let call_args : :any -> :integer -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let call_args cx mask args env s k = {
+    let bound_here = fn i env1 -> {
+        let [slots, _, made] = reads cx.[:img] i;
+        list.all (fn v -> made.[v else false] || map.has v (Env.slots env1)) (map.keys slots)
+    };
+    let rec go ns !at acc env1 s1 = match ns {
+        [] => k (list.reverse acc) env1 s1,
+        [n, ..rest] => {
+            let now = at < 60 && (mask >> at) & 1 == 1 && (cx.[:pure else false] || effect_free cx.[:img] n) && bound_here n env1;
+            (if now { value } else { lazily }) cx n env1 s1 (fn a env2 s2 -> go rest (at + 1) (list.cons a acc) env2 s2)
+        },
+    };
+    go args 0 [] env s
+};
+
 /// What `n` reads of the frame it runs in: `[slots, captures, bound]`, each a set.
 let reads : image.Image -> :integer -> [:map];
 let reads img root = {
@@ -748,7 +898,7 @@ let applied cx callee args env s = {
             let g = image.global cx.[:img] (image.Node.a n);
             let f = image.Global.target g;
             if image.Global.kind g == 0 && image.Func.arity (image.func cx.[:img] f) == list.length args {
-                lazies cx args env (queue cx f s) (fn atoms _ s2 -> [Expr.call (symbol_of cx.[:unit] f) atoms, s2])
+                call_args cx cx.[:strict].[f else 0] args env (queue cx f s) (fn atoms _ s2 -> [Expr.call (symbol_of cx.[:unit] f) atoms, s2])
             } else { unknown () }
         },
         12 => {
@@ -1604,7 +1754,8 @@ let translate cx f how s = {
     let captures = list.fold (fn m [i, v] -> m.[i => Atom.var v]) %{} (list.enumerate caps);
     let env = Env.make slots captures %{} [];
     let place = [name, image.func_source cx.[:img] f, image.func_line cx.[:img] f, image.func_col cx.[:img] f];
-    let cx1 = cx |> (fn c -> c.[:name => name]) |> (fn c -> c.[:place => place]);
+    let cx1 = cx |> (fn c -> c.[:name => name]) |> (fn c -> c.[:place => place])
+                 |> (fn c -> c.[:pure => image.Func.flags fr & image.func_impure == 0]);
     let [body, s3] = tail cx1 (image.Func.body fr) env s2;
     let func_ = Function.make symbol symbol how (image.Func.flags fr & image.func_impure != 0) params caps body name
         (list.append place [0]);
@@ -1615,6 +1766,7 @@ let translate cx f how s = {
 /// and everything they reach comes with them.
 let program : :map -> [[:any]] -> :map -> :map -> :map -> St -> St;
 let program units roots lib_names native_arity lib_arity s = {
+    let masks = map.map_values strict_masks units;
     let rec go s1 seen lib_seen = match St.queued s1 {
         [] => {
             let wanted = list.filter (fn n -> not (lib_seen.[n else false])) (map.keys (St.needed_lib s1));
@@ -1631,7 +1783,7 @@ let program units roots lib_names native_arity lib_arity s = {
             let key = str.concat_all [unit, to_string f, to_string how];
             if seen.[key else false] { go s2 seen lib_seen }
             else {
-                let cx = %{:img => units.[unit], :unit => unit, :name => "", :native_arity => native_arity, :lib_arity => lib_arity};
+                let cx = %{:img => units.[unit], :unit => unit, :name => "", :native_arity => native_arity, :lib_arity => lib_arity, :strict => masks.[unit]};
                 go (translate cx f how s2) seen.[key => true] lib_seen
             }
         },
