@@ -1,0 +1,361 @@
+// The executable writer: one relocatable object in, one executable out.
+//
+// A native build needs no linker installed, which is the whole reason this
+// exists. It is far smaller than a linker because it is asked for far less: the
+// compiler hands over one object and nothing else, so there is no symbol
+// resolution between objects, no archives and no section merging. What is left is
+// to lay the object's sections out at fixed addresses, make what the dynamic
+// loader needs to find the C library, and apply the relocations.
+//
+// The address space is fixed and the file is laid out congruent with it, an offset
+// being the address less `base`, so one number describes both. Three segments, in
+// the order the loader wants them:
+//
+//     read only   the headers, the loader's tables, the object's read-only data
+//     executable  the object's code, then one jump stub per imported function
+//     writable    the dynamic section, the imported addresses, data, then zeros
+//
+// The C library stays shared because `std.ffi` needs `dlopen` and macOS allows
+// nothing else, so an import is the one thing not known here: each gets a stub
+// that jumps through a slot the loader fills at start-up. Binding is immediate,
+// since a lazy binding would need the resolver stub and buys nothing for a
+// program that uses a few dozen functions.
+//
+// Only x86-64 ELF for now; another machine is refused by name, not misread.
+
+import std.array;
+import std.list;
+import std.map;
+import std.str;
+
+let base = 4194304;
+let page = 4096;
+let ehdr_size = 64;
+let phdr_size = 56;
+let phdr_count = 6;
+let dynsym_size = 24;
+let rela_size = 24;
+let stub_size = 16;
+/// `ff 25 rel32`, `jmp *slot(%rip)`, is six bytes of each stub.
+let stub_jump_size = 6;
+
+let sht_symtab = 2;
+let sht_rela = 4;
+let sht_nobits = 8;
+let shf_write = 1;
+let shf_alloc = 2;
+let shf_exec = 4;
+let shn_abs = 65521;
+
+let em_x86_64 = 62;
+let r_64 = 1;
+let r_pc32 = 2;
+let r_gotpcrel = 9;
+let r_plt32 = 4;
+let r_32 = 10;
+let r_32s = 11;
+let r_gotpcrelx = 41;
+let r_rex_gotpcrelx = 42;
+let r_glob_dat = 6;
+
+/// What the program needs of the machine it will run on, and the object's own
+/// bytes say the rest. `interp` is the dynamic loader's path, which is the one
+/// thing about a Linux that cannot be read from anywhere but the machine.
+group Options { interp : :string, needed : [:string] }
+
+group Section {
+    index : :integer,
+    name : :string,
+    kind : :integer,
+    flags : :integer,
+    align : :integer,
+    size : :integer,
+    link : :integer,
+    info : :integer,
+    bytes : :string,
+}
+
+group Symbol { name : :string, shndx : :integer, value : :integer }
+
+group Reloc { offset : :integer, kind : :integer, symbol : :integer, addend : :integer }
+
+// --- reading ---------------------------------------------------------------------
+
+let u8_at : :string -> :integer -> :integer;
+let u8_at s i = str.byte i s;
+let u16_at : :string -> :integer -> :integer;
+let u16_at s i = u8_at s i + 256 * u8_at s (i + 1);
+let u32_at : :string -> :integer -> :integer;
+let u32_at s i = u16_at s i + 65536 * u16_at s (i + 2);
+let u64_at : :string -> :integer -> :integer;
+let u64_at s i = u32_at s i + 4294967296 * u32_at s (i + 4);
+
+/// An addend is signed; everything else read here is a size or an address.
+let i64_at : :string -> :integer -> :integer;
+let i64_at s i = {
+    let v = u64_at s i;
+    if v >= 9223372036854775808 { v - 18446744073709551616 } else { v }
+};
+
+let cstr_at : :string -> :integer -> :string;
+let cstr_at s from = str.slice from (str.find_from from "\0" s - from) s;
+
+let sections : :string -> [Section];
+let sections obj = {
+    let table = u64_at obj 40;
+    let entry = u16_at obj 58;
+    let count = u16_at obj 60;
+    let names = u64_at obj (table + u16_at obj 62 * entry + 24);
+    list.map (fn i -> {
+        let h = table + i * entry;
+        let kind = u32_at obj (h + 4);
+        let size = u64_at obj (h + 32);
+        Section.make i (cstr_at obj (names + u32_at obj h)) kind (u64_at obj (h + 8))
+            (u64_at obj (h + 48)) size (u32_at obj (h + 40)) (u32_at obj (h + 44))
+            (if kind == sht_nobits { "" } else { str.slice (u64_at obj (h + 24)) size obj })
+    }) (list.range 0 count)
+};
+
+let symbols : [Section] -> [Symbol];
+let symbols ss = match list.filter (fn s -> Section.kind s == sht_symtab) ss {
+    [] => [],
+    [table, .._] => {
+        let names = Section.bytes ss.[Section.link table];
+        let b = Section.bytes table;
+        list.map (fn i -> {
+            let o = i * 24;
+            Symbol.make (cstr_at names (u32_at b o)) (u16_at b (o + 6)) (u64_at b (o + 8))
+        }) (list.range 0 (Section.size table / 24))
+    },
+};
+
+let relocs_of : Section -> [Reloc];
+let relocs_of s = {
+    let b = Section.bytes s;
+    list.map (fn i -> {
+        let o = i * 24;
+        Reloc.make (u64_at b o) (u32_at b (o + 8)) (u32_at b (o + 12)) (i64_at b (o + 16))
+    }) (list.range 0 (Section.size s / 24))
+};
+
+// --- writing ---------------------------------------------------------------------
+
+let le : :integer -> :integer -> :string;
+let le width v = {
+    // The two's complement of a negative field, reached without a 64-bit literal
+    // in the arithmetic: a field's low bytes do not depend on the rest.
+    let rec go !i !n !acc =
+        if i >= width { str.concat_all (list.reverse acc) }
+        else { go (i + 1) (n / 256) (list.cons (str.of_int_le 1 (n % 256)) acc) };
+    if v >= 0 { go 0 v [] }
+    else {
+        let limit = list.fold (fn a _ -> a * 256) 1 (list.range 0 width);
+        go 0 (limit + v) []
+    }
+};
+
+let align_up : :integer -> :integer -> :integer;
+let align_up alignment n =
+    if alignment <= 1 { n } else { (n + alignment - 1) / alignment * alignment };
+
+let zeros : :integer -> :string;
+let zeros n = str.repeat n "\0";
+
+// --- layout ----------------------------------------------------------------------
+
+/// Sections placed one after another from `from`: the address of each, by section
+/// index, and where they end.
+let place : [Section] -> :integer -> :map -> [:map, :integer];
+let place ss from known = list.fold (fn [m, at] s -> {
+    let a = align_up (Section.align s) at;
+    [m.[Section.index s => a], a + Section.size s]
+}) [known, from] ss;
+
+let allocated : Section -> :bool;
+let allocated s = Section.flags s & shf_alloc != 0;
+let writable : Section -> :bool;
+let writable s = Section.flags s & shf_write != 0;
+let executable : Section -> :bool;
+let executable s = Section.flags s & shf_exec != 0;
+
+/// A section's bytes with its relocations written in. `patches` is
+/// `[offset, width, value]`, and sorted here because nothing promises the order.
+let patched : :string -> [[:integer]] -> :string;
+let patched bytes patches = {
+    let rec go ps !at acc = match ps {
+        [] => str.concat_all (list.reverse (list.cons (str.slice at (len bytes - at) bytes) acc)),
+        [[offset, width, value], ..rest] =>
+            go rest (offset + width) (list.cons (le width value) (list.cons (str.slice at (offset - at) bytes) acc)),
+    };
+    go (list.sort_on (fn p -> p.[0]) patches) 0 []
+};
+
+/// Write `obj` as an executable, or say why it cannot be one.
+let link : Options -> :string -> Result :string :string;
+let link o obj =
+    if str.slice 0 4 obj != str.of_bytes [127, 69, 76, 70] { Result.error "not an ELF object" }
+    else if u16_at obj 18 != em_x86_64 { Result.error "only x86-64 can be linked yet" }
+    else { laid_out o obj };
+
+priv let laid_out : Options -> :string -> Result :string :string;
+priv let laid_out o obj = {
+    let ss = sections obj;
+    let syms = array.of_list (symbols ss);
+    let kept = list.filter allocated ss;
+    let ro = list.filter (fn s -> not (writable s) && not (executable s)) kept;
+    let rx = list.filter executable kept;
+    let rw = list.filter (fn s -> writable s && Section.kind s != sht_nobits) kept;
+    let bss = list.filter (fn s -> writable s && Section.kind s == sht_nobits) kept;
+    let relas = list.filter (fn s -> Section.kind s == sht_rela
+                                      && allocated ss.[Section.info s]) ss;
+
+    // Imports: every symbol a relocation names and the object does not define.
+    let used = list.unique (list.flat_map (fn s ->
+        list.map (fn r -> Reloc.symbol r) (relocs_of s)) relas);
+    let undefined = list.filter (fn i -> Symbol.shndx syms.[i] == 0) used;
+    let imports = list.sort (list.unique (list.map (fn i -> Symbol.name syms.[i]) undefined));
+    let count = list.length imports;
+    let import_index = list.fold (fn m [i, n] -> m.[n => i]) %{} (list.enumerate imports);
+
+    // A slot for each symbol the object defines but reaches through one: LLVM asks
+    // for that for any symbol not marked as staying in this file. The address is
+    // known here, so the slot is written rather than left to the loader.
+    let via_slot = fn r -> list.contains (Reloc.kind r) [r_gotpcrel, r_gotpcrelx, r_rex_gotpcrelx];
+    let held = list.unique (list.filter (fn i -> Symbol.shndx syms.[i] != 0)
+        (list.flat_map (fn s -> list.map (fn r -> Reloc.symbol r) (list.filter via_slot (relocs_of s))) relas));
+    let slots = count + list.length held;
+    let held_index = list.fold (fn m [i, n] -> m.[n => count + i]) %{} (list.enumerate held);
+
+    // The dynamic string table: a NUL, the libraries, the imports.
+    let [strtab, name_at] = list.fold (fn [text, m] n ->
+        [str.concat_all [text, n, "\0"], m.[n => len text]]) ["\0", %{}] (list.append (Options.needed o) imports);
+
+    let interp : :string = str.concat_all [Options.interp o, "\0"];
+    let at_interp = ehdr_size + phdr_size * phdr_count;
+    let at_hash = align_up 8 (at_interp + len interp);
+    let hash_size = 4 * (2 + 1 + count + 1);
+    let at_dynsym = align_up 8 (at_hash + hash_size);
+    let at_dynstr = at_dynsym + dynsym_size * (count + 1);
+    let at_rela = align_up 8 (at_dynstr + len strtab);
+    let ro_from = at_rela + rela_size * count;
+    let [addr0, ro_end] = place ro (base + ro_from) %{};
+
+    let rx_start = align_up page ro_end;
+    let [addr1, rx_end] = place rx rx_start addr0;
+    let at_stubs = align_up stub_size rx_end;
+    let rx_stop = at_stubs + stub_size * count;
+
+    let rw_start = align_up page rx_stop;
+    let dynamic_entries = list.length (Options.needed o) + 9;
+    let dynamic_size = 16 * dynamic_entries;
+    let at_slots = rw_start + dynamic_size;
+    let [addr2, data_end] = place rw (at_slots + 8 * slots) addr1;
+    let [addresses, bss_end] = place bss data_end addr2;
+
+    let stub_of = fn name -> at_stubs + stub_size * import_index.[name];
+    let slot_of = fn name -> at_slots + 8 * import_index.[name];
+    let slot_for = fn i -> match Symbol.shndx syms.[i] {
+        0 => slot_of (Symbol.name syms.[i]),
+        _ => at_slots + 8 * held_index.[i],
+    };
+    let symbol_address = fn i -> {
+        let s = syms.[i];
+        match Symbol.shndx s {
+            0 => stub_of (Symbol.name s),
+            n if n == shn_abs => Symbol.value s,
+            n => addresses.[n] + Symbol.value s,
+        }
+    };
+
+    // Each relocation as a patch to its section, or the name of the one that
+    // this does not know how to write. An unknown kind must stop the link: a word
+    // left unrelocated is a crash at a distance.
+    let patch_of = fn target r -> {
+        let p = addresses.[target] + Reloc.offset r;
+        let s = symbol_address (Reloc.symbol r) + Reloc.addend r;
+        match Reloc.kind r {
+            k if k == r_64 => [Reloc.offset r, 8, s],
+            k if k == r_pc32 || k == r_plt32 => [Reloc.offset r, 4, s - p],
+            k if k == r_32 || k == r_32s => [Reloc.offset r, 4, s],
+            k if k == r_gotpcrel || k == r_gotpcrelx || k == r_rex_gotpcrelx =>
+                [Reloc.offset r, 4, slot_for (Reloc.symbol r) + Reloc.addend r - p],
+            k => [:unknown, k],
+        }
+    };
+    let patches = list.fold (fn m s -> {
+        let target = Section.info s;
+        m.[target => list.append m.[target else []] (list.map (patch_of target) (relocs_of s))]
+    }) %{} relas;
+    let bad = list.filter (fn p -> p.[0] == :unknown) (list.concat (map.values patches));
+
+    match bad {
+        [[_, kind], .._] => Result.error ("a relocation of kind " + to_string kind + " cannot be written"),
+        _ => {
+            let body = fn s -> patched (Section.bytes s) patches.[Section.index s else []];
+            let lay = fn ss from -> list.fold (fn [pieces, at] s -> {
+                let a = align_up (Section.align s) at;
+                [list.cons (body s) (list.cons (zeros (a - at)) pieces), a + Section.size s]
+            }) [[], from] ss;
+            let [ro_pieces, _] = lay ro (base + ro_from);
+            let [rx_pieces, _] = lay rx rx_start;
+            let [rw_pieces, _] = lay rw (at_slots + 8 * slots);
+
+            let stubs = list.map (fn n -> {
+                let at = stub_of n;
+                str.of_bytes [255, 37] + le 4 (slot_of n - (at + stub_jump_size)) + zeros (stub_size - stub_jump_size)
+            }) imports;
+            let dynsym = zeros dynsym_size + str.concat_all (list.map (fn n ->
+                le 4 name_at.[n] + le 1 16 + le 1 0 + le 2 0 + le 8 0 + le 8 0) imports);
+            // One empty bucket: nothing is exported, so no lookup can find anything
+            // here, and every library's own search should not stop to look.
+            let hash = le 4 1 + le 4 (count + 1) + le 4 0 + zeros (4 * (count + 1));
+            let rela = str.concat_all (list.map_indexed (fn i n ->
+                le 8 (slot_of n) + le 4 r_glob_dat + le 4 (i + 1) + le 8 0) imports);
+            let tag = fn t v -> le 8 t + le 8 v;
+            let dynamic = str.concat_all (list.append
+                (list.map (fn n -> tag 1 name_at.[n]) (Options.needed o))
+                [tag 4 (base + at_hash), tag 5 (base + at_dynstr), tag 6 (base + at_dynsym),
+                 tag 10 (len strtab), tag 11 dynsym_size, tag 7 (base + at_rela),
+                 tag 8 (rela_size * count), tag 9 rela_size, tag 0 0]);
+
+            let phdr = fn kind flags from filesz memsz alignment ->
+                le 4 kind + le 4 flags + le 8 (from - base) + le 8 from + le 8 from
+                + le 8 filesz + le 8 memsz + le 8 alignment;
+            let phdrs = str.concat_all [
+                phdr 3 4 (base + at_interp) (len interp) (len interp) 1,
+                phdr 1 4 base (ro_end - base) (ro_end - base) page,
+                phdr 1 5 rx_start (rx_stop - rx_start) (rx_stop - rx_start) page,
+                phdr 1 6 rw_start (data_end - rw_start) (bss_end - rw_start) page,
+                phdr 2 6 rw_start dynamic_size dynamic_size 8,
+                // No executable stack: an object with no note would otherwise ask for one.
+                le 4 1685382481 + le 4 6 + zeros 48,
+            ];
+            match list.find (fn s -> Symbol.name s == "_start") (array.to_list syms) {
+                Option.none => Result.error "the object defines no _start",
+                Option.some(start) => {
+                    let entry = addresses.[Symbol.shndx start] + Symbol.value start;
+                    let ehdr = str.of_bytes [127, 69, 76, 70, 2, 1, 1, 0] + zeros 8 + le 2 2 + le 2 em_x86_64 + le 4 1
+                        + le 8 entry + le 8 ehdr_size + le 8 0 + le 4 0 + le 2 ehdr_size
+                        + le 2 phdr_size + le 2 phdr_count + le 2 64 + le 2 0 + le 2 0;
+                    let seq = fn at pieces -> list.fold (fn [out, here] [where, text] ->
+                        [list.cons text (list.cons (zeros (where - here)) out), where + len text]) [[], at] pieces;
+                    let [front, front_end] = seq 0 [
+                        [0, ehdr], [ehdr_size, phdrs], [at_interp, interp], [at_hash, hash],
+                        [at_dynsym, dynsym], [at_dynstr, strtab], [at_rela, rela]];
+                    let parts = list.concat [
+                        list.reverse front,
+                        list.reverse ro_pieces,
+                        [zeros (rx_start - ro_end)],
+                        list.reverse rx_pieces,
+                        [zeros (at_stubs - rx_end)],
+                        stubs,
+                        [zeros (rw_start - rx_stop), dynamic, zeros (8 * count)],
+                        list.map (fn i -> le 8 (symbol_address i)) held,
+                        list.reverse rw_pieces,
+                    ];
+                    Result.ok (str.concat_all parts)
+                },
+            }
+        },
+    }
+};

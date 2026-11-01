@@ -1,0 +1,70 @@
+// `dreams --aot`: an image in, an executable on disk.
+//
+// The stages in order, and the one thing none of them can answer for themselves:
+// which dynamic loader the executable should name. That is read from the VM
+// running this, whose own header holds a loader that exists on this machine, and
+// a build for another machine will have to say otherwise.
+//
+// Today this compiles only the runtime dialect; the machine for ordinary Dream is
+// the next step in dreams/docs/aot.md. A program it cannot compile yet is refused
+// by name, function by function, rather than built into something that fails later.
+
+import std.file;
+import std.io;
+import std.list;
+import std.str;
+import std.vm;
+
+import dreams.aot.dialect;
+import dreams.aot.image;
+import dreams.aot.link;
+
+/// The host module a dialect program imports; a build has to be told it exists.
+let primitives = "rt.prim";
+
+/// What a `-O2` is worth keeping out of a debugging session is a later question;
+/// this is the level everything is built at.
+let opt_level = 2;
+
+let default_loader = "/lib64/ld-linux-x86-64.so.2";
+
+/// The `PT_INTERP` of an ELF executable, or `()` if it has none.
+let interpreter_of : :string -> :any;
+let interpreter_of exe = {
+    let table = link.u64_at exe 32;
+    let count = link.u16_at exe 56;
+    let size = link.u16_at exe 54;
+    match list.find (fn i -> link.u32_at exe (table + i * size) == 3) (list.range 0 count) {
+        Option.none => (),
+        Option.some(i) => link.cstr_at exe (link.u64_at exe (table + i * size + 8)),
+    }
+};
+
+let loader! : :unit -> :string;
+let loader! () = match file.read! "/proc/self/exe" {
+    Option.none => default_loader,
+    Option.some(exe) => match interpreter_of exe {
+        () => default_loader,
+        path => path,
+    },
+};
+
+/// Write `bytes`, an image, to `out` as an executable: its size, or what stopped it.
+let build! : :string -> :string -> Result :integer [:string];
+let build! bytes out = match image.read bytes {
+    Result.error(why) => Result.error [why],
+    Result.ok(img) => match dialect.to_ir img {
+        Result.error(why) => Result.error why,
+        Result.ok(ir) => match vm.llvm_object! ir opt_level {
+            Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
+            Result.ok(object) => match link.link (link.Options.make (loader! ()) ["libc.so.6"]) object {
+                Result.error(why) => Result.error [why],
+                Result.ok(exe) => {
+                    file.write! out exe;
+                    io.chmod! out 493;
+                    Result.ok (len exe)
+                },
+            },
+        },
+    },
+};

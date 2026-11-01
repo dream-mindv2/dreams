@@ -28,6 +28,7 @@ import dreams.ast;
 import dreams.cache;
 import dreams.compile;
 import dreams.config;
+import dreams.aot.driver as aot;
 import dreams.diag;
 import dreams.drive;
 import dreams.emit;
@@ -946,6 +947,7 @@ let rec parse_args args o =
         ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :supercompile :roundtrip o),
         ["--supercompile", ..rest] => parse_args rest (with_opt :supercompile :drive o),
         ["--debug-info", ..rest] => parse_args rest (with_opt :debug_info true o),
+        ["--aot", ..rest] => parse_args rest (with_opt :aot true o),
         ["--no-supercompile", ..rest] => parse_args rest (with_opt :supercompile :none o),
         ["--sc-stats", ..rest] => parse_args rest (with_opt :sc_stats true o),
         ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,
@@ -1019,6 +1021,7 @@ let usage! () = {
         "  --no-supercompile        compile the program as written, even for a release",
         "  --sc-roundtrip           take the image through the supercompiler's core and back",
         "  --sc-stats               say what the supercompiler decided, and where code grew",
+        "  --aot                    write a native executable, needing no VM, rather than an image;\n                           FILE may be an image already built (dreams/docs/aot.md)",
         "  --debug-info             name each function's locals in the image, for `dream --debug`",
         "  --remap-path-prefix FROM=TO",
         "                           record source paths that begin with FROM as",
@@ -1102,6 +1105,40 @@ let cached_build! o src = {
     }
 };
 
+/// A native executable, from an image: the one named, or the one this builds
+/// first. The image is made as any build makes one, beside where the executable
+/// is going, and is not kept. See dreams/docs/aot.md.
+let native_build! o src = {
+    let out = opt o :output;
+    let finished! bytes = match aot.build! bytes out {
+        Result.ok(size) => {
+            console.error! ("compiled -> " + out + " (" + to_string size + " bytes, native)");
+            0
+        },
+        Result.error(why) => {
+            list.each! (fn line -> console.error! ("error: " + line)) why;
+            1
+        },
+    };
+    if str.ends_with ".dream" src {
+        match file.read! src {
+            Option.some(bytes) => finished! bytes,
+            Option.none => {
+                console.error! ("error: cannot read " + src);
+                1
+            },
+        }
+    } else {
+        let image = out + ".image";
+        let answer = cached_build! (o |> with_opt :output image |> append_opt :hosts aot.primitives) src;
+        if answer != 0 { answer } else {
+            let Option.some(bytes) = file.read! image;
+            file.remove_all! image;
+            finished! bytes
+        }
+    }
+};
+
 let run_command! o file =
     match opt o :command {
         :tokens    => with_source! file (fn src -> tokenize! file src),
@@ -1110,7 +1147,7 @@ let run_command! o file =
         :fmt       => format_files! (list.cons file (o.[:more_files else []])) false,
         :fmt_check => format_files! (list.cons file (o.[:more_files else []])) true,
         :check     => check_program! (load! o file) (compile_options o),
-        :build     => cached_build! o file,
+        :build     => if opt o :aot == true { native_build! o file } else { cached_build! o file },
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),
         :ir        => show_ir! (load! o file),

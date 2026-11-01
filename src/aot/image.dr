@@ -1,0 +1,107 @@
+// An image, read: what the AOT compiler takes as its input.
+//
+// Nothing is unpacked. A section is a position in the file and a record a fixed
+// size, so each accessor reads the bytes it was asked for and a large image costs
+// what is looked at. The format is dream/docs/bytecode-format.md; only what the
+// format says is relied on, and nothing about how the VM runs it.
+
+import std.array;
+import std.list;
+import std.map;
+import std.str;
+
+group Image { bytes : :string, table : :map, entry : :integer }
+
+group Node { op : :integer, flags : :integer, a : :integer, b : :integer, c : :integer }
+
+group Func {
+    name : :integer,
+    body : :integer,
+    arity : :integer,
+    flags : :integer,
+    slots : :integer,
+    captures : :integer,
+}
+
+group Global { name : :integer, kind : :integer, target : :integer }
+
+/// The sentinel for an absent edge, the entry included.
+let no_node = 4294967295;
+
+let func_impure = 1;
+let func_global_value = 8;
+
+let u32_at : :string -> :integer -> :integer;
+let u32_at s i = str.byte i s + 256 * str.byte (i + 1) s + 65536 * str.byte (i + 2) s
+    + 16777216 * str.byte (i + 3) s;
+let u16_at : :string -> :integer -> :integer;
+let u16_at s i = str.byte i s + 256 * str.byte (i + 1) s;
+/// A `KINT` constant, which is signed. Built from halves because a 64-bit field's
+/// top half is what says so.
+let i64_at : :string -> :integer -> :integer;
+let i64_at s i = {
+    let low = u32_at s i;
+    let high = u32_at s (i + 4);
+    (if high >= 2147483648 { high - 4294967296 } else { high }) * 4294967296 + low
+};
+
+/// `bytes` as an image, or why it is not one.
+let read : :string -> Result Image :string;
+let read bytes =
+    if len bytes < 32 || str.slice 0 8 bytes != "DAGNCAAF" { Result.error "not a Dream image" }
+    else if u16_at bytes 8 != 0 { Result.error "an image of a format this compiler does not read" }
+    else {
+        let table = list.fold (fn m i -> {
+            let at = 32 + 16 * i;
+            m.[str.slice at 4 bytes => [u32_at bytes (at + 4), u32_at bytes (at + 12)]]
+        }) %{} (list.range 0 (u32_at bytes 28));
+        Result.ok (Image.make bytes table (u32_at bytes 24))
+    };
+
+priv let at : Image -> :string -> :integer;
+priv let at img kind = (Image.table img).[kind else [0, 0]].[0];
+
+let count : Image -> :string -> :integer;
+let count img kind = (Image.table img).[kind else [0, 0]].[1];
+
+let node : Image -> :integer -> Node;
+let node img i = {
+    let b = Image.bytes img;
+    let o = at img "NODE" + 16 * i;
+    Node.make (str.byte o b) (str.byte (o + 1) b) (u32_at b (o + 4)) (u32_at b (o + 8)) (u32_at b (o + 12))
+};
+
+let kid : Image -> :integer -> :integer;
+let kid img i = u32_at (Image.bytes img) (at img "KIDS" + 4 * i);
+
+let kids : Image -> :integer -> :integer -> [:integer];
+let kids img offset n = list.map (fn i -> kid img (offset + i)) (list.range 0 n);
+
+let func : Image -> :integer -> Func;
+let func img i = {
+    let b = Image.bytes img;
+    let o = at img "FUNC" + 32 * i;
+    Func.make (u32_at b o) (u32_at b (o + 4)) (u16_at b (o + 8)) (u16_at b (o + 10))
+              (u16_at b (o + 12)) (u16_at b (o + 14))
+};
+
+let global : Image -> :integer -> Global;
+let global img i = {
+    let b = Image.bytes img;
+    let o = at img "GLBL" + 16 * i;
+    Global.make (u32_at b o) (u32_at b (o + 4)) (u32_at b (o + 8))
+};
+
+let string : Image -> :integer -> :string;
+let string img i = {
+    let b = Image.bytes img;
+    let o = at img "KSTR" + 8 * i;
+    str.slice (at img "SBLB" + u32_at b o) (u32_at b (o + 4)) b
+};
+
+let integer : Image -> :integer -> :integer;
+let integer img i = i64_at (Image.bytes img) (at img "KINT" + 8 * i);
+
+/// The path of import `i`: what a module global's target names.
+let import_path : Image -> :integer -> :string;
+let import_path img i = string img (u32_at (Image.bytes img) (at img "IMPT" + 8 * i));

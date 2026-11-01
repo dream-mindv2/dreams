@@ -1,0 +1,479 @@
+// The runtime dialect: Dream's syntax, a machine's meaning.
+//
+// A collector cannot allocate and cannot be lazy, and neither can anything it
+// calls, so the part of an AOT program's runtime that must be below the language
+// is written in a dialect of it. A dialect program is an ordinary Dream program
+// to the front end, and the parser and the checker need to know nothing. The
+// difference is all here, in what its image is compiled to:
+//
+//   - every value is one raw 64-bit word, and a boolean is 0 or 1;
+//   - evaluation is eager, so a `let` runs where it is written;
+//   - arithmetic wraps, and `/` and `%` truncate as a machine's do;
+//   - a call names a top-level function, and every call is direct;
+//   - memory and the C library are reached through the host module `rt.prim`,
+//     which only this file knows. No VM implements it, so adding a primitive
+//     needs no change to the VM and no staged seed.
+//
+// What would need the heap or a thunk has no meaning here and is refused, each
+// with the function it was found in: a list, a closure, a match on a list. A
+// refused program is reported whole rather than at its first refusal.
+//
+// Functions are `tailcc` and a call in tail position is `musttail`, so a dialect
+// loop is a loop. No function may have more than six parameters: see "one
+// signature" in dreams/docs/aot.md for what stack arguments do.
+
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.aot.image;
+
+/// `tailcc` passes this many in registers on x86-64.
+let max_params = 6;
+
+/// What generating one function has so far: its lines newest first, the block
+/// they are going in, and what the module will have to define because of it.
+group State {
+    next : :integer,
+    lines : [:string],
+    label : :string,
+    functions : :map,
+    strings : :map,
+    imports : :map,
+    refused : [:string],
+}
+
+let empty_state : State;
+let empty_state = State.make 0 [] "entry" %{} %{} %{} [];
+
+let line : :string -> State -> State;
+let line text s = State.set_lines (list.cons text (State.lines s)) s;
+
+let fresh : State -> [:string, State];
+let fresh s = [str.concat_all ["%t", to_string (State.next s)], State.set_next (State.next s + 1) s];
+
+let fresh_label : :string -> State -> [:string, State];
+let fresh_label stem s =
+    [str.concat_all [stem, to_string (State.next s)], State.set_next (State.next s + 1) s];
+
+let start_block : :string -> State -> State;
+let start_block name s = State.set_label name (line (name + ":") s);
+
+/// An answer that stands in for what could not be compiled, so that generation
+/// goes on and finds the rest.
+let refuse : :string -> State -> [:string, State];
+let refuse why s = ["0", State.set_refused (list.cons why (State.refused s)) s];
+
+/// `%t = <instruction>`, answering the name.
+let instr : :string -> State -> [:string, State];
+let instr text s = {
+    let [name, s1] = fresh s;
+    [name, line (str.concat_all ["  ", name, " = ", text]) s1]
+};
+
+/// A comparison's `i1` as a dialect boolean.
+let widened : :string -> State -> [:string, State];
+let widened text s = {
+    let [bit, s1] = instr text s;
+    instr (str.concat_all ["zext i1 ", bit, " to i64"]) s1
+};
+
+let binary : :string -> :string -> :string -> State -> [:string, State];
+let binary op a b s = instr (str.concat_all [op, " i64 ", a, ", ", b]) s;
+
+/// What each arithmetic opcode is, and each comparison's condition. By number
+/// because that is how the format names them.
+let arithmetic : %{:integer => :string};
+let arithmetic = %{21 => "add", 22 => "sub", 23 => "mul", 24 => "sdiv", 25 => "srem",
+                   75 => "and", 76 => "or", 77 => "xor", 79 => "shl", 80 => "ashr"};
+let comparisons : %{:integer => :string};
+let comparisons = %{26 => "eq", 27 => "ne", 28 => "slt", 29 => "sle", 30 => "sgt", 31 => "sge"};
+
+let slot : :integer -> :string;
+let slot n = str.concat_all ["%slot", to_string n];
+let function_name : :integer -> :string;
+let function_name f = str.concat_all ["@f", to_string f];
+
+let args_text : [:string] -> :string;
+let args_text vals = str.join_str ", " (list.map (fn v -> "i64 " + v) vals);
+
+/// Each of `nodes` evaluated in order, left to right.
+let values : :any -> [:integer] -> State -> [[:string], State];
+let rec values cx nodes s = {
+    let rec go ns acc st = match ns {
+        [] => [list.reverse acc, st],
+        [n, ..rest] => {
+            let [v, st1] = value cx n st;
+            go rest (list.cons v acc) st1
+        },
+    };
+    go nodes [] s
+};
+
+/// The function a callee node names directly, as `[function, arity]`, or `()`.
+let direct : :any -> image.Node -> :any;
+let direct cx callee = match image.Node.op callee {
+    10 => {
+        let g = image.global cx.[:img] (image.Node.a callee);
+        if image.Global.kind g == 0 {
+            [image.Global.target g, image.Func.arity (image.func cx.[:img] (image.Global.target g))]
+        } else { () }
+    },
+    _ => (),
+};
+
+let member_of_prim : :any -> image.Node -> :any;
+let member_of_prim cx callee = match image.Node.op callee {
+    12 => {
+        let object = image.node cx.[:img] (image.Node.a callee);
+        let is_prim = image.Node.op object == 10 && {
+            let g = image.global cx.[:img] (image.Node.a object);
+            image.Global.kind g == 1 && image.import_path cx.[:img] (image.Global.target g) == "rt.prim"
+        };
+        if is_prim { image.string cx.[:img] (image.Node.b callee) } else { () }
+    },
+    _ => (),
+};
+
+let loaded : :string -> :string -> State -> [:string, State];
+let loaded width address s = {
+    let [p, s1] = instr (str.concat_all ["inttoptr i64 ", address, " to ptr"]) s;
+    if width == "i64" { instr ("load i64, ptr " + p) s1 }
+    else {
+        let [v, s2] = instr (str.concat_all ["load ", width, ", ptr ", p]) s1;
+        instr (str.concat_all ["zext ", width, " ", v, " to i64"]) s2
+    }
+};
+
+let stored : :string -> :string -> :string -> State -> [:string, State];
+let stored width address v s = {
+    let [p, s1] = instr (str.concat_all ["inttoptr i64 ", address, " to ptr"]) s;
+    if width == "i64" { ["0", line (str.concat_all ["  store i64 ", v, ", ptr ", p]) s1] }
+    else {
+        let [t, s2] = instr (str.concat_all ["trunc i64 ", v, " to ", width]) s1;
+        ["0", line (str.concat_all ["  store ", width, " ", t, ", ptr ", p]) s2]
+    }
+};
+
+/// A call to a primitive. `cN!` takes the C function's name as a literal first
+/// argument, because a symbol is not a value.
+let primitive : :any -> :string -> [:integer] -> State -> [:string, State];
+let primitive cx name args s = match name {
+    "c0!" => c_call cx args s,
+    "c1!" => c_call cx args s,
+    "c2!" => c_call cx args s,
+    "c3!" => c_call cx args s,
+    "c4!" => c_call cx args s,
+    "c5!" => c_call cx args s,
+    "c6!" => c_call cx args s,
+    _ => {
+        let [vals, s1] = values cx args s;
+        match [name, vals] {
+            ["load8!", [a]] => loaded "i8" a s1,
+            ["load16!", [a]] => loaded "i16" a s1,
+            ["load32!", [a]] => loaded "i32" a s1,
+            ["load64!", [a]] => loaded "i64" a s1,
+            ["store8!", [a, v]] => stored "i8" a v s1,
+            ["store16!", [a, v]] => stored "i16" a v s1,
+            ["store32!", [a, v]] => stored "i32" a v s1,
+            ["store64!", [a, v]] => stored "i64" a v s1,
+            // A string literal's length sits in the word before its bytes.
+            ["str_len", [a]] => {
+                let [back, s2] = binary "sub" a "8" s1;
+                loaded "i64" back s2
+            },
+            ["ult", [a, b]] => widened (str.concat_all ["icmp ult i64 ", a, ", ", b]) s1,
+            ["ule", [a, b]] => widened (str.concat_all ["icmp ule i64 ", a, ", ", b]) s1,
+            ["ushr", [a, b]] => binary "lshr" a b s1,
+            ["udiv", [a, b]] => binary "udiv" a b s1,
+            ["urem", [a, b]] => binary "urem" a b s1,
+            // A C `int` answer's top half is not promised to mean anything.
+            ["sext32", [a]] => {
+                let [t, s2] = instr (str.concat_all ["trunc i64 ", a, " to i32"]) s1;
+                instr (str.concat_all ["sext i32 ", t, " to i64"]) s2
+            },
+            _ => refuse (str.concat_all [cx.[:name], ": no primitive `", name, "` of ",
+                                         to_string (list.length args), " arguments"]) s1,
+        }
+    },
+};
+
+let c_call : :any -> [:integer] -> State -> [:string, State];
+let c_call cx args s = match args {
+    [] => refuse (cx.[:name] + ": a C call needs the function's name") s,
+    [first, ..rest] => {
+        let n = image.node cx.[:img] first;
+        if image.Node.op n != 3 {
+            refuse (cx.[:name] + ": a C function's name must be a literal") s
+        } else {
+            let symbol = image.string cx.[:img] (image.Node.a n);
+            let [vals, s1] = values cx rest s;
+            let s2 = State.set_imports ((State.imports s1).[symbol => list.length rest]) s1;
+            instr (str.concat_all ["call i64 @", symbol, "(", args_text vals, ")"]) s2
+        }
+    },
+};
+
+/// A direct call's answer. `cx` says how: as a value, or in tail position.
+let call_of : :any -> image.Node -> [:integer] -> :bool -> State -> [:string, State];
+let call_of cx n args tail s = {
+    let callee = image.node cx.[:img] (image.Node.a n);
+    match [member_of_prim cx callee, direct cx callee] {
+        [(), ()] => refuse (cx.[:name] + ": a call that does not name a top-level function") s,
+        [(), [target, arity]] =>
+            if arity != list.length args {
+                refuse (str.concat_all [cx.[:name], ": a call giving ", to_string (list.length args),
+                                        " arguments to a function of ", to_string arity,
+                                        "; a partial application needs the heap"]) s
+            } else {
+                let [vals, s1] = values cx args s;
+                let s2 = State.set_functions ((State.functions s1).[target => true]) s1;
+                let call = str.concat_all ["call tailcc i64 ", function_name target, "(", args_text vals, ")"];
+                instr (if tail { "musttail " + call } else { call }) s2
+            },
+        [name, _] => primitive cx name args s,
+    }
+};
+
+/// `n`'s value, in the block `s` is in.
+let value : :any -> :integer -> State -> [:string, State];
+let rec value cx node_index s = {
+    let n = image.node cx.[:img] node_index;
+    let op = image.Node.op n;
+    match op {
+        1 => [to_string (image.integer cx.[:img] (image.Node.a n)), s],
+        3 => {
+            let i = image.Node.a n;
+            let s1 = State.set_strings ((State.strings s).[i => true]) s;
+            instr (str.concat_all ["ptrtoint ptr getelementptr (i8, ptr @s", to_string i, ", i64 8) to i64"]) s1
+        },
+        4 => [to_string (image.Node.a n), s],
+        5 => [to_string (image.Node.a n), s],
+        7 => ["0", s],
+        8 => instr ("load i64, ptr " + slot (image.Node.a n)) s,
+        10 => match direct cx n {
+            [target, 0] => {
+                let s1 = State.set_functions ((State.functions s).[target => true]) s;
+                instr (str.concat_all ["call tailcc i64 ", function_name target, "()"]) s1
+            },
+            _ => refuse (cx.[:name] + ": a function or module used as a value") s,
+        },
+        13 => call_of cx n (image.kids cx.[:img] (image.Node.b n) (image.Node.c n)) false s,
+        14 => if_value cx n s,
+        15 => block_value cx (image.kids cx.[:img] (image.Node.a n) (image.Node.b n)) s,
+        16 => {
+            let [v, s1] = value cx (image.Node.b n) s;
+            [v, line (str.concat_all ["  store i64 ", v, ", ptr ", slot (image.Node.a n)]) s1]
+        },
+        20 => value cx (image.Node.a n) s,
+        32 => short_circuit cx "and" n s,
+        33 => short_circuit cx "or" n s,
+        34 => {
+            let [v, s1] = value cx (image.Node.a n) s;
+            binary "sub" "0" v s1
+        },
+        35 => {
+            let [v, s1] = value cx (image.Node.a n) s;
+            widened (str.concat_all ["icmp eq i64 ", v, ", 0"]) s1
+        },
+        78 => {
+            let [v, s1] = value cx (image.Node.a n) s;
+            binary "xor" v "-1" s1
+        },
+        _ => match [map.lookup op arithmetic, map.lookup op comparisons] {
+            [Option.some(operation), _] => {
+                let [a, s1] = value cx (image.Node.a n) s;
+                let [b, s2] = value cx (image.Node.b n) s1;
+                binary operation a b s2
+            },
+            [_, Option.some(condition)] => {
+                let [a, s1] = value cx (image.Node.a n) s;
+                let [b, s2] = value cx (image.Node.b n) s1;
+                widened (str.concat_all ["icmp ", condition, " i64 ", a, ", ", b]) s2
+            },
+            _ => refuse (str.concat_all [cx.[:name], ": opcode ", to_string op,
+                                         " needs the heap, and the dialect has none"]) s,
+        },
+    }
+};
+
+let branch_on : :string -> :string -> :string -> State -> State;
+let branch_on v yes no s = {
+    let [bit, s1] = instr (str.concat_all ["icmp ne i64 ", v, ", 0"]) s;
+    line (str.concat_all ["  br i1 ", bit, ", label %", yes, ", label %", no]) s1
+};
+
+/// Both arms, joined by a `phi`. An arm's value is read from the block it ended
+/// in, which is not the one it began in if it held another `if`.
+let if_value : :any -> image.Node -> State -> [:string, State];
+let if_value cx n s = {
+    let [c, s1] = value cx (image.Node.a n) s;
+    let [yes, s2] = fresh_label "then" s1;
+    let [no, s3] = fresh_label "else" s2;
+    let [join, s4] = fresh_label "join" s3;
+    let s5 = start_block yes (branch_on c yes no s4);
+    let [a, s6] = value cx (image.Node.b n) s5;
+    let from_yes = State.label s6;
+    let s7 = start_block no (line ("  br label %" + join) s6);
+    let [b, s8] = value cx (image.Node.c n) s7;
+    let from_no = State.label s8;
+    let s9 = start_block join (line ("  br label %" + join) s8);
+    instr (str.concat_all ["phi i64 [ ", a, ", %", from_yes, " ], [ ", b, ", %", from_no, " ]"]) s9
+};
+
+let short_circuit : :any -> :string -> image.Node -> State -> [:string, State];
+let short_circuit cx which n s = {
+    let [a, s1] = value cx (image.Node.a n) s;
+    let from = State.label s1;
+    let [more, s2] = fresh_label "more" s1;
+    let [join, s3] = fresh_label "join" s2;
+    let s4 = if which == "and" { branch_on a more join s3 } else { branch_on a join more s3 };
+    let [b, s5] = value cx (image.Node.b n) (start_block more s4);
+    let from_more = State.label s5;
+    let s6 = start_block join (line ("  br label %" + join) s5);
+    instr (str.concat_all ["phi i64 [ ", a, ", %", from, " ], [ ", b, ", %", from_more, " ]"]) s6
+};
+
+let block_value : :any -> [:integer] -> State -> [:string, State];
+let block_value cx statements s = {
+    let rec go ns last st = match ns {
+        [] => [last, st],
+        [n, ..rest] => {
+            let [v, st1] = value cx n st;
+            go rest v st1
+        },
+    };
+    go statements "0" s
+};
+
+/// `n` as what the function answers. A call here is a jump, which is the whole of
+/// how a dialect loop runs in constant stack, so this descends through what a
+/// tail position can be inside of.
+let returning : :any -> :integer -> State -> State;
+let rec returning cx node_index s = {
+    let n = image.node cx.[:img] node_index;
+    match image.Node.op n {
+        13 => {
+            let [v, s1] = call_of cx n (image.kids cx.[:img] (image.Node.b n) (image.Node.c n)) true s;
+            line ("  ret i64 " + v) s1
+        },
+        14 => {
+            let [c, s1] = value cx (image.Node.a n) s;
+            let [yes, s2] = fresh_label "then" s1;
+            let [no, s3] = fresh_label "else" s2;
+            let s4 = returning cx (image.Node.b n) (start_block yes (branch_on c yes no s3));
+            returning cx (image.Node.c n) (start_block no s4)
+        },
+        15 => {
+            let statements = image.kids cx.[:img] (image.Node.a n) (image.Node.b n);
+            match list.reverse statements {
+                [] => line "  ret i64 0" s,
+                [last, ..before] => {
+                    let [_, s1] = block_value cx (list.reverse before) s;
+                    returning cx last s1
+                },
+            }
+        },
+        20 => returning cx (image.Node.a n) s,
+        _ => {
+            let [v, s1] = value cx node_index s;
+            line ("  ret i64 " + v) s1
+        },
+    }
+};
+
+/// One function's text. The slots are `alloca`s, which LLVM's first pass makes
+/// registers, so generation need not know which block last wrote one.
+let function_text : image.Image -> :integer -> State -> [:string, State];
+let function_text img f s = {
+    let rec_ = image.func img f;
+    let name = image.string img (image.Func.name rec_);
+    let arity = image.Func.arity rec_;
+    let cx = %{:img => img, :name => name};
+    let params = list.range 0 arity;
+    let s0 = s |> State.set_lines [] |> State.set_next 0 |> State.set_label "entry";
+    let s1 = if arity > max_params {
+        State.set_refused (list.cons (str.concat_all [name, ": more than ", to_string max_params, " parameters"])
+                                     (State.refused s0)) s0
+    } else if image.Func.captures rec_ != 0 {
+        State.set_refused (list.cons (name + ": a closure needs the heap") (State.refused s0)) s0
+    } else { s0 };
+    let s2 = list.fold (fn st i -> line (str.concat_all ["  ", slot i, " = alloca i64"]) st) s1
+        (list.range 0 (image.Func.slots rec_));
+    let s3 = list.fold (fn st i -> line (str.concat_all ["  store i64 %a", to_string i, ", ptr ", slot i]) st) s2 params;
+    let s4 = returning cx (image.Func.body rec_) s3;
+    let signature = str.join_str ", " (list.map (fn i -> "i64 %a" + to_string i) params);
+    let text = str.concat_all (list.flat_map (fn l -> [l, "\n"]) (list.reverse (State.lines s4)));
+    [str.concat_all ["; ", name, "\ndefine internal tailcc i64 ", function_name f, "(", signature,
+                     ") {\nentry:\n", text, "}\n"], s4]
+};
+
+/// A string's bytes in LLVM's notation.
+let escaped : :string -> :string;
+let escaped text = str.concat_all (list.map (fn i -> {
+    let hex = "0123456789ABCDEF";
+    let b = str.byte i text;
+    str.concat_all ["\\", str.slice (b / 16) 1 hex, str.slice (b % 16) 1 hex]
+}) (list.range 0 (len text)));
+
+let string_text : image.Image -> :integer -> :string;
+let string_text img i = {
+    let text = image.string img i;
+    let n = to_string (len text + 1);
+    str.concat_all ["@s", to_string i, " = private constant <{ i64, [", n, " x i8] }> <{ i64 ",
+                    to_string (len text), ", [", n, " x i8] c\"", escaped text, "\\00\" }>\n"]
+};
+
+/// Program entry, for x86-64: what the C runtime's own start file would do, since
+/// there is none here. Written as module assembly because the stack it has to
+/// read is exactly what a function's prologue would disturb.
+let start_text : :string;
+let start_text = str.concat_all (list.map (fn l -> str.concat_all ["module asm \"", l, "\"\n"]) [
+    ".globl _start", "_start:", "  xorl %ebp, %ebp", "  movq %rdx, %r9", "  popq %rsi",
+    "  movq %rsp, %rdx", "  andq $-16, %rsp", "  pushq %rax", "  pushq %rsp", "  xorl %r8d, %r8d",
+    "  xorl %ecx, %ecx", "  movq $main, %rdi", "  call __libc_start_main", "  hlt"]);
+
+/// Every function reachable from `f`, generated once each. A worklist because the
+/// image also carries what nothing here calls, the prelude first of all.
+let reachable : image.Image -> [:integer] -> :map -> [:string] -> State -> [[:string], State];
+let rec reachable img work seen texts s = match work {
+    [] => [texts, s],
+    [f, ..rest] =>
+        if seen.[f else false] { reachable img rest seen texts s }
+        else {
+            let [text, s1] = function_text img f s;
+            reachable img (list.append (map.keys (State.functions s1)) rest) seen.[f => true]
+                (list.cons text texts) (State.set_functions %{} s1)
+        },
+};
+
+/// `img` as LLVM IR, or everything in it the dialect has no meaning for.
+let to_ir : image.Image -> Result :string [:string];
+let to_ir img = {
+    let entry = image.Image.entry img;
+    if entry == image.no_node { Result.error ["the program has no main!"] }
+    else {
+        let [texts, s] = reachable img [entry] %{} [] empty_state;
+        match State.refused s {
+            [] => {
+                let arity = image.Func.arity (image.func img entry);
+                let units = list.replicate arity "0";
+                let declares = list.map (fn [symbol, n] ->
+                    str.concat_all ["declare i64 @", symbol, "(",
+                                    str.join_str ", " (list.replicate n "i64"), ")\n"])
+                    (map.pairs (State.imports s));
+                Result.ok (str.concat_all (list.concat [
+                    ["target triple = \"x86_64-unknown-linux-gnu\"\n", start_text,
+                     "declare void @__libc_start_main()\n"],
+                    declares,
+                    list.map (string_text img) (map.keys (State.strings s)),
+                    list.reverse texts,
+                    [str.concat_all ["define dso_local i32 @main() {\n  %r = call tailcc i64 ",
+                                     function_name entry, "(", args_text units,
+                                     ")\n  %c = trunc i64 %r to i32\n  ret i32 %c\n}\n"]],
+                ]))
+            },
+            why => Result.error (list.unique (list.reverse why)),
+        }
+    }
+};
