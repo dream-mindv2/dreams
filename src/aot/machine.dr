@@ -28,6 +28,7 @@ group Gen {
     pending : [[:any]],
     data : [:string],
     code : [:string],
+    place : :string,
     rt : %{:string => :string},
     names : %{:string => :string},
 }
@@ -232,13 +233,14 @@ let info_symbol name =
     if str.starts_with "@" name { "@i_" + str.slice 1 (len name - 1) name } else { "@i_" + name };
 
 let info_text : :string -> :string -> :integer -> :integer -> :integer -> :string;
-let info_text name code kind size arity = info_with name code kind size arity "null" "null" 0;
+let info_text name code kind size arity = info_with name code kind size arity "null" "null" 0 "null";
 
 /// An info: seven words, `rt/main.dr` says what each is.
-let info_with : :string -> :string -> :integer -> :integer -> :integer -> :string -> :string -> :integer -> :string;
-let info_with name code kind size arity call shown impure =
-    str.concat_all [name, " = internal constant <{ ptr, i64, i64, i64, ptr, ptr, i64 }> <{ ptr ", code, ", i64 ", to_string kind,
-                    ", i64 ", to_string size, ", i64 ", to_string arity, ", ptr ", call, ", ptr ", shown, ", i64 ", to_string impure, " }>\n"];
+let info_with : :string -> :string -> :integer -> :integer -> :integer -> :string -> :string -> :integer -> :string -> :string;
+let info_with name code kind size arity call shown impure place =
+    str.concat_all [name, " = internal constant <{ ptr, i64, i64, i64, ptr, ptr, i64, ptr }> <{ ptr ", code, ", i64 ", to_string kind,
+                    ", i64 ", to_string size, ", i64 ", to_string arity, ", ptr ", call, ", ptr ", shown, ", i64 ", to_string impure,
+                    ", ptr ", place, " }>\n"];
 
 /// A value of the right-hand side of a `bind`.
 let rhs : core.Rhs -> :map -> :string -> Gen -> [:string, Gen];
@@ -346,7 +348,7 @@ let expr e env sp g = match e {
         let info = "@i_k" + to_string n;
         let size = 1 + list.length live;
         let g1 = Gen.set_next (n + 1) g;
-        let g2 = g1 |> Gen.set_data (list.cons (info_text info symbol 0 size 0) (Gen.data g1))
+        let g2 = g1 |> Gen.set_data (list.cons (info_with info symbol 0 size 0 "null" "null" 0 (Gen.place g1)) (Gen.data g1))
                     |> Gen.set_pending (list.cons [symbol, live, x, rest] (Gen.pending g1));
         let [below, g3] = reserve sp size g2;
         let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr ", info, " to i64)"]) g3;
@@ -359,7 +361,7 @@ let expr e env sp g = match e {
         let info = "@i_k" + to_string n;
         let size = 1 + list.length live;
         let g1 = Gen.set_next (n + 1) g;
-        let g2 = g1 |> Gen.set_data (list.cons (info_with info (rt_symbol g "frame_catch_return!") (if cleanup { 23 } else { 20 }) size 0 symbol "null" 0) (Gen.data g1))
+        let g2 = g1 |> Gen.set_data (list.cons (info_with info (rt_symbol g "frame_catch_return!") (if cleanup { 23 } else { 20 }) size 0 symbol "null" 0 (Gen.place g1)) (Gen.data g1))
                     |> Gen.set_pending (list.cons [symbol, live, x, handler] (Gen.pending g1));
         let [below, g3] = reserve sp size g2;
         let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr ", info, " to i64)"]) g3;
@@ -370,6 +372,7 @@ let expr e env sp g = match e {
         let [v, g1] = rhs r env sp g;
         expr rest env.[x => v] sp g1
     },
+    core.Expr.raised(a) => jump (rt_symbol g "raise!") ["%p", sp, str.concat_all ["ptrtoint (ptr ", Gen.place g, " to i64)"], atom_text env a, "0", "0"] g,
     core.Expr.raise_text(text) => jump (rt_symbol g "native_failed!") ["%p", sp, "0", "0", "0", "0"] g,
 };
 
@@ -416,6 +419,18 @@ let safepoint symbol extra g = {
     start go_on (jump (rt_symbol g7 "collect_at_entry!") ["%p", "%sp0", "%a", "%b", "%c", "%d"] g7)
 };
 
+/// A function's place, as static words: what a raise from it or a frame of it reports.
+let place_of : core.Function -> :string -> [[:string], :string];
+let place_of f plain = match core.Function.place f {
+    [name, path, line, col, made] => {
+        let symbol = "@pl_" + plain;
+        [[string_object ("@pln_" + plain) name, string_object ("@plp_" + plain) path,
+          str.concat_all [symbol, " = internal constant <{ ptr, ptr, i64, i64, i64 }> <{ ptr @pln_", plain, ", ptr @plp_", plain,
+                          ", i64 ", to_string line, ", i64 ", to_string col, ", i64 ", to_string made, " }>\n"]], symbol]
+    },
+    _ => [[], "null"],
+};
+
 /// One core function, and its infos.
 let function : core.Function -> Gen -> Gen;
 let function f g = {
@@ -426,7 +441,9 @@ let function f g = {
     let plain = str.slice 1 (len symbol - 1) symbol;
     let arity = list.length params;
     let extra = if arity > 3 { arity - 3 } else { 0 };
-    let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry";
+    let [place_text, place_sym] = place_of f plain;
+    let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_place place_sym
+              |> (fn x -> Gen.set_data (list.append place_text (Gen.data x)) x);
     let g1 = safepoint symbol extra g0;
     let registers = ["%b", "%c", "%d"];
     let env0 = list.fold (fn m [i, v] -> if i < 3 { m.[v => registers.[i]] } else { m }) %{} (list.enumerate params);
@@ -457,7 +474,7 @@ let function f g = {
         :caf => [info_text (info_symbol symbol) symbol 0 1 0],
         _ => [
             string_object ("@fn_" + plain) (core.Function.name f),
-            info_with ("@i_c" + plain) (rt_symbol g7 "code_value!") 3 (list.length captures) arity symbol ("@fn_" + plain) (if core.Function.impure f { 1 } else { 0 }),
+            info_with ("@i_c" + plain) (rt_symbol g7 "code_value!") 3 (list.length captures) arity symbol ("@fn_" + plain) (if core.Function.impure f { 1 } else { 0 }) "null",
             str.concat_all ["@c_", plain, " = internal constant <{ ptr }> <{ ptr @i_c", plain, " }>, align 8\n"],
         ],
     };
@@ -490,7 +507,7 @@ let fixed_infos g = {
      info_text "@i_map" (rt "code_value!") 10 0 0,
      info_text "@i_map_leaf" (rt "code_value!") 11 4 0,
      info_text "@i_big" (rt "code_value!") 12 0 0,
-     info_text "@i_error" (rt "code_value!") 13 2 0,
+     info_text "@i_error" (rt "code_value!") 13 3 0,
      info_text "@i_raised" (rt "code_raised!") 0 1 0,
      info_text "@i_deferred2" (rt "code_deferred2!") 0 3 0,
      info_text "@i_update" (rt "frame_update!") 21 2 0,
@@ -500,10 +517,15 @@ let fixed_infos g = {
      info_text "@i_enter_again" (rt "frame_enter_again!") 0 2 0,
      info_text "@i_start" (rt "frame_start!") 0 2 0,
      info_text "@i_process" (rt "code_value!") 14 1 0,
+     info_text "@i_trunk" (rt "code_value!") 15 3 0,
      info_text "@i_m_join" (rt "join_m!") 0 0 0,
      info_text "@i_m_recv" (rt "recv_m!") 0 0 0,
      info_text "@i_m_await" (rt "await_message_m!") 0 0 0,
      info_text "@i_m_sleep" (rt "sleep_until_m!") 0 0 0,
+     info_text "@i_m_read" (rt "io_read_m!") 0 0 0,
+     info_text "@i_m_write" (rt "io_write_m!") 0 0 0,
+     info_text "@i_m_accept" (rt "net_accept_m!") 0 0 0,
+     info_text "@i_m_connected" (rt "net_connected_m!") 0 0 0,
      info_text "@i_apply_rest" (rt "frame_apply_rest!") 0 0 0]
 };
 
@@ -513,7 +535,7 @@ let runtime_roots = ["init!", "alloc!", "enter!", "apply!", "raise!", "collect_a
                      "code_ind!", "code_hole!", "frame_update!", "code_halt!", "frame_apply_rest!", "code_raised!",
                      "code_deferred2!", "frame_catch_return!", "native_failed!", "not_bool!", "frame_resume_entry!",
                      "frame_retry_call!", "frame_enter_again!", "frame_start!", "join_m!", "recv_m!",
-                     "await_message_m!", "sleep_until_m!",
+                     "await_message_m!", "sleep_until_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!",
                      "add_slow!", "sub_slow!", "mul_slow!", "div_slow!", "mod_slow!",
                      "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!"];
 
@@ -549,7 +571,7 @@ let to_ir user lib rt = {
         let [_, st1] = core.wrapper_of_library %{:lib_arity => lib_arity} name st;
         st1
     }) start (map.values library_roots);
-    let st = core.program %{"u" => user, "l" => lib} [["u", entry]] lib_names native_arity lib_arity wanted;
+    let st = core.program %{"u" => user, "l" => lib} [["u", entry, :function]] lib_names native_arity lib_arity wanted;
     let natives = map.keys (core.St.natives st);
     let unit_ = dialect.unit_of rt (list.append runtime_roots natives);
     match list.append (list.reverse (core.St.refused st)) (dialect.Unit.refused unit_) {
@@ -573,15 +595,21 @@ let tick_text = str.concat_all [
 
 let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :string;
 let assemble user st unit_ lib_names entry = {
+    // The atoms the dialect asked for by name are numbered with the rest.
+    let st_with = list.fold (fn s1 name -> list.nth 1 (core.intern_atom name s1)) st (dialect.Unit.atoms unit_);
+    let atom_words = list.map (fn name ->
+        str.concat_all ["@aw_", name, " = internal constant i64 ",
+                        core.immediate_word 3 (core.St.atoms st_with).[name], "\n"]) (dialect.Unit.atoms unit_);
     let names = list.fold (fn m name -> m.["@lib_" + name => "@l" + to_string lib_names.[name]])
         (list.fold (fn m name -> m.["@m_" + name => (dialect.Unit.symbols unit_).[name]])
             %{"@raise!" => (dialect.Unit.symbols unit_).["raise!"]} (map.keys core.machine_natives))
         (map.keys (core.St.needed_lib st));
-    let g0 = Gen.make 0 [] "entry" [] [] [] (dialect.Unit.symbols unit_) names;
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names;
     let g = list.fold (fn g1 f -> function f g1) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
-    let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st));
+    let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));
     let atom_objects = list.map (fn [name, i] -> string_object ("@atom" + to_string i) name) atom_list;
+    let atom_count = str.concat_all ["@i_atom_count = internal constant i64 ", to_string (list.length atom_list), "\n"];
     let atom_table = str.concat_all ["@i_atoms = internal constant [", to_string (list.length atom_list), " x ptr] [",
         str.join_str ", " (list.map (fn [_, i] -> "ptr @atom" + to_string i) atom_list), "]\n"];
     let caf_functions = list.filter (fn f -> core.Function.how f == :caf) (core.St.functions st);
@@ -607,8 +635,9 @@ let assemble user st unit_ lib_names entry = {
     let args = list.take 3 (list.replicate arity core.unit_word);
     let pad = list.replicate (3 - list.length args) "0";
     let main_ = str.concat_all [
-        "define dso_local i32 @main() {\n  %p = call tailcc i64 ", (dialect.Unit.symbols unit_).["init!"],
-        "()\n  %tp = add i64 %p, 40\n  %tq = inttoptr i64 %tp to ptr\n  %top = load i64, ptr %tq\n",
+        "define dso_local i32 @main(i32 %argc, ptr %argv) {\n  %p = call tailcc i64 ", (dialect.Unit.symbols unit_).["init!"],
+        "()\n  %ac = sext i32 %argc to i64\n  %av = ptrtoint ptr %argv to i64\n  %au = call tailcc i64 ", (dialect.Unit.symbols unit_).["set_args!"],
+        "(i64 %p, i64 %ac, i64 %av)\n  %tp = add i64 %p, 40\n  %tq = inttoptr i64 %tp to ptr\n  %top = load i64, ptr %tq\n",
         "  %sp = sub i64 %top, 8\n  %r = call tailcc i64 @u", to_string entry, "(",
         args_text (list.concat [["%p", "%sp", "0"], args, pad]), ")\n  ret i32 0\n}\n"];
     str.concat_all (list.concat [
@@ -617,13 +646,14 @@ let assemble user st unit_ lib_names entry = {
          "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n",
          "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n"],
         dialect.declarations (dialect.Unit.imports unit_),
+        atom_words,
         fixed_infos g,
         strings,
         atom_objects,
         displays,
         floats,
         closures,
-        [atom_table, types_table, display_table, cafs_table, tick_text],
+        [atom_count, atom_table, types_table, display_table, cafs_table, tick_text],
         Gen.data g,
         [dialect.Unit.text unit_],
         list.reverse (Gen.code g),

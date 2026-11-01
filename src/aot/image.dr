@@ -121,3 +121,15 @@ let float_bits img i = {
     let o = at img "KFLT" + 8 * i;
     [u32_at (Image.bytes img) o, u32_at (Image.bytes img) (o + 4)]
 };
+
+/// Where function `i` was written: its source, line and column, as the format has them
+/// for what an error reports. The source is one more than a string index; 0 is not known.
+let func_source : Image -> :integer -> :string;
+let func_source img i = {
+    let n = u32_at (Image.bytes img) (at img "FUNC" + 32 * i + 28);
+    if n == 0 { "" } else { string img (n - 1) }
+};
+let func_line : Image -> :integer -> :integer;
+let func_line img i = u32_at (Image.bytes img) (at img "FUNC" + 32 * i + 20);
+let func_col : Image -> :integer -> :integer;
+let func_col img i = u32_at (Image.bytes img) (at img "FUNC" + 32 * i + 24);

@@ -74,6 +74,8 @@ union Expr {
     catching(x : :integer, live : [:integer], body : Expr, handler : Expr, cleanup : :bool),
     bind(x : :integer, rhs : Rhs, rest : Expr),
     raise_text(text : :string),
+    /// `raise!`, which knows where it was written.
+    raised(a : Atom),
 }
 
 /// A function of the core: a global, a closure's code, or a thunk's.
@@ -86,6 +88,7 @@ group Function {
     captures : [:integer],
     body : Expr,
     name : :string,
+    place : [:any],
 }
 
 /// Everything translation has found so far. Threaded rather than kept, as all state
@@ -176,6 +179,7 @@ let free e = match e {
     Expr.catching(x, live, body, _, _) => union_of (free body) (set_of live),
     Expr.bind(x, r, rest) => union_of (set_of (rhs_vars r)) (map.remove x (free rest)),
     Expr.raise_text(_) => %{},
+    Expr.raised(a) => set_of (atom_vars a),
 };
 
 let set_of : [:integer] -> :map;
@@ -286,7 +290,16 @@ let mark_forced a env = match a {
 };
 
 let queue : :any -> :integer -> St -> St;
-let queue cx f s = St.set_queued (list.cons [cx.[:unit], f] (St.queued s)) s;
+let queue cx f s = St.set_queued (list.cons [cx.[:unit], f, :function] (St.queued s)) s;
+
+/// A parameterless pure function named at the top level is a value, computed once. The
+/// same function reached by a `$( .. )` is a function of nothing, a value of its own,
+/// and so one image function may be compiled as both; what decides is how it was reached.
+let queue_once : :any -> :integer -> St -> St;
+let queue_once cx f s = St.set_queued (list.cons [cx.[:unit], f, :caf] (St.queued s)) s;
+
+let once_symbol : :any -> :integer -> :string;
+let once_symbol cx f = str.concat_all ["@v", cx.[:unit], to_string f];
 
 let intern_string : :string -> St -> [:string, St];
 let intern_string text s = match map.lookup text (St.strings s) {
@@ -713,7 +726,7 @@ let global_read cx g env s = {
         let s1 = queue cx f s;
         if image.Func.arity fr > 0 { [Expr.ret (static_closure symbol), s1] }
         else if image.Func.flags fr & image.func_impure != 0 { [Expr.call symbol [], s1] }
-        else { [Expr.enter (Atom.address (caf_symbol symbol)), s1] }
+        else { [Expr.enter (Atom.address (caf_symbol (once_symbol cx f))), queue_once cx f s] }
     }
 };
 
@@ -751,26 +764,61 @@ let applied cx callee args env s = {
 /// arguments forced. A native takes the context first (rt/main.dr).
 let host_members : :map;
 let host_members = %{
-    "std.io.stdout!" => "io_stdout!",
-    "std.io.stderr!" => "io_stderr!",
-    "std.io.write!" => "io_write!",
-    "std.vm.mailbox_size!" => "mailbox_size!",
-    "std.vm.mailbox_peek!" => "mailbox_peek!",
-    "std.vm.mailbox_take!" => "mailbox_take!",
-    "std.vm.monitor!" => "monitor!",
-    "std.vm.demonitor!" => "demonitor!",
-    "std.vm.unique!" => "unique_value!",
-    "std.vm.now_ns!" => "now_ns_value!",
-    "std.vm.wall_ms!" => "wall_ms!",
-    "std.vm.await_message!" => "await_message_m!",
-    "std.vm.sleep_until!" => "sleep_until_m!",
-    "std.vm.kill!" => "kill_value!",
+    "std.io.stdout!" => "io_stdout!", "std.io.stderr!" => "io_stderr!", "std.io.stdin!" => "io_stdin!",
+    "std.io.read!" => "io_read_m!", "std.io.write!" => "io_write_m!", "std.io.open!" => "io_open!",
+    "std.io.close!" => "io_close!", "std.io.flush!" => "io_flush!", "std.io.seek!" => "io_seek!",
+    "std.io.size!" => "io_size!", "std.io.kind!" => "io_kind!", "std.io.is_open!" => "is_open!",
+    "std.io.is_terminal!" => "io_is_terminal!", "std.io.enable_ansi!" => "io_enable_ansi!",
+    "std.io.exists!" => "io_exists!", "std.io.is_dir!" => "io_is_dir!", "std.io.remove!" => "io_remove!",
+    "std.io.rename!" => "io_rename!", "std.io.mkdir!" => "io_mkdir!", "std.io.stat!" => "io_stat!",
+    "std.io.lstat!" => "io_lstat!", "std.io.is_link!" => "io_is_link!", "std.io.mode!" => "io_mode!",
+    "std.io.chmod!" => "io_chmod!", "std.io.link!" => "io_link!", "std.io.symlink!" => "io_symlink!",
+    "std.io.read_link!" => "io_read_link!", "std.io.copy!" => "io_copy!", "std.io.temp_file!" => "io_temp_file!",
+    "std.io.temp_dir!" => "io_temp_dir!", "std.io.remove_all!" => "remove_all!", "std.io.mkdir_all!" => "mkdir_all!",
+    "std.io.walk!" => "walk!",
+    "std.os.args!" => "os_args!", "std.os.env!" => "os_env!", "std.os.set_env!" => "os_set_env!",
+    "std.os.cwd!" => "os_cwd!", "std.os.chdir!" => "os_chdir!", "std.os.list_dir!" => "list_dir!",
+    "std.os.monotonic!" => "os_monotonic!", "std.os.now!" => "wall_ms!", "std.os.pid!" => "os_pid!",
+    "std.os.platform" => "os_platform!", "std.os.arch" => "os_arch!", "std.os.exit!" => "os_exit!",
+    "std.os.install_dirs!" => "os_install_dirs!", "std.os.exec!" => "exec!", "std.os.exec_for!" => "exec_for!",
+    "std.os.exec_in!" => "exec_in!", "std.os.exec_with!" => "exec_with!", "std.os.exec_joined!" => "exec_joined!",
+    "std.net.listen!" => "net_listen!", "std.net.listen_on!" => "net_listen_on!", "std.net.accept!" => "net_accept_m!",
+    "std.net.connect!" => "net_connect_m!", "std.net.peer!" => "net_peer!", "std.net.port!" => "net_port!",
+    "std.net.shutdown!" => "net_shutdown!",
+    "std.math.sqrt" => "math_sqrt!", "std.math.abs" => "math_abs!", "std.math.floor" => "math_floor!",
+    "std.math.exp" => "math_exp!", "std.math.log" => "math_log!", "std.math.sin" => "math_sin!",
+    "std.math.cos" => "math_cos!", "std.math.tan" => "math_tan!", "std.math.tanh" => "math_tanh!",
+    "std.math.atan" => "math_atan!", "std.math.pow" => "math_pow!",
+    "std.vm.mailbox_size!" => "mailbox_size!", "std.vm.mailbox_peek!" => "mailbox_peek!",
+    "std.vm.mailbox_take!" => "mailbox_take!", "std.vm.monitor!" => "monitor!", "std.vm.demonitor!" => "demonitor!",
+    "std.vm.unique!" => "unique_value!", "std.vm.now_ns!" => "now_ns_value!", "std.vm.wall_ms!" => "wall_ms!",
+    "std.vm.await_message!" => "await_message_m!", "std.vm.sleep_until!" => "sleep_until_m!",
+    "std.vm.kill!" => "kill_value!", "std.vm.share!" => "share!",
+    "std.vm.regex_run" => "regex_run!",
+    "std.vm.wire_encode" => "wire_encode", "std.vm.wire_decode" => "wire_decode", "std.vm.wire_pack" => "wire_pack",
+    "std.vm.json_encode" => "json_encode", "std.vm.json_decode" => "json_decode!",
+    "std.vm.shared_bytes!" => "no_shared_bytes!", "std.vm.release!" => "release_nothing!", "std.vm.collect_shared!" => "no_shared_bytes!",
+    "std.vm.trunk_of" => "trunk_of", "std.vm.trunk_to_list" => "trunk_to_list!", "std.vm.trunk_len" => "trunk_len!",
+    "std.vm.trunk_at" => "trunk_read!", "std.vm.trunk_push" => "trunk_push!", "std.vm.trunk_cons" => "trunk_cons!",
+    "std.vm.trunk_set" => "trunk_set!", "std.vm.trunk_slice" => "trunk_slice!", "std.vm.trunk_concat" => "trunk_concat",
+    "std.vm.trunk_contains" => "trunk_contains", "std.vm.trunk_index_of" => "trunk_index_of",
+    "std.vm.trunk_count" => "trunk_count", "std.vm.trunk_lookup" => "trunk_lookup", "std.vm.trunk_put" => "trunk_put",
+    "std.io.digest!" => "io_digest_file!", "std.io.digest" => "io_digest!",
+    "std.crypto.md5" => "crypto_md5!", "std.crypto.sha1" => "crypto_sha1!", "std.crypto.sha256" => "crypto_sha256!",
+    "std.crypto.sha384" => "crypto_sha384!", "std.crypto.sha512" => "crypto_sha512!", "std.crypto.digest" => "crypto_digest!",
+    "std.crypto.digest_file!" => "crypto_digest_file!", "std.crypto.hmac" => "crypto_hmac!", "std.crypto.pbkdf2" => "crypto_pbkdf2!",
+    "std.crypto.hkdf" => "crypto_hkdf!", "std.crypto.equal" => "crypto_equal!", "std.crypto.xor" => "crypto_xor!",
+    "std.crypto.hex" => "crypto_hex!", "std.crypto.unhex" => "crypto_unhex!", "std.crypto.base64" => "crypto_base64!",
+    "std.crypto.unbase64" => "crypto_unbase64!", "std.crypto.random_bytes!" => "crypto_random_bytes!",
+    "std.crypto.ed25519_public" => "ed25519_public", "std.crypto.ed25519_sign" => "ed25519_sign",
+    "std.crypto.ed25519_verify" => "ed25519_verify",
 };
 
 /// Runtime functions that may block, so that they take the stack and are jumped to
 /// rather than called: `name => arguments`.
 let machine_natives : :map;
-let machine_natives = %{"join_m!" => 1, "recv_m!" => 1, "await_message_m!" => 2, "sleep_until_m!" => 1};
+let machine_natives = %{"join_m!" => 1, "recv_m!" => 1, "await_message_m!" => 2, "sleep_until_m!" => 1,
+                       "io_read_m!" => 2, "io_write_m!" => 2, "net_accept_m!" => 1, "net_connect_m!" => 2};
 
 let native_call : :any -> :string -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let native_call cx module_ member args env s = match native_named cx module_ member {
@@ -807,7 +855,12 @@ let arity_of_native cx fn_name = match map.lookup fn_name machine_natives {
 
 /// Host members that are functions of the library, which must force what they send.
 let library_natives : :map;
-let library_natives = %{"kill_value!" => 2};
+let library_natives = %{"kill_value!" => 2, "remove_all!" => 1, "mkdir_all!" => 1, "walk!" => 1, "list_dir!" => 1,
+                        "exec!" => 2, "exec_for!" => 3, "exec_in!" => 4, "exec_with!" => 5, "exec_joined!" => 5,
+                        "share!" => 1, "trunk_of" => 1, "trunk_concat" => 2, "trunk_contains" => 2, "trunk_index_of" => 2,
+                        "trunk_count" => 2, "trunk_lookup" => 2, "trunk_put" => 3, "ed25519_public" => 1,
+                        "ed25519_sign" => 2, "ed25519_verify" => 3, "wire_encode" => 1, "wire_decode" => 1,
+                        "wire_pack" => 1, "json_encode" => 1};
 
 let native_exactly : :string -> :any -> [:integer] -> Env -> St -> [Expr, St];
 let native_exactly fn_name cx args env s =
@@ -846,7 +899,7 @@ let wrapper_of_native cx fn_name s = {
         let n = arity_of_native cx fn_name;
         let [params, s1] = fresh_many n (St.set_natives ((St.natives s).[fn_name => true]) s);
         let [body, s2] = forcing_all params [] fn_name s1;
-        let f = Function.make symbol symbol :function true params [] body fn_name;
+        let f = Function.make symbol symbol :function true params [] body fn_name [];
         [static_closure symbol, s2 |> St.set_wrapped ((St.wrapped s2).[symbol => true])
                                    |> St.set_functions (list.cons f (St.functions s2))]
     }
@@ -880,7 +933,7 @@ let wrapper_of_library cx name s = {
         let n = cx.[:lib_arity].[name else 1];
         let [params, s1] = fresh_many n (St.set_needed_lib ((St.needed_lib s).[name => true]) s);
         let body = Expr.call ("@lib_" + name) (list.map (fn p -> Atom.var p) params);
-        let f = Function.make symbol symbol :function false params [] body name;
+        let f = Function.make symbol symbol :function false params [] body name [];
         [static_closure symbol, s1 |> St.set_wrapped ((St.wrapped s1).[symbol => true])
                                    |> St.set_functions (list.cons f (St.functions s1))]
     }
@@ -917,8 +970,12 @@ let host_value cx n s = {
 /// of the library (mind/std/src/rt/lib.dr), which is ordinary Dream.
 let builtin : :any -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let builtin cx name args env s = match [name, args] {
-    ["raise!", [e]] => value cx e env s (fn v _ s1 -> [Expr.call "@raise!" [v], s1]),
+    ["raise!", [e]] => value cx e env s (fn v _ s1 -> [Expr.raised v, s1]),
     ["_list_cons", [h, t]] => lazily_alloc cx "cons" [h, t] env s (fn x _ s1 -> [Expr.ret x, s1]),
+    ["_list_cons", _] => {
+        let [f, s1] = wrapper_of_library cx "cons_of" s;
+        lazies cx args env s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2])
+    },
     ["_list_is_cons_unused", _] => [Expr.raise_text "", s],
     ["_match_is_cons", [l]] => tested cx (fn a -> Rhs.has_kind a 5) l env s (fn x _ s1 -> [Expr.ret x, s1]),
     ["_list_is_empty", [l]] => tested cx (fn a -> Rhs.same a nil_word) l env s (fn x _ s1 -> [Expr.ret x, s1]),
@@ -970,7 +1027,7 @@ let native_builtins = %{
     "_array_to_list" => "array_to_list!", "_map_has" => "map_has!", "_map_remove" => "map_remove!",
     "_map_pairs" => "map_pairs!", "_record_is" => "record_is!", "_record_id" => "record_id!",
     "_record_fields" => "record_fields!", "_record_of" => "record_of!", "_match_at" => "match_at!",
-    "_match_key" => "match_key!", "_pow" => "pow!", "spawn!" => "spawn!", "join!" => "join_m!",
+    "_match_key" => "match_key!", "_pow" => "pow!", "_to_existing_atom" => "to_existing_atom!", "_list_tail" => "list_tail!", "spawn!" => "spawn!", "join!" => "join_m!",
     "recv!" => "recv_m!", "self!" => "self!", "_mailbox_peek!" => "mailbox_peek!",
     "_mailbox_take!" => "mailbox_take!", "_await_message!" => "await_message_m!", "_deadline_in!" => "deadline_in!",
 };
@@ -979,11 +1036,12 @@ let native_builtins = %{
 let native_lazy : :map;
 let native_lazy = %{
     "array_new!" => [1], "error_new!" => [1], "array_store!" => [2], "new_cons!" => [0, 1], "spawn!" => [0],
+    "trunk_push!" => [0], "trunk_cons!" => [0], "trunk_set!" => [1],
 };
 
 /// Natives that answer what they found without forcing it.
 let answers_unforced : :map;
-let answers_unforced = %{"match_at!" => true, "list_head!" => true, "list_tail!" => true};
+let answers_unforced = %{"match_at!" => true, "list_head!" => true, "list_tail!" => true, "trunk_read!" => true};
 
 let library_call : :any -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let library_call cx name args env s =
@@ -1037,7 +1095,7 @@ let lazily cx i env s k = {
                 let symbol = symbol_of cx.[:unit] f;
                 if image.Func.arity fr > 0 { k (static_closure symbol) env (queue cx f s) }
                 else if image.Func.flags fr & image.func_impure != 0 { suspended cx i env s k }
-                else { k (Atom.address (caf_symbol symbol)) env (queue cx f s) }
+                else { k (Atom.address (caf_symbol (once_symbol cx f))) env (queue_once cx f s) }
             }
         },
         o if o == 17 || o == 18 => closure_of cx a env s k,
@@ -1138,7 +1196,8 @@ let suspended cx i env s k = {
     let inner = lifted_env pieces vars env;
     let [body, s3] = tail cx i inner s2;
     let symbol = str.concat_all ["@t", cx.[:unit], to_string id];
-    let f = Function.make symbol symbol :thunk false [] vars body (cx.[:name] + " (suspended)");
+    let f = Function.make symbol symbol :thunk false [] vars body (cx.[:name] + " (suspended)")
+        (match cx.[:place] { [n, path, line, col] => [n, path, line, col, 1], _ => [] });
     let s4 = St.set_functions (list.cons f (St.functions s3)) s3;
     let values_ = list.map (fn piece -> match piece.[2] {
         Option.some(atom) => atom,
@@ -1228,23 +1287,22 @@ let settle_holes slot atom env s k = {
     }) [body, s1] waiting
 };
 
-/// Image function `f` as a core function.
-let translate : :any -> :integer -> St -> St;
-let translate cx f s = {
+/// Image function `f` as a core function, in the form it was asked for.
+let translate : :any -> :integer -> :atom -> St -> St;
+let translate cx f how s = {
     let fr = image.func cx.[:img] f;
-    let symbol = symbol_of cx.[:unit] f;
+    let symbol = if how == :caf { once_symbol cx f } else { symbol_of cx.[:unit] f };
     let [params, s1] = fresh_many (image.Func.arity fr) s;
     let [caps, s2] = fresh_many (image.Func.captures fr) s1;
     let name = image.string cx.[:img] (image.Func.name fr);
     let slots = list.fold (fn m [i, v] -> m.[i => Atom.var v]) %{} (list.enumerate params);
     let captures = list.fold (fn m [i, v] -> m.[i => Atom.var v]) %{} (list.enumerate caps);
     let env = Env.make slots captures %{} [];
-    let cx1 = cx.[:name => name];
+    let place = [name, image.func_source cx.[:img] f, image.func_line cx.[:img] f, image.func_col cx.[:img] f];
+    let cx1 = cx |> (fn c -> c.[:name => name]) |> (fn c -> c.[:place => place]);
     let [body, s3] = tail cx1 (image.Func.body fr) env s2;
-    let pure_value = image.Func.arity fr == 0 && image.Func.flags fr & image.func_impure == 0
-                     && image.Func.captures fr == 0;
-    let how = if pure_value { :caf } else { :function };
-    let func_ = Function.make symbol symbol how (image.Func.flags fr & image.func_impure != 0) params caps body name;
+    let func_ = Function.make symbol symbol how (image.Func.flags fr & image.func_impure != 0) params caps body name
+        (list.append place [0]);
     St.set_functions (list.cons func_ (St.functions s3)) s3
 };
 
@@ -1259,17 +1317,17 @@ let program units roots lib_names native_arity lib_arity s = {
                 [] => s1,
                 [name, ..rest] => match map.lookup name lib_names {
                     Option.none => go (refuse_in "the library" (str.concat_all ["it has no `", name, "`"]) (St.set_needed_lib (map.remove name (St.needed_lib s1)) s1)) seen lib_seen,
-                    Option.some(f) => go (St.set_queued [["l", f]] s1) seen lib_seen.[name => true],
+                    Option.some(f) => go (St.set_queued [["l", f, :function]] s1) seen lib_seen.[name => true],
                 },
             }
         },
-        [[unit, f], ..rest] => {
+        [[unit, f, how], ..rest] => {
             let s2 = St.set_queued rest s1;
-            let key = str.concat_all [unit, to_string f];
+            let key = str.concat_all [unit, to_string f, to_string how];
             if seen.[key else false] { go s2 seen lib_seen }
             else {
                 let cx = %{:img => units.[unit], :unit => unit, :name => "", :native_arity => native_arity, :lib_arity => lib_arity};
-                go (translate cx f s2) seen.[key => true] lib_seen
+                go (translate cx f how s2) seen.[key => true] lib_seen
             }
         },
     };

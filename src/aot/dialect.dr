@@ -40,11 +40,12 @@ group State {
     functions : :map,
     strings : :map,
     imports : :map,
+    atoms : :map,
     refused : [:string],
 }
 
 let empty_state : State;
-let empty_state = State.make 0 [] "entry" %{} %{} %{} [];
+let empty_state = State.make 0 [] "entry" %{} %{} %{} %{} [];
 
 let line : :string -> State -> State;
 let line text s = State.set_lines (list.cons text (State.lines s)) s;
@@ -170,6 +171,15 @@ let primitive cx name args s = match name {
     "d2!" => double_call cx args s,
     // The address of an info the machine lays out. By name, since it is the
     // compiler's and is not a value anything here could compute.
+    // An atom's word, whatever number the program gives it.
+    "atom" => match args {
+        [first] => {
+            let name = image.string cx.[:img] (image.Node.a (image.node cx.[:img] first));
+            let s1 = State.set_atoms ((State.atoms s).[name => true]) s;
+            instr (str.concat_all ["load i64, ptr @aw_", name]) s1
+        },
+        _ => refuse (cx.[:name] + ": `atom` takes a name") s,
+    },
     "info" => match args {
         [first] => {
             let n = image.node cx.[:img] first;
@@ -565,7 +575,7 @@ let reachable img work seen texts s = match work {
 
 /// What a dialect image is, as the machine links it: the text of what `roots`
 /// reach, its constants and C declarations, and each root's symbol.
-group Unit { text : :string, imports : :map, symbols : %{:string => :string}, refused : [:string] }
+group Unit { text : :string, imports : :map, symbols : %{:string => :string}, refused : [:string], atoms : [:string] }
 
 /// A top-level function of `img` by its name. Names are unique because the runtime
 /// is written so; a dialect image is the compiler's own input.
@@ -587,6 +597,7 @@ let unit_of img roots = {
     Unit.make (str.concat_all (list.append strings (list.reverse texts))) (State.imports s) symbols
         (list.append (list.reverse (State.refused s))
                      (list.map (fn r -> "the runtime has no `" + r + "`") missing))
+        (map.keys (State.atoms s))
 };
 
 /// A dialect program by itself: `img` as LLVM IR, or everything in it the dialect
