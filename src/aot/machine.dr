@@ -529,6 +529,7 @@ let fixed_infos g = {
      info_text "@i_m_accept" (rt "net_accept_m!") 0 0 0,
      info_text "@i_m_connected" (rt "net_connected_m!") 0 0 0,
      info_text "@i_m_tls_handshake" (rt "tls_handshake_m!") 0 0 0,
+     info_with "@i_cb_return" (rt "frame_cb_return!") 20 2 0 (rt "cb_raised!") "null" 0 "null",
      info_text "@i_apply_rest" (rt "frame_apply_rest!") 0 0 0]
 };
 
@@ -538,7 +539,7 @@ let runtime_roots = ["init!", "alloc!", "enter!", "apply!", "raise!", "collect_a
                      "code_ind!", "code_hole!", "frame_update!", "code_halt!", "frame_apply_rest!", "code_raised!",
                      "code_deferred2!", "frame_catch_return!", "native_failed!", "not_bool!", "frame_resume_entry!",
                      "frame_retry_call!", "frame_enter_again!", "frame_start!", "join_m!", "recv_m!",
-                     "await_message_m!", "sleep_until_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!", "tls_handshake_m!",
+                     "await_message_m!", "sleep_until_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!", "tls_handshake_m!", "ffi_call_m!", "cb_enter!", "frame_cb_return!", "cb_raised!",
                      "add_slow!", "sub_slow!", "mul_slow!", "div_slow!", "mod_slow!",
                      "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!"];
 
@@ -602,6 +603,7 @@ let tick_text = str.concat_all [
 /// protocol choice is OpenSSL's own function over the list the context was given.
 let tls_text : :string;
 let tls_text = str.concat_all [
+    "@i_cb_context = internal global i64 0\n",
     "@i_tls_get_error = internal global i64 0\n@i_tls_set_error = internal global i64 0\n@i_tls_next_proto = internal global i64 0\n",
     "define internal i32 @i_verify_stub(i32 %ok, ptr %store) {\nentry:\n  %good = icmp ne i32 %ok, 0\n  br i1 %good, label %yes, label %look\n",
     "yes:\n  ret i32 1\nlook:\n  %g = load i64, ptr @i_tls_get_error\n  %gp = inttoptr i64 %g to ptr\n  %e = call i32 %gp(ptr %store)\n",
@@ -612,6 +614,21 @@ let tls_text = str.concat_all [
     "  %f = load i64, ptr @i_tls_next_proto\n  %fp = inttoptr i64 %f to ptr\n",
     "  %r = call i32 %fp(ptr %out, ptr %outlen, ptr %ours, i32 %t, ptr %in, i32 %inlen)\n",
     "  %ok = icmp eq i32 %r, 1\n  %v = select i1 %ok, i32 0, i32 3\n  ret i32 %v\n}\n"];
+
+/// Where a callback from C lands, by a stub `rt/main.dr` writes: save what C passed where the
+/// runtime can read it, and hand back the answer in both registers an answer may be looked for.
+let callback_text : :string -> :string;
+let callback_text enter = str.concat_all [
+    str.concat_all (list.map (fn l -> str.concat_all ["module asm \"", l, "\"\n"]) [
+        ".text", ".globl i_cb_common", "i_cb_common:", "  subq $120, %rsp",
+        "  movq %rdi, 0(%rsp)", "  movq %rsi, 8(%rsp)", "  movq %rdx, 16(%rsp)", "  movq %rcx, 24(%rsp)",
+        "  movq %r8, 32(%rsp)", "  movq %r9, 40(%rsp)", "  movsd %xmm0, 48(%rsp)", "  movsd %xmm1, 56(%rsp)",
+        "  movsd %xmm2, 64(%rsp)", "  movsd %xmm3, 72(%rsp)", "  movsd %xmm4, 80(%rsp)", "  movsd %xmm5, 88(%rsp)",
+        "  movsd %xmm6, 96(%rsp)", "  movsd %xmm7, 104(%rsp)", "  movq %r10, %rdi", "  movq %rsp, %rsi",
+        "  call dream_cb_entry", "  movq %rax, %xmm0", "  addq $120, %rsp", "  ret"]),
+    "declare void @i_cb_common()\n",
+    "define dso_local i64 @dream_cb_entry(i64 %r, i64 %regs) {\n  %v = call tailcc i64 ", enter,
+    "(i64 %r, i64 %regs)\n  ret i64 %v\n}\n"];
 
 let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :string;
 let assemble user st unit_ lib_names entry = {
@@ -637,6 +654,17 @@ let assemble user st unit_ lib_names entry = {
         let symbol = core.Function.symbol f;
         str.concat_all ["ptr @caf_", str.slice 1 (len symbol - 1) symbol]
     }) caf_functions;
+    let table = image.data_table user;
+    let payload_labels = list.flat_map (fn [i, row] -> match row.[2] {
+        () => [],
+        name => [string_object ("@paylabel" + to_string i) name],
+    }) (list.enumerate table);
+    let payload_rows = list.map (fn [i, row] -> str.concat_all [
+        ", i64 ", to_string row.[0], ", i64 ", to_string row.[1], ", i64 ",
+        match row.[2] { () => "0", _ => str.concat_all ["ptrtoint (ptr @paylabel", to_string i, " to i64)"] }]) (list.enumerate table);
+    let payload_types = str.join_str "" (list.map (fn _ -> ", i64, i64, i64") table);
+    let payload_table = str.concat_all ["@i_payload = external constant i8\n@i_payload_table = internal constant <{ i64",
+        payload_types, " }> <{ i64 ", to_string (list.length table), str.concat_all payload_rows, " }>\n"];
     let closures = list.map (fn [name, target] ->
         str.concat_all ["@i_", name, " = internal constant <{ ptr }> <{ ptr @i_cwl", core.mangled target, " }>, align 8\n"])
         (map.pairs library_roots);
@@ -671,9 +699,11 @@ let assemble user st unit_ lib_names entry = {
         strings,
         atom_objects,
         displays,
+        payload_labels,
+        [payload_table],
         floats,
         closures,
-        [atom_count, atom_table, types_table, display_table, cafs_table, tick_text, tls_text],
+        [atom_count, atom_table, types_table, display_table, cafs_table, tick_text, tls_text, callback_text (dialect.Unit.symbols unit_).["cb_enter!"]],
         Gen.data g,
         [dialect.Unit.text unit_],
         list.reverse (Gen.code g),

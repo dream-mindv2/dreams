@@ -5,7 +5,7 @@
 # and only the second is a bug. The refusals are tallied, most common first, because
 # that is the list of what to build next.
 #
-#   image=... DREAM=... dreams/tests/aot_programs.sh [PATTERN]
+#   image=... DREAM=... AOT_FLAGS=--release dreams/tests/aot_programs.sh [PATTERN]
 
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +13,7 @@ root="$(cd "$here/../.." && pwd)"
 export dream="$(realpath "${DREAM:-$root/build-dream/bin/dream}")"
 export image="$(realpath "${image:-$root/build/dreams.dream}")"
 export root
+export AOT_FLAGS="${AOT_FLAGS:-}"
 export dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 pattern="${1:-}"
@@ -22,7 +23,7 @@ one() {
   name="$(basename "$src" .dr)"
   w="$(dirname "$src")"
   cd "$w" || exit 0
-  if ! DREAMS_CACHE= timeout 180 "$dream" "$image" --aot -L "$root/mind" -I "$w" -o "$dir/$name" "$src" >"$dir/$name.said" 2>&1; then
+  if ! DREAMS_CACHE= timeout 180 "$dream" "$image" --aot ${AOT_FLAGS:-} -L "$root/mind" -I "$w" -o "$dir/$name" "$src" >"$dir/$name.said" 2>&1; then
     grep 'error: ' "$dir/$name.said" | sed 's/^error: [^:]*: //' | sort -u > "$dir/$name.reasons"
     echo refused > "$dir/$name.verdict"
     return

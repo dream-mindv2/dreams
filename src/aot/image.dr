@@ -133,3 +133,29 @@ let func_line : Image -> :integer -> :integer;
 let func_line img i = u32_at (Image.bytes img) (at img "FUNC" + 32 * i + 20);
 let func_col : Image -> :integer -> :integer;
 let func_col img i = u32_at (Image.bytes img) (at img "FUNC" + 32 * i + 24);
+
+let u64_at : :string -> :integer -> :integer;
+let u64_at s i = u32_at s i + 4294967296 * u32_at s (i + 4);
+
+/// The large data: each datum's `[offset, length, name]`, the name `()` if it has none.
+let data_table : Image -> [[:any]];
+let data_table img = {
+    let b = Image.bytes img;
+    let n = count img "LDAT";
+    let names_at = at img "LNAM";
+    let rec named i pos = if i >= n { [] } else {
+        let o = at img "LDAT" + 16 * i;
+        let name_len = if names_at == 0 { 0 } else { u32_at b pos };
+        let name = if names_at == 0 { () } else { str.slice (pos + 4) name_len b };
+        [u64_at b o, u64_at b (o + 8), name] :: named (i + 1) (pos + 4 + name_len)
+    };
+    named 0 names_at
+};
+
+/// The bytes the table's offsets are into: what follows the payload's length word.
+let payload_bytes : Image -> :string;
+let payload_bytes img = {
+    let b = Image.bytes img;
+    let o = at img "PAYL";
+    if o == 0 { "" } else { str.slice (o + 8) (u64_at b o) b }
+};

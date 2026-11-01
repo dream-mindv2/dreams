@@ -232,6 +232,23 @@ let primitive cx name args s = match name {
             // printf and strtod by themselves, because a double goes in another
             // register from a word, which the `cN!` calls do not say.
             // A C function by its address, for a library opened at run time.
+            ["to_f32", [a]] => {
+                let [d, s2] = instr (str.concat_all ["bitcast i64 ", a, " to double"]) s1;
+                let [f, s3] = instr (str.concat_all ["fptrunc double ", d, " to float"]) s2;
+                let [i, s4] = instr (str.concat_all ["bitcast float ", f, " to i32"]) s3;
+                instr (str.concat_all ["zext i32 ", i, " to i64"]) s4
+            },
+            ["from_f32", [a]] => {
+                let [t, s2] = instr (str.concat_all ["trunc i64 ", a, " to i32"]) s1;
+                let [f, s3] = instr (str.concat_all ["bitcast i32 ", t, " to float"]) s2;
+                let [d, s4] = instr (str.concat_all ["fpext float ", f, " to double"]) s3;
+                instr (str.concat_all ["bitcast double ", d, " to i64"]) s4
+            },
+            ["ffi_word!", [f, ints, doubles]] => ffi_call f ints doubles "i64" s1,
+            ["ffi_double!", [f, ints, doubles]] => {
+                let [d, s2] = ffi_call f ints doubles "double" s1;
+                instr (str.concat_all ["bitcast double ", d, " to i64"]) s2
+            },
             ["ptr0!", [f]] => pointer_call f [] s1,
             ["ptr1!", [f, ..rest]] => pointer_call f rest s1,
             ["ptr2!", [f, ..rest]] => pointer_call f rest s1,
@@ -283,6 +300,29 @@ let c_call cx args s = match args {
             instr (str.concat_all ["call i64 @", symbol, "(", args_text vals, ")"]) s2
         }
     },
+};
+
+/// Every register of both rows loaded, and the address called. Twelve words: six in
+/// registers and six on the machine stack, where C finds what its registers did not hold.
+let ffi_call : :string -> :string -> :string -> :string -> State -> [:string, State];
+let ffi_call f ints doubles answer s = {
+    let [target, s1] = instr (str.concat_all ["inttoptr i64 ", f, " to ptr"]) s;
+    let s2 = s1;
+    let load_word = fn base i st -> {
+        let [address, st1] = binary "add" base (to_string (i * 8)) st;
+        loaded "i64" address st1
+    };
+    let [int_vals, s3] = list.fold (fn [acc, st] i -> {
+        let [v, st1] = load_word ints i st;
+        [list.cons ("i64 " + v) acc, st1]
+    }) [[], s2] (list.range 0 12);
+    let [dbl_vals, s4] = list.fold (fn [acc, st] i -> {
+        let [v, st1] = load_word doubles i st;
+        let [d, st2] = instr (str.concat_all ["bitcast i64 ", v, " to double"]) st1;
+        [list.cons ("double " + d) acc, st2]
+    }) [[], s3] (list.range 0 8);
+    instr (str.concat_all ["call ", answer, " ", target, "(",
+                           str.join_str ", " (list.append (list.reverse int_vals) (list.reverse dbl_vals)), ")"]) s4
 };
 
 let pointer_call : :string -> [:string] -> State -> [:string, State];

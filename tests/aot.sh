@@ -98,8 +98,8 @@ grep -q "main!: opcode 36" said || fail "the refusal did not name main!: $(cat s
 
 # Ordinary Dream, on the runtime: what it does not have yet is refused the same way.
 cat > later.dr <<'DR'
-import std.net;
-let main! () = net.lookup! "localhost";
+import std.vm;
+let main! () = vm.open_image! "";
 DR
 if compile -o later later.dr; then fail "a native not built yet was accepted"; fi
 grep -q "is not compiled yet" said || fail "the refusal did not say why: $(cat said)"

@@ -47,6 +47,9 @@ let shf_alloc = 2;
 let shf_exec = 4;
 let shn_abs = 65521;
 
+/// The address of the program's large data, in the object.
+let payload_symbol = "i_payload";
+
 let em_x86_64 = 62;
 let r_64 = 1;
 let r_pc32 = 2;
@@ -61,7 +64,7 @@ let r_glob_dat = 6;
 /// What the program needs of the machine it will run on, and the object's own
 /// bytes say the rest. `interp` is the dynamic loader's path, which is the one
 /// thing about a Linux that cannot be read from anywhere but the machine.
-group Options { interp : :string, needed : [:string] }
+group Options { interp : :string, needed : [:string], payload : :string }
 
 group Section {
     index : :integer,
@@ -212,7 +215,10 @@ priv let laid_out o obj = {
     // Imports: every symbol a relocation names and the object does not define.
     let used = list.unique (list.flat_map (fn s ->
         list.map (fn r -> Reloc.symbol r) (relocs_of s)) relas);
-    let undefined = list.filter (fn i -> Symbol.shndx syms.[i] == 0) used;
+    // The program's large data is not code and goes nowhere near LLVM: it is laid out here,
+    // and the one symbol naming it is resolved here.
+    let is_payload = fn i -> Symbol.name syms.[i] == payload_symbol;
+    let undefined = list.filter (fn i -> Symbol.shndx syms.[i] == 0 && not (is_payload i)) used;
     let imports = list.sort (list.unique (list.map (fn i -> Symbol.name syms.[i]) undefined));
     let count = list.length imports;
     let import_index = list.fold (fn m [i, n] -> m.[n => i]) %{} (list.enumerate imports);
@@ -221,7 +227,7 @@ priv let laid_out o obj = {
     // for that for any symbol not marked as staying in this file. The address is
     // known here, so the slot is written rather than left to the loader.
     let via_slot = fn r -> list.contains (Reloc.kind r) [r_gotpcrel, r_gotpcrelx, r_rex_gotpcrelx];
-    let held = list.unique (list.filter (fn i -> Symbol.shndx syms.[i] != 0)
+    let held = list.unique (list.filter (fn i -> Symbol.shndx syms.[i] != 0 || is_payload i)
         (list.flat_map (fn s -> list.map (fn r -> Reloc.symbol r) (list.filter via_slot (relocs_of s))) relas));
     let slots = count + list.length held;
     let held_index = list.fold (fn m [i, n] -> m.[n => count + i]) %{} (list.enumerate held);
@@ -238,7 +244,9 @@ priv let laid_out o obj = {
     let at_dynstr = at_dynsym + dynsym_size * (count + 1);
     let at_rela = align_up 8 (at_dynstr + len strtab);
     let ro_from = at_rela + rela_size * count;
-    let [addr0, ro_end] = place ro (base + ro_from) %{};
+    let [addr0, ro_sections_end] = place ro (base + ro_from) %{};
+    let payload_at = align_up 16 ro_sections_end;
+    let ro_end = payload_at + len (Options.payload o);
 
     let rx_start = align_up page ro_end;
     let [addr1, rx_end] = place rx rx_start addr0;
@@ -255,13 +263,13 @@ priv let laid_out o obj = {
     let stub_of = fn name -> at_stubs + stub_size * import_index.[name];
     let slot_of = fn name -> at_slots + 8 * import_index.[name];
     let slot_for = fn i -> match Symbol.shndx syms.[i] {
-        0 => slot_of (Symbol.name syms.[i]),
+        0 if not (is_payload i) => slot_of (Symbol.name syms.[i]),
         _ => at_slots + 8 * held_index.[i],
     };
     let symbol_address = fn i -> {
         let s = syms.[i];
         match Symbol.shndx s {
-            0 => stub_of (Symbol.name s),
+            0 => if Symbol.name s == payload_symbol { payload_at } else { stub_of (Symbol.name s) },
             n if n == shn_abs => Symbol.value s,
             n => addresses.[n] + Symbol.value s,
         }
@@ -345,6 +353,7 @@ priv let laid_out o obj = {
                     let parts = list.concat [
                         list.reverse front,
                         list.reverse ro_pieces,
+                        [zeros (payload_at - ro_sections_end), Options.payload o],
                         [zeros (rx_start - ro_end)],
                         list.reverse rx_pieces,
                         [zeros (at_stubs - rx_end)],
