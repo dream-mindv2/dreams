@@ -1109,7 +1109,9 @@ let cached_build! o src = {
 /// An image of `src`, by the ordinary build, kept nowhere: its bytes, or `()` with the
 /// reasons already printed.
 let image_of! o src image = {
-    let answer = cached_build! (o |> with_opt :output image |> with_opt :test false) src;
+    // The file goes in the options because they are the cache's key: three builds from one set
+    // of options would otherwise be one entry, and the runtime the library's image.
+    let answer = cached_build! (o |> with_opt :output image |> with_opt :test false |> with_opt :native_part src) src;
     if answer != 0 { () } else {
         let Option.some(bytes) = file.read! image;
         file.remove_all! image;
