@@ -255,11 +255,43 @@ let tagged_arith sp op a b g = {
     let from_fast = Gen.label g9;
     let g10 = emit (str.concat_all ["  br i1 ", over, ", label %", slow, ", label %", done]) g9;
     let g11 = start slow g10;
-    let [s, g12] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol (slow_name op), "(i64 %p, i64 ", a, ", i64 ", b, ")"]) g11;
+    // Two floats are the next most likely thing, and need no call. A literal operand is an
+    // integer, and then they are not.
+    let may_be_floats = op != "mod" && str.starts_with "%" a && str.starts_with "%" b;
+    let [cold, g11a] = label_of "cold" g11;
+    let [floated, g11b] = if may_be_floats { both_floats op a b cold done g11a } else { [[], emit ("  br label %" + cold) g11a] };
+    let g11c = start cold g11b;
+    let [s, g12] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol (slow_name op), "(i64 %p, i64 ", a, ", i64 ", b, ")"]) g11c;
     let g13 = raise_if_zero sp s g12;
     let from_slow = Gen.label g13;
     let g14 = start done (emit ("  br label %" + done) g13);
-    instr (str.concat_all ["phi i64 [ ", v, ", %", from_fast, " ], [ ", s, ", %", from_slow, " ]"]) g14
+    let from_float = match floated { [word, at] => str.concat_all [" [ ", word, ", %", at, " ],"], _ => "" };
+    instr (str.concat_all ["phi i64 [ ", v, ", %", from_fast, " ],", from_float, " [ ", s, ", %", from_slow, " ]"]) g14
+};
+
+/// The float path of an operation: answers its boxed result and the block it comes from.
+let both_floats : :string -> :string -> :string -> :string -> :string -> Gen -> [[:string], Gen];
+let both_floats op a b cold done g = {
+    let [either, g1] = instr (str.concat_all ["or i64 ", a, ", ", b]) g;
+    let [low, g2] = instr (str.concat_all ["and i64 ", either, ", 7"]) g1;
+    let [objects, g3] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g2;
+    let [check, g4] = label_of "objects" g3;
+    let [flt, g5] = label_of "floats" g4;
+    let g6 = start check (emit (str.concat_all ["  br i1 ", objects, ", label %", check, ", label %", cold]) g5);
+    let [ia, g7] = load_at a 0 g6;
+    let [ib, g8] = load_at b 0 g7;
+    let [xa, g9] = instr (str.concat_all ["icmp eq i64 ", ia, ", ptrtoint (ptr @i_float to i64)"]) g8;
+    let [xb, g10] = instr (str.concat_all ["icmp eq i64 ", ib, ", ptrtoint (ptr @i_float to i64)"]) g9;
+    let [both, g11] = instr (str.concat_all ["and i1 ", xa, ", ", xb]) g10;
+    let g12 = start flt (emit (str.concat_all ["  br i1 ", both, ", label %", flt, ", label %", cold]) g11);
+    let [ba, g13] = load_at a 8 g12;
+    let [bb, g14] = load_at b 8 g13;
+    let [da, g15] = instr (str.concat_all ["bitcast i64 ", ba, " to double"]) g14;
+    let [db, g16] = instr (str.concat_all ["bitcast i64 ", bb, " to double"]) g15;
+    let [d, g17] = instr (str.concat_all [float_op op, " double ", da, ", ", db]) g16;
+    let [o, g18] = boxed_float d g17;
+    let at = Gen.label g18;
+    [[o, at], emit ("  br label %" + done) g18]
 };
 
 /// A comparison. Words with no object in them compare as words; anything with one
@@ -419,9 +451,33 @@ let expr e env sp g = match e {
         jump (target_of g symbol) (list.concat [["%p", below, atom_text env f], regs, pad]) g1
     },
     core.Expr.apply(f, args) => {
+        // The usual case, a closure given exactly its arguments, goes straight to its code in
+        // registers. Everything else (a partial application, too few, too many, not a function)
+        // is what `apply!` is for.
         let vals = list.map (atom_text env) args;
-        let [below, g1] = pushing vals sp g;
-        jump (rt_symbol g "apply!") ["%p", below, atom_text env f, to_string (list.length vals), "0", "0"] g1
+        let fv = atom_text env f;
+        let count = list.length vals;
+        let [low, g1] = instr (str.concat_all ["and i64 ", fv, ", 7"]) g;
+        let [is_object, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g1;
+        let [object, g3] = label_of "object" g2;
+        let [direct, g4] = label_of "direct" g3;
+        let [general, g5] = label_of "general" g4;
+        let g6 = start object (emit (str.concat_all ["  br i1 ", is_object, ", label %", object, ", label %", general]) g5);
+        let [info, g7] = load_at fv 0 g6;
+        let [kind, g8] = load_at info 8 g7;
+        let [arity, g9] = load_at info 24 g8;
+        let [is_closure, g10] = instr (str.concat_all ["icmp eq i64 ", kind, ", 3"]) g9;
+        let [fits, g11] = instr (str.concat_all ["icmp eq i64 ", arity, ", ", to_string count]) g10;
+        let [exact, g12] = instr (str.concat_all ["and i1 ", is_closure, ", ", fits]) g11;
+        let g13 = start direct (emit (str.concat_all ["  br i1 ", exact, ", label %", direct, ", label %", general]) g12);
+        let [code, g14] = load_at info 32 g13;
+        let [target, g15] = instr (str.concat_all ["inttoptr i64 ", code, " to ptr"]) g14;
+        let regs = list.take 3 vals;
+        let [below, g16] = pushing (list.drop 3 vals) sp g15;
+        let pad = list.replicate (3 - list.length regs) "0";
+        let g17 = start general (jump target (list.concat [["%p", below, fv], regs, pad]) g16);
+        let [below2, g18] = pushing vals sp g17;
+        jump (rt_symbol g18 "apply!") ["%p", below2, fv, to_string count, "0", "0"] g18
     },
     core.Expr.choose(a, yes, no) => {
         let v = atom_text env a;

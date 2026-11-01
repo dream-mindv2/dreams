@@ -286,10 +286,22 @@ let forced_by img d i lets = if i == image.no_node { 0 } else {
         o if o >= 21 && o <= 31 => of_ a | of_ b,
         o if o == 75 || o == 76 || o == 77 || o == 79 || o == 80 => of_ a | of_ b,
         39 => of_ a,
+        o if o >= 47 && o <= 74 => forced_by_builtin img d names_of_builtins.[a] (image.kids img b c) lets,
         41 => forced_by_arms img d (of_ a) (image.kids img b c) lets,
         42 => forced_by_arms img d (of_ a) (image.kids img b c) lets,
         _ => 0,
     }
+};
+
+/// A builtin that is a native forces what it takes but for its declared lazy positions.
+let forced_by_builtin : image.Image -> Demand -> :string -> [:integer] -> :map -> :integer;
+let forced_by_builtin img d name args lets = match map.lookup name native_builtins {
+    Option.some(native) => if str.ends_with "!" name || map.has native library_natives { 0 } else {
+        let lazy_at = native_lazy.[native else []];
+        list.fold (fn acc [k, arg] -> if list.contains k lazy_at { acc } else { acc | forced_by img d arg lets })
+            0 (list.enumerate args)
+    },
+    Option.none => 0,
 };
 
 /// The function a call runs, if that is known and it is called with exactly its arguments.

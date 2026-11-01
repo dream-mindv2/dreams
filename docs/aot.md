@@ -142,3 +142,59 @@ strictness analysis. `fib 30` takes about what the VM takes.
 of the VM's that one heap has no use for). The runtime grew floats, bignums, maps, records,
 errors with traces, processes on a scheduler, files, sockets, child processes, crypto, trunks,
 regex, the wire format, tensors, and TLS over a `dlopen`ed OpenSSL.
+
+**2026-11-01: FFI.** `std.ffi` and `std.foreign` work with no libffi: a C call is generated code
+loading registers (`prim.ffi_word!`, `ffi_double!`), a callback is a stub written at run time. A
+binary needs libc and libm and nothing else. `dream/tests/ffi/run.sh` holds it to the VM's output.
+Only x86-64's calling convention is written.
+
+**2026-11-01: the first analyses.** Each measured alone against the commit before it, with the
+workloads of `benchmark/benchmark` (ms, best of three, no supercompiler):
+
+| | fib | sum | collatz | pi | strbuild | mapfilter | bytescan |
+|---|---|---|---|---|---|---|---|
+| VM (JIT) | 40 | 43 | 64 | 28 | 33 | 22 | 49 |
+| before any of this | 84 | 267 | 146 | 200 | 112 | 13 | 116 |
+| now | 14 | 35 | 42 | 39 | 73 | 2 | 15 |
+
+and with programs shaped like programs, whose output agrees with the VM's:
+
+| | tree | maps | sorts | recs | strs | procs |
+|---|---|---|---|---|---|---|
+| VM (JIT) | 691 | 598 | 358 | 745 | 201 | 938 |
+| now | 72 | 631 | 528 | 511 | 169 | 144 |
+
+What made the difference, largest first:
+
+- **Strictness** (`strict_masks`, `forced_by` in `aot/core.dr`): a mask per pure function of the
+  parameters every path forces, as a greatest fixed point, seen through known local closures
+  (`closure_calls`) and builtins. A caller evaluates those arguments, a function forces them on
+  entry, and a local that what follows must force is evaluated where it is bound. The cost is
+  which of two errors a call with two raising arguments shows. What may perform effects is
+  excluded, by the image's marks: the function's flag and, for a lambda, its body node's
+  `F_IMPURE`, as the VM's `callee_is_impure` reads them.
+- **Asking before entering**: a value already evaluated continues in line with no frame stored
+  (`inline_budget`). `entry_force` keeps one copy of a body by re-entering with the value, and
+  `Gen.conts` keeps one continuation per `seq`, without which a chain doubled at every link.
+- **Reused heap memory** (`take_chunk!`, `round_chunk!`): page faults were a tenth of a run.
+- **In-line allocation and cold slow paths**: a call to a slow path made a whole function save
+  the callee-saved registers on entry, so those calls are `preserve_mostcc` (`cold_text`).
+- **Cheap eagerness** (`Rhs.speculate`): small-integer arithmetic on evaluated operands is done
+  rather than suspended, and falls back to the suspension when it is not small.
+- **Floats in registers** (`stays_unboxed`): an escape analysis decides whether a float gets a box.
+- **Direct calls**: a known closure (`call_closure`), and an unknown one given exactly its arity
+  checked in line, without the stack `apply!` takes its arguments on.
+
+Trap: once a function stops allocating, LLVM makes a self-call a real loop and lifts the safepoint's
+load out of it, and the process can no longer be killed or collected. That load is volatile.
+
+Found by the second table and not by the first: the scheduler walked every process on every switch
+(`procs` was 8.1 s; now a list of those with a timer or descriptor), a process had a 256 MB mapping
+where this design says a growable stack (now 32 KB, doubling, `move_stack!`), and `list.sort`
+was a lazy merge with a generic comparison (`sorts` was 19.9 s; `sort_prim!` for integer or string keys).
+
+Not done: passing unboxed floats or integers between functions (a worker/wrapper split, which is what
+`pi` still lacks), returning records in registers, omitting a thunk's update when it can only be
+entered once, stack allocation of what does not escape, and a generational collector, which is what
+`maps` and anything with a large live heap would want. Native runs on **one OS thread**, where the VM
+uses every core, so a parallel program will be slower than these numbers suggest.
