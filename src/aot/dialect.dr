@@ -231,6 +231,13 @@ let primitive cx name args s = match name {
             ["feq", [a, b]] => float_compare "oeq" a b s1,
             // printf and strtod by themselves, because a double goes in another
             // register from a word, which the `cN!` calls do not say.
+            // A C function by its address, for a library opened at run time.
+            ["ptr0!", [f]] => pointer_call f [] s1,
+            ["ptr1!", [f, ..rest]] => pointer_call f rest s1,
+            ["ptr2!", [f, ..rest]] => pointer_call f rest s1,
+            ["ptr3!", [f, ..rest]] => pointer_call f rest s1,
+            ["ptr4!", [f, ..rest]] => pointer_call f rest s1,
+            ["ptr5!", [f, ..rest]] => pointer_call f rest s1,
             ["fmt_double!", [buf, size, format, prec, bits]] => {
                 let [d, s2] = instr (str.concat_all ["bitcast i64 ", bits, " to double"]) s1;
                 let [b, s3] = instr (str.concat_all ["inttoptr i64 ", buf, " to ptr"]) s2;
@@ -276,6 +283,12 @@ let c_call cx args s = match args {
             instr (str.concat_all ["call i64 @", symbol, "(", args_text vals, ")"]) s2
         }
     },
+};
+
+let pointer_call : :string -> [:string] -> State -> [:string, State];
+let pointer_call f args s = {
+    let [target, s1] = instr (str.concat_all ["inttoptr i64 ", f, " to ptr"]) s;
+    instr (str.concat_all ["call i64 ", target, "(", args_text args, ")"]) s1
 };
 
 let float_op : :string -> :string -> :string -> State -> [:string, State];

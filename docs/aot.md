@@ -135,3 +135,10 @@ one field, forcing a captured function ran its body with no arguments.
 
 It is not an optimizing compiler yet: every lazy argument is a thunk, as there is no
 strictness analysis. `fib 30` takes about what the VM takes.
+
+**2026-11-01: every recorded program.** All 97 programs in `dream/tests/programs` and
+`examples/` that have recorded output build native and print what they should
+(`dreams/tests/aot_programs.sh`; `share_release` is left out, because it asks about an area
+of the VM's that one heap has no use for). The runtime grew floats, bignums, maps, records,
+errors with traces, processes on a scheduler, files, sockets, child processes, crypto, trunks,
+regex, the wire format, tensors, and TLS over a `dlopen`ed OpenSSL.

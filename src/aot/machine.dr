@@ -528,6 +528,7 @@ let fixed_infos g = {
      info_text "@i_m_write" (rt "io_write_m!") 0 0 0,
      info_text "@i_m_accept" (rt "net_accept_m!") 0 0 0,
      info_text "@i_m_connected" (rt "net_connected_m!") 0 0 0,
+     info_text "@i_m_tls_handshake" (rt "tls_handshake_m!") 0 0 0,
      info_text "@i_apply_rest" (rt "frame_apply_rest!") 0 0 0]
 };
 
@@ -537,7 +538,7 @@ let runtime_roots = ["init!", "alloc!", "enter!", "apply!", "raise!", "collect_a
                      "code_ind!", "code_hole!", "frame_update!", "code_halt!", "frame_apply_rest!", "code_raised!",
                      "code_deferred2!", "frame_catch_return!", "native_failed!", "not_bool!", "frame_resume_entry!",
                      "frame_retry_call!", "frame_enter_again!", "frame_start!", "join_m!", "recv_m!",
-                     "await_message_m!", "sleep_until_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!",
+                     "await_message_m!", "sleep_until_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!", "tls_handshake_m!",
                      "add_slow!", "sub_slow!", "mul_slow!", "div_slow!", "mod_slow!",
                      "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!"];
 
@@ -594,6 +595,23 @@ let tick_text = str.concat_all [
     "  call i32 @usleep(i32 10000)\n  %t = load atomic i64, ptr @i_tick_target monotonic, align 8\n",
     "  %q = inttoptr i64 %t to ptr\n  store atomic i64 -1, ptr %q monotonic, align 8\n  br label %again\n}\n",
     "define internal i64 @dream_start_tick() {\n  %r = call i32 @pthread_create(ptr @dream_tick_handle, ptr null, ptr @dream_tick, ptr null)\n  ret i64 0\n}\n"];
+
+/// The C callbacks OpenSSL wants, which the dialect has no way to write. Each is reached
+/// through addresses `rt/main.dr` stores once it has opened the library. A certificate
+/// revocation list that cannot be found is no reason to refuse a certificate, and a server's
+/// protocol choice is OpenSSL's own function over the list the context was given.
+let tls_text : :string;
+let tls_text = str.concat_all [
+    "@i_tls_get_error = internal global i64 0\n@i_tls_set_error = internal global i64 0\n@i_tls_next_proto = internal global i64 0\n",
+    "define internal i32 @i_verify_stub(i32 %ok, ptr %store) {\nentry:\n  %good = icmp ne i32 %ok, 0\n  br i1 %good, label %yes, label %look\n",
+    "yes:\n  ret i32 1\nlook:\n  %g = load i64, ptr @i_tls_get_error\n  %gp = inttoptr i64 %g to ptr\n  %e = call i32 %gp(ptr %store)\n",
+    "  switch i32 %e, label %no [ i32 3, label %forgive i32 11, label %forgive i32 12, label %forgive i32 33, label %forgive ]\n",
+    "forgive:\n  %s = load i64, ptr @i_tls_set_error\n  %sp = inttoptr i64 %s to ptr\n  call void %sp(ptr %store, i32 0)\n  ret i32 1\nno:\n  ret i32 0\n}\n",
+    "define internal i32 @i_alpn_stub(ptr %ssl, ptr %out, ptr %outlen, ptr %in, i32 %inlen, ptr %arg) {\n",
+    "  %n = load i64, ptr %arg\n  %ours = getelementptr i8, ptr %arg, i64 8\n  %t = trunc i64 %n to i32\n",
+    "  %f = load i64, ptr @i_tls_next_proto\n  %fp = inttoptr i64 %f to ptr\n",
+    "  %r = call i32 %fp(ptr %out, ptr %outlen, ptr %ours, i32 %t, ptr %in, i32 %inlen)\n",
+    "  %ok = icmp eq i32 %r, 1\n  %v = select i1 %ok, i32 0, i32 3\n  ret i32 %v\n}\n"];
 
 let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :string;
 let assemble user st unit_ lib_names entry = {
@@ -655,7 +673,7 @@ let assemble user st unit_ lib_names entry = {
         displays,
         floats,
         closures,
-        [atom_count, atom_table, types_table, display_table, cafs_table, tick_text],
+        [atom_count, atom_table, types_table, display_table, cafs_table, tick_text, tls_text],
         Gen.data g,
         [dialect.Unit.text unit_],
         list.reverse (Gen.code g),
