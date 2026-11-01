@@ -166,6 +166,8 @@ let primitive cx name args s = match name {
     "c4!" => c_call cx args s,
     "c5!" => c_call cx args s,
     "c6!" => c_call cx args s,
+    "d1!" => double_call cx args s,
+    "d2!" => double_call cx args s,
     // The address of an info the machine lays out. By name, since it is the
     // compiler's and is not a value anything here could compute.
     "info" => match args {
@@ -201,6 +203,44 @@ let primitive cx name args s = match name {
             ["ushr", [a, b]] => binary "lshr" a b s1,
             ["udiv", [a, b]] => binary "udiv" a b s1,
             ["urem", [a, b]] => binary "urem" a b s1,
+            ["fadd", [a, b]] => float_op "fadd" a b s1,
+            ["fsub", [a, b]] => float_op "fsub" a b s1,
+            ["fmul", [a, b]] => float_op "fmul" a b s1,
+            ["fdiv", [a, b]] => float_op "fdiv" a b s1,
+            ["fneg", [a]] => float_unary "fneg double" a s1,
+            ["fabs", [a]] => float_unary "call double @llvm.fabs.f64(double" a s1,
+            ["i2f", [a]] => {
+                let [d, s2] = instr (str.concat_all ["sitofp i64 ", a, " to double"]) s1;
+                instr (str.concat_all ["bitcast double ", d, " to i64"]) s2
+            },
+            ["f2i", [a]] => {
+                let [d, s2] = instr (str.concat_all ["bitcast i64 ", a, " to double"]) s1;
+                instr (str.concat_all ["fptosi double ", d, " to i64"]) s2
+            },
+            ["flt", [a, b]] => float_compare "olt" a b s1,
+            ["feq", [a, b]] => float_compare "oeq" a b s1,
+            // printf and strtod by themselves, because a double goes in another
+            // register from a word, which the `cN!` calls do not say.
+            ["fmt_double!", [buf, size, format, prec, bits]] => {
+                let [d, s2] = instr (str.concat_all ["bitcast i64 ", bits, " to double"]) s1;
+                let [b, s3] = instr (str.concat_all ["inttoptr i64 ", buf, " to ptr"]) s2;
+                let [f, s4] = instr (str.concat_all ["inttoptr i64 ", format, " to ptr"]) s3;
+                let [t, s5] = instr (str.concat_all ["trunc i64 ", prec, " to i32"]) s4;
+                let [r, s6] = instr (str.concat_all ["call i32 (ptr, i64, ptr, ...) @snprintf(ptr ", b, ", i64 ", size, ", ptr ", f, ", i32 ", t, ", double ", d, ")"]) s5;
+                ["0", State.set_imports ((State.imports s6).["snprintf" => :variadic]) s6]
+            },
+            // A thread whose only work is to set the guard on a clock, which is how a
+            // loop that does not allocate gets preempted. Its body is in the machine's
+            // text, since it runs with C's calling convention on its own stack.
+            ["tick_thread!", [_]] => {
+                let [r, s2] = instr "call i64 @dream_start_tick()" s1;
+                [r, s2]
+            },
+            ["strtod!", [buf]] => strtod_call buf "null" s1,
+            ["strtod_end!", [buf, end]] => {
+                let [e, s2] = instr (str.concat_all ["inttoptr i64 ", end, " to ptr"]) s1;
+                strtod_call buf e s2
+            },
             // A C `int` answer's top half is not promised to mean anything.
             ["sext32", [a]] => {
                 let [t, s2] = instr (str.concat_all ["trunc i64 ", a, " to i32"]) s1;
@@ -226,6 +266,56 @@ let c_call cx args s = match args {
             instr (str.concat_all ["call i64 @", symbol, "(", args_text vals, ")"]) s2
         }
     },
+};
+
+let float_op : :string -> :string -> :string -> State -> [:string, State];
+let float_op op a b s = {
+    let [x, s1] = instr (str.concat_all ["bitcast i64 ", a, " to double"]) s;
+    let [y, s2] = instr (str.concat_all ["bitcast i64 ", b, " to double"]) s1;
+    let [r, s3] = instr (str.concat_all [op, " double ", x, ", ", y]) s2;
+    instr (str.concat_all ["bitcast double ", r, " to i64"]) s3
+};
+
+let float_unary : :string -> :string -> State -> [:string, State];
+let float_unary op a s = {
+    let [x, s1] = instr (str.concat_all ["bitcast i64 ", a, " to double"]) s;
+    let closes = str.ends_with "(double" op;
+    let [r, s2] = instr (str.concat_all [op, " ", x, if closes { ")" } else { "" }]) s1;
+    instr (str.concat_all ["bitcast double ", r, " to i64"]) s2
+};
+
+let float_compare : :string -> :string -> :string -> State -> [:string, State];
+let float_compare condition a b s = {
+    let [x, s1] = instr (str.concat_all ["bitcast i64 ", a, " to double"]) s;
+    let [y, s2] = instr (str.concat_all ["bitcast i64 ", b, " to double"]) s1;
+    widened (str.concat_all ["fcmp ", condition, " double ", x, ", ", y]) s2
+};
+
+let strtod_call : :string -> :string -> State -> [:string, State];
+let strtod_call buf end s = {
+    let [b, s1] = instr (str.concat_all ["inttoptr i64 ", buf, " to ptr"]) s;
+    let [d, s2] = instr (str.concat_all ["call double @strtod(ptr ", b, ", ptr ", end, ")"]) s1;
+    let [r, s3] = instr (str.concat_all ["bitcast double ", d, " to i64"]) s2;
+    [r, State.set_imports ((State.imports s3).["strtod" => :strtod]) s3]
+};
+
+/// A C function of doubles: libm's. The words here are their bits.
+let double_call : :any -> [:integer] -> State -> [:string, State];
+let double_call cx args s = match args {
+    [first, ..rest] => {
+        let n = image.node cx.[:img] first;
+        let symbol = image.string cx.[:img] (image.Node.a n);
+        let [vals, s1] = values cx rest s;
+        let [doubles, s2] = list.fold (fn [acc, st] v -> {
+            let [d, st1] = instr (str.concat_all ["bitcast i64 ", v, " to double"]) st;
+            [list.cons d acc, st1]
+        }) [[], s1] vals;
+        let params = str.join_str ", " (list.map (fn d -> "double " + d) (list.reverse doubles));
+        let [r, s3] = instr (str.concat_all ["call double @", symbol, "(", params, ")"]) s2;
+        let [w, s4] = instr (str.concat_all ["bitcast double ", r, " to i64"]) s3;
+        [w, State.set_imports ((State.imports s4).[symbol => [:double, list.length rest]]) s4]
+    },
+    [] => refuse (cx.[:name] + ": a C call needs the function's name") s,
 };
 
 /// A direct call's answer. `cx` says how: as a value, or in tail position.
@@ -529,6 +619,11 @@ let to_ir img = {
 
 /// A C function's declaration, for each of the ones a unit called.
 let declarations : :map -> [:string];
-let declarations imports = list.map (fn [symbol, n] ->
-    str.concat_all ["declare i64 @", symbol, "(", str.join_str ", " (list.replicate n "i64"), ")\n"])
-    (map.pairs imports);
+let declarations imports = list.append
+    ["declare double @llvm.fabs.f64(double)\n"]
+    (list.map (fn [symbol, shape] -> match shape {
+        :variadic => "declare i32 @snprintf(ptr, i64, ptr, ...)\n",
+        :strtod => "declare double @strtod(ptr, ptr)\n",
+        [:double, n] => str.concat_all ["declare double @", symbol, "(", str.join_str ", " (list.replicate n "double"), ")\n"],
+        n => str.concat_all ["declare i64 @", symbol, "(", str.join_str ", " (list.replicate n "i64"), ")\n"],
+    }) (map.pairs imports));

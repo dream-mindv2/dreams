@@ -98,9 +98,10 @@ grep -q "main!: opcode 36" said || fail "the refusal did not name main!: $(cat s
 
 # Ordinary Dream, on the runtime: what it does not have yet is refused the same way.
 cat > later.dr <<'DR'
-let main! () = try! { 1 } catch e { 2 };
+import std.net;
+let main! () = net.lookup! "localhost";
 DR
-if compile -o later later.dr; then fail "try! was accepted before it is built"; fi
+if compile -o later later.dr; then fail "a native not built yet was accepted"; fi
 grep -q "is not compiled yet" said || fail "the refusal did not say why: $(cat said)"
 
 # A lazy list consumed as it is built must not be pinned, a list that is held must

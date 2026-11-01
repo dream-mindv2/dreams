@@ -64,7 +64,7 @@ let written! ir out = {
 let object_and_link! : :string -> :string -> Result :integer [:string];
 let object_and_link! ir out = match vm.llvm_object! ir opt_level {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
-    Result.ok(object) => match link.link (link.Options.make (loader! ()) ["libc.so.6"]) object {
+    Result.ok(object) => match link.link (link.Options.make (loader! ()) ["libm.so.6", "libc.so.6"]) object {
         Result.error(why) => Result.error [why],
         Result.ok(exe) => {
             file.write! out exe;
