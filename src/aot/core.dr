@@ -127,7 +127,7 @@ let refuse_in where why s = St.set_refused (list.cons (str.concat_all [where, ":
 
 // --- words -----------------------------------------------------------------------
 //
-// How a value is one word, the compiler's half of what mind/std/src/rt/main.dr says.
+// How a value is one word, the compiler's half of what mind/std/rt/main.dr says.
 
 let fixnum_word : :integer -> :string;
 let fixnum_word n = to_string (n * 2 + 1);
@@ -620,8 +620,11 @@ let tail cx i env s = {
             [Expr.ret f, s1]
         },
         12 => {
-            let [f, s1] = host_value cx n s;
-            [Expr.ret f, s1]
+            let object = image.node cx.[:img] a;
+            if image.Node.op object == 10 && image.Global.kind (image.global cx.[:img] (image.Node.a object)) == 1 {
+                let [f, s1] = host_value cx n s;
+                [Expr.ret f, s1]
+            } else { dynamic_member cx n env s }
         },
         13 => applied cx a (image.kids cx.[:img] b c) env s,
         14 => value cx a env s (fn cond env1 s1 -> {
@@ -718,7 +721,7 @@ let global_read : :any -> :integer -> Env -> St -> [Expr, St];
 let global_read cx g env s = {
     let rec_ = image.global cx.[:img] g;
     if image.Global.kind rec_ != 0 {
-        [Expr.raise_text "module", refuse_in cx.[:name] "a module used as a value" s]
+        module_value cx (image.import_path cx.[:img] (image.Global.target rec_)) s
     } else {
         let f = image.Global.target rec_;
         let fr = image.func cx.[:img] f;
@@ -752,8 +755,13 @@ let applied cx callee args env s = {
             let object = image.node cx.[:img] (image.Node.a n);
             let g = image.global cx.[:img] (image.Node.a object);
             if image.Node.op object == 10 && image.Global.kind g == 1 {
-                native_call cx (image.import_path cx.[:img] (image.Global.target g))
-                    (image.string cx.[:img] (image.Node.b n)) args env s
+                let module_ = image.import_path cx.[:img] (image.Global.target g);
+                let member = image.string cx.[:img] (image.Node.b n);
+                if module_ == "std.vm" && member == "host_members" {
+                    let [table, s1] = intern_string (host_table cx) s;
+                    lazies cx args env (St.set_needed_lib ((St.needed_lib s1).["host_members_in" => true]) s1)
+                        (fn atoms _ s2 -> [Expr.call "@lib_host_members_in" (list.cons (Atom.address table) atoms), s2])
+                } else { native_call cx module_ member args env s }
             } else { unknown () }
         },
         _ => unknown (),
@@ -762,58 +770,226 @@ let applied cx callee args env s = {
 
 /// Members of host modules this machine has: the runtime function, with the
 /// arguments forced. A native takes the context first (rt/main.dr).
+let host_member_list : [[:string]];
+let host_member_list = [
+    ["std.math.sqrt", "math_sqrt!"],
+    ["std.math.abs", "math_abs!"],
+    ["std.math.floor", "math_floor!"],
+    ["std.math.exp", "math_exp!"],
+    ["std.math.log", "math_log!"],
+    ["std.math.sin", "math_sin!"],
+    ["std.math.cos", "math_cos!"],
+    ["std.math.tan", "math_tan!"],
+    ["std.math.tanh", "math_tanh!"],
+    ["std.math.atan", "math_atan!"],
+    ["std.math.pow", "math_pow!"],
+    ["std.io.stdout!", "io_stdout!"],
+    ["std.io.stderr!", "io_stderr!"],
+    ["std.io.stdin!", "io_stdin!"],
+    ["std.io.read!", "io_read_m!"],
+    ["std.io.write!", "io_write_m!"],
+    ["std.io.open!", "io_open!"],
+    ["std.io.close!", "io_close!"],
+    ["std.io.flush!", "io_flush!"],
+    ["std.io.seek!", "io_seek!"],
+    ["std.io.size!", "io_size!"],
+    ["std.io.kind!", "io_kind!"],
+    ["std.io.is_open!", "is_open!"],
+    ["std.io.is_terminal!", "io_is_terminal!"],
+    ["std.io.enable_ansi!", "io_enable_ansi!"],
+    ["std.io.exists!", "io_exists!"],
+    ["std.io.is_dir!", "io_is_dir!"],
+    ["std.io.remove!", "io_remove!"],
+    ["std.io.rename!", "io_rename!"],
+    ["std.io.mkdir!", "io_mkdir!"],
+    ["std.io.stat!", "io_stat!"],
+    ["std.io.lstat!", "io_lstat!"],
+    ["std.io.is_link!", "io_is_link!"],
+    ["std.io.mode!", "io_mode!"],
+    ["std.io.chmod!", "io_chmod!"],
+    ["std.io.link!", "io_link!"],
+    ["std.io.symlink!", "io_symlink!"],
+    ["std.io.read_link!", "io_read_link!"],
+    ["std.io.copy!", "io_copy!"],
+    ["std.io.temp_file!", "io_temp_file!"],
+    ["std.io.temp_dir!", "io_temp_dir!"],
+    ["std.io.remove_all!", "remove_all!"],
+    ["std.io.mkdir_all!", "mkdir_all!"],
+    ["std.io.walk!", "walk!"],
+    ["std.os.args!", "os_args!"],
+    ["std.os.env!", "os_env!"],
+    ["std.os.set_env!", "os_set_env!"],
+    ["std.os.cwd!", "os_cwd!"],
+    ["std.os.chdir!", "os_chdir!"],
+    ["std.os.list_dir!", "list_dir!"],
+    ["std.os.monotonic!", "os_monotonic!"],
+    ["std.os.now!", "wall_ms!"],
+    ["std.os.pid!", "os_pid!"],
+    ["std.os.platform", "os_platform!"],
+    ["std.os.arch", "os_arch!"],
+    ["std.os.exit!", "os_exit!"],
+    ["std.os.install_dirs!", "os_install_dirs!"],
+    ["std.os.exec!", "exec!"],
+    ["std.os.exec_for!", "exec_for!"],
+    ["std.os.exec_in!", "exec_in!"],
+    ["std.os.exec_with!", "exec_with!"],
+    ["std.os.exec_joined!", "exec_joined!"],
+    ["std.net.listen!", "net_listen!"],
+    ["std.net.listen_on!", "net_listen_on!"],
+    ["std.net.accept!", "net_accept_m!"],
+    ["std.net.connect!", "net_connect_m!"],
+    ["std.net.peer!", "net_peer!"],
+    ["std.net.port!", "net_port!"],
+    ["std.net.shutdown!", "net_shutdown!"],
+    ["std.vm.mailbox_size!", "mailbox_size!"],
+    ["std.vm.mailbox_peek!", "mailbox_peek!"],
+    ["std.vm.mailbox_take!", "mailbox_take!"],
+    ["std.vm.monitor!", "monitor!"],
+    ["std.vm.demonitor!", "demonitor!"],
+    ["std.vm.unique!", "unique_value!"],
+    ["std.vm.now_ns!", "now_ns_value!"],
+    ["std.vm.wall_ms!", "wall_ms!"],
+    ["std.vm.await_message!", "await_message_m!"],
+    ["std.vm.sleep_until!", "sleep_until_m!"],
+    ["std.vm.kill!", "kill_value!"],
+    ["std.vm.share!", "share!"],
+    ["std.vm.regex_run", "regex_run!"],
+    ["std.vm.host_members", "zero_of!"],
+    ["std.vm.processes!", "processes_live!"],
+    ["std.vm.reductions!", "zero_of!"],
+    ["std.vm.collections!", "collections_done!"],
+    ["std.vm.heap_bytes!", "heap_bytes!"],
+    ["std.vm.allocated!", "heap_bytes!"],
+    ["std.vm.peak_bytes!", "heap_bytes!"],
+    ["std.vm.mailbox_size!", "mailbox_size!"],
+    ["std.vm.async_io", "true_of!"],
+    ["std.vm.dump!", "unit_of!"],
+    ["std.vm.modules!", "nil_of!"],
+    ["std.vm.scheduler!", "empty_map_of!"],
+    ["std.vm.io!", "empty_map_of!"],
+    ["std.vm.stats!", "empty_map_of!"],
+    ["std.vm.processes_info!", "nil_of!"],
+    ["std.vm.process_info!", "unit_of!"],
+    ["std.tensor.of_list", "as_tensor"],
+    ["std.tensor.to_list", "tensor_to_list"],
+    ["std.tensor.zeros", "t_zeros"],
+    ["std.tensor.ones", "t_ones"],
+    ["std.tensor.fill", "t_fill"],
+    ["std.tensor.identity", "t_identity"],
+    ["std.tensor.range", "t_range"],
+    ["std.tensor.random", "t_random"],
+    ["std.tensor.random_like", "t_random_like"],
+    ["std.tensor.shape", "t_shape"],
+    ["std.tensor.rank", "t_rank"],
+    ["std.tensor.size", "t_size"],
+    ["std.tensor.device", "t_device"],
+    ["std.tensor.dtype", "t_dtype"],
+    ["std.tensor.reshape", "t_reshape"],
+    ["std.tensor.transpose", "t_transpose"],
+    ["std.tensor.at", "t_at"],
+    ["std.tensor.matmul", "t_matmul"],
+    ["std.tensor.dot", "t_dot"],
+    ["std.tensor.outer", "t_outer"],
+    ["std.tensor.sum", "t_sum"],
+    ["std.tensor.sum_tensor", "t_sum_tensor"],
+    ["std.tensor.minimum", "t_minimum"],
+    ["std.tensor.maximum", "t_maximum"],
+    ["std.tensor.mean", "t_mean"],
+    ["std.tensor.norm", "t_norm"],
+    ["std.tensor.sum_axis", "t_sum_axis"],
+    ["std.tensor.min_axis", "t_min_axis"],
+    ["std.tensor.max_axis", "t_max_axis"],
+    ["std.tensor.argmin_axis", "t_argmin_axis"],
+    ["std.tensor.argmax_axis", "t_argmax_axis"],
+    ["std.tensor.sqrt", "t_sqrt"],
+    ["std.tensor.exp", "t_exp"],
+    ["std.tensor.log", "t_log"],
+    ["std.tensor.abs", "t_abs"],
+    ["std.tensor.tanh", "t_tanh"],
+    ["std.tensor.sin", "t_sin"],
+    ["std.tensor.cos", "t_cos"],
+    ["std.tensor.relu", "t_relu"],
+    ["std.tensor.sigmoid", "t_sigmoid"],
+    ["std.tensor.floor", "t_floor"],
+    ["std.tensor.ceil", "t_ceil"],
+    ["std.tensor.round", "t_round"],
+    ["std.tensor.sign", "t_sign"],
+    ["std.tensor.erf", "t_erf"],
+    ["std.tensor.max", "t_max"],
+    ["std.tensor.min", "t_min"],
+    ["std.tensor.pow", "t_pow"],
+    ["std.tensor.lt", "t_lt"],
+    ["std.tensor.le", "t_le"],
+    ["std.tensor.gt", "t_gt"],
+    ["std.tensor.ge", "t_ge"],
+    ["std.tensor.eq", "t_eq"],
+    ["std.tensor.ne", "t_ne"],
+    ["std.tensor.fill_like", "t_fill_like"],
+    ["std.tensor.repeat", "t_repeat"],
+    ["std.tensor.slice", "t_slice"],
+    ["std.tensor.take", "t_take"],
+    ["std.tensor.concat", "t_concat"],
+    ["std.tensor.one_hot", "t_one_hot"],
+    ["std.tensor.normal", "t_normal"],
+    ["std.tensor.to_bytes", "t_to_bytes"],
+    ["std.tensor.im2col", "t_im2col"],
+    ["std.tensor.permute", "t_permute"],
+    ["std.tensor.col2im", "t_col2im"],
+    ["std.tensor.of_bytes", "t_of_bytes"],
+    ["std.tensor.gpu", "t_gpu"],
+    ["std.tensor.gpu64", "t_gpu64"],
+    ["std.tensor.host", "t_host"],
+    ["std.tensor.gpu_available", "t_gpu_available"],
+    ["std.tensor.gpu_name", "t_gpu_name"],
+    ["std.tensor.cpu_kernels", "t_cpu_kernels"],
+    ["std.vm.wire_encode", "wire_encode"],
+    ["std.vm.wire_decode", "wire_decode"],
+    ["std.vm.wire_pack", "wire_pack"],
+    ["std.vm.json_encode", "json_encode"],
+    ["std.vm.json_decode", "json_decode!"],
+    ["std.vm.shared_bytes!", "no_shared_bytes!"],
+    ["std.vm.release!", "release_nothing!"],
+    ["std.vm.collect_shared!", "no_shared_bytes!"],
+    ["std.vm.trunk_of", "trunk_of"],
+    ["std.vm.trunk_to_list", "trunk_to_list!"],
+    ["std.vm.trunk_len", "trunk_len!"],
+    ["std.vm.trunk_at", "trunk_read!"],
+    ["std.vm.trunk_push", "trunk_push!"],
+    ["std.vm.trunk_cons", "trunk_cons!"],
+    ["std.vm.trunk_set", "trunk_set!"],
+    ["std.vm.trunk_slice", "trunk_slice!"],
+    ["std.vm.trunk_concat", "trunk_concat"],
+    ["std.vm.trunk_contains", "trunk_contains"],
+    ["std.vm.trunk_index_of", "trunk_index_of"],
+    ["std.vm.trunk_count", "trunk_count"],
+    ["std.vm.trunk_lookup", "trunk_lookup"],
+    ["std.vm.trunk_put", "trunk_put"],
+    ["std.io.digest!", "io_digest_file!"],
+    ["std.io.digest", "io_digest!"],
+    ["std.crypto.md5", "crypto_md5!"],
+    ["std.crypto.sha1", "crypto_sha1!"],
+    ["std.crypto.sha256", "crypto_sha256!"],
+    ["std.crypto.sha384", "crypto_sha384!"],
+    ["std.crypto.sha512", "crypto_sha512!"],
+    ["std.crypto.digest", "crypto_digest!"],
+    ["std.crypto.digest_file!", "crypto_digest_file!"],
+    ["std.crypto.hmac", "crypto_hmac!"],
+    ["std.crypto.pbkdf2", "crypto_pbkdf2!"],
+    ["std.crypto.hkdf", "crypto_hkdf!"],
+    ["std.crypto.equal", "crypto_equal!"],
+    ["std.crypto.xor", "crypto_xor!"],
+    ["std.crypto.hex", "crypto_hex!"],
+    ["std.crypto.unhex", "crypto_unhex!"],
+    ["std.crypto.base64", "crypto_base64!"],
+    ["std.crypto.unbase64", "crypto_unbase64!"],
+    ["std.crypto.random_bytes!", "crypto_random_bytes!"],
+    ["std.crypto.ed25519_public", "ed25519_public"],
+    ["std.crypto.ed25519_sign", "ed25519_sign"],
+    ["std.crypto.ed25519_verify", "ed25519_verify"],
+];
+
 let host_members : :map;
-let host_members = %{
-    "std.io.stdout!" => "io_stdout!", "std.io.stderr!" => "io_stderr!", "std.io.stdin!" => "io_stdin!",
-    "std.io.read!" => "io_read_m!", "std.io.write!" => "io_write_m!", "std.io.open!" => "io_open!",
-    "std.io.close!" => "io_close!", "std.io.flush!" => "io_flush!", "std.io.seek!" => "io_seek!",
-    "std.io.size!" => "io_size!", "std.io.kind!" => "io_kind!", "std.io.is_open!" => "is_open!",
-    "std.io.is_terminal!" => "io_is_terminal!", "std.io.enable_ansi!" => "io_enable_ansi!",
-    "std.io.exists!" => "io_exists!", "std.io.is_dir!" => "io_is_dir!", "std.io.remove!" => "io_remove!",
-    "std.io.rename!" => "io_rename!", "std.io.mkdir!" => "io_mkdir!", "std.io.stat!" => "io_stat!",
-    "std.io.lstat!" => "io_lstat!", "std.io.is_link!" => "io_is_link!", "std.io.mode!" => "io_mode!",
-    "std.io.chmod!" => "io_chmod!", "std.io.link!" => "io_link!", "std.io.symlink!" => "io_symlink!",
-    "std.io.read_link!" => "io_read_link!", "std.io.copy!" => "io_copy!", "std.io.temp_file!" => "io_temp_file!",
-    "std.io.temp_dir!" => "io_temp_dir!", "std.io.remove_all!" => "remove_all!", "std.io.mkdir_all!" => "mkdir_all!",
-    "std.io.walk!" => "walk!",
-    "std.os.args!" => "os_args!", "std.os.env!" => "os_env!", "std.os.set_env!" => "os_set_env!",
-    "std.os.cwd!" => "os_cwd!", "std.os.chdir!" => "os_chdir!", "std.os.list_dir!" => "list_dir!",
-    "std.os.monotonic!" => "os_monotonic!", "std.os.now!" => "wall_ms!", "std.os.pid!" => "os_pid!",
-    "std.os.platform" => "os_platform!", "std.os.arch" => "os_arch!", "std.os.exit!" => "os_exit!",
-    "std.os.install_dirs!" => "os_install_dirs!", "std.os.exec!" => "exec!", "std.os.exec_for!" => "exec_for!",
-    "std.os.exec_in!" => "exec_in!", "std.os.exec_with!" => "exec_with!", "std.os.exec_joined!" => "exec_joined!",
-    "std.net.listen!" => "net_listen!", "std.net.listen_on!" => "net_listen_on!", "std.net.accept!" => "net_accept_m!",
-    "std.net.connect!" => "net_connect_m!", "std.net.peer!" => "net_peer!", "std.net.port!" => "net_port!",
-    "std.net.shutdown!" => "net_shutdown!",
-    "std.math.sqrt" => "math_sqrt!", "std.math.abs" => "math_abs!", "std.math.floor" => "math_floor!",
-    "std.math.exp" => "math_exp!", "std.math.log" => "math_log!", "std.math.sin" => "math_sin!",
-    "std.math.cos" => "math_cos!", "std.math.tan" => "math_tan!", "std.math.tanh" => "math_tanh!",
-    "std.math.atan" => "math_atan!", "std.math.pow" => "math_pow!",
-    "std.vm.mailbox_size!" => "mailbox_size!", "std.vm.mailbox_peek!" => "mailbox_peek!",
-    "std.vm.mailbox_take!" => "mailbox_take!", "std.vm.monitor!" => "monitor!", "std.vm.demonitor!" => "demonitor!",
-    "std.vm.unique!" => "unique_value!", "std.vm.now_ns!" => "now_ns_value!", "std.vm.wall_ms!" => "wall_ms!",
-    "std.vm.await_message!" => "await_message_m!", "std.vm.sleep_until!" => "sleep_until_m!",
-    "std.vm.kill!" => "kill_value!", "std.vm.share!" => "share!",
-    "std.vm.regex_run" => "regex_run!",
-    "std.tensor.of_list" => "as_tensor", "std.tensor.to_list" => "tensor_to_list", "std.tensor.zeros" => "t_zeros", "std.tensor.ones" => "t_ones", "std.tensor.fill" => "t_fill", "std.tensor.identity" => "t_identity", "std.tensor.range" => "t_range", "std.tensor.random" => "t_random", "std.tensor.random_like" => "t_random_like", "std.tensor.shape" => "t_shape", "std.tensor.rank" => "t_rank", "std.tensor.size" => "t_size", "std.tensor.device" => "t_device", "std.tensor.dtype" => "t_dtype", "std.tensor.reshape" => "t_reshape", "std.tensor.transpose" => "t_transpose", "std.tensor.at" => "t_at", "std.tensor.matmul" => "t_matmul", "std.tensor.dot" => "t_dot", "std.tensor.outer" => "t_outer", "std.tensor.sum" => "t_sum", "std.tensor.sum_tensor" => "t_sum_tensor", "std.tensor.minimum" => "t_minimum", "std.tensor.maximum" => "t_maximum", "std.tensor.mean" => "t_mean", "std.tensor.norm" => "t_norm", "std.tensor.sum_axis" => "t_sum_axis", "std.tensor.min_axis" => "t_min_axis", "std.tensor.max_axis" => "t_max_axis", "std.tensor.argmin_axis" => "t_argmin_axis", "std.tensor.argmax_axis" => "t_argmax_axis", "std.tensor.sqrt" => "t_sqrt", "std.tensor.exp" => "t_exp", "std.tensor.log" => "t_log", "std.tensor.abs" => "t_abs", "std.tensor.tanh" => "t_tanh", "std.tensor.sin" => "t_sin", "std.tensor.cos" => "t_cos", "std.tensor.relu" => "t_relu", "std.tensor.sigmoid" => "t_sigmoid", "std.tensor.floor" => "t_floor", "std.tensor.ceil" => "t_ceil", "std.tensor.round" => "t_round", "std.tensor.sign" => "t_sign", "std.tensor.erf" => "t_erf", "std.tensor.max" => "t_max", "std.tensor.min" => "t_min", "std.tensor.pow" => "t_pow", "std.tensor.lt" => "t_lt", "std.tensor.le" => "t_le", "std.tensor.gt" => "t_gt", "std.tensor.ge" => "t_ge", "std.tensor.eq" => "t_eq", "std.tensor.ne" => "t_ne", "std.tensor.fill_like" => "t_fill_like", "std.tensor.repeat" => "t_repeat", "std.tensor.slice" => "t_slice", "std.tensor.take" => "t_take", "std.tensor.concat" => "t_concat", "std.tensor.one_hot" => "t_one_hot", "std.tensor.normal" => "t_normal", "std.tensor.to_bytes" => "t_to_bytes", "std.tensor.im2col" => "t_im2col", "std.tensor.permute" => "t_permute", "std.tensor.col2im" => "t_col2im", "std.tensor.of_bytes" => "t_of_bytes", "std.tensor.gpu" => "t_gpu", "std.tensor.gpu64" => "t_gpu64", "std.tensor.host" => "t_host", "std.tensor.gpu_available" => "t_gpu_available", "std.tensor.gpu_name" => "t_gpu_name", "std.tensor.cpu_kernels" => "t_cpu_kernels",
-    "std.vm.wire_encode" => "wire_encode", "std.vm.wire_decode" => "wire_decode", "std.vm.wire_pack" => "wire_pack",
-    "std.vm.json_encode" => "json_encode", "std.vm.json_decode" => "json_decode!",
-    "std.vm.shared_bytes!" => "no_shared_bytes!", "std.vm.release!" => "release_nothing!", "std.vm.collect_shared!" => "no_shared_bytes!",
-    "std.vm.trunk_of" => "trunk_of", "std.vm.trunk_to_list" => "trunk_to_list!", "std.vm.trunk_len" => "trunk_len!",
-    "std.vm.trunk_at" => "trunk_read!", "std.vm.trunk_push" => "trunk_push!", "std.vm.trunk_cons" => "trunk_cons!",
-    "std.vm.trunk_set" => "trunk_set!", "std.vm.trunk_slice" => "trunk_slice!", "std.vm.trunk_concat" => "trunk_concat",
-    "std.vm.trunk_contains" => "trunk_contains", "std.vm.trunk_index_of" => "trunk_index_of",
-    "std.vm.trunk_count" => "trunk_count", "std.vm.trunk_lookup" => "trunk_lookup", "std.vm.trunk_put" => "trunk_put",
-    "std.io.digest!" => "io_digest_file!", "std.io.digest" => "io_digest!",
-    "std.crypto.md5" => "crypto_md5!", "std.crypto.sha1" => "crypto_sha1!", "std.crypto.sha256" => "crypto_sha256!",
-    "std.crypto.sha384" => "crypto_sha384!", "std.crypto.sha512" => "crypto_sha512!", "std.crypto.digest" => "crypto_digest!",
-    "std.crypto.digest_file!" => "crypto_digest_file!", "std.crypto.hmac" => "crypto_hmac!", "std.crypto.pbkdf2" => "crypto_pbkdf2!",
-    "std.crypto.hkdf" => "crypto_hkdf!", "std.crypto.equal" => "crypto_equal!", "std.crypto.xor" => "crypto_xor!",
-    "std.crypto.hex" => "crypto_hex!", "std.crypto.unhex" => "crypto_unhex!", "std.crypto.base64" => "crypto_base64!",
-    "std.crypto.unbase64" => "crypto_unbase64!", "std.crypto.random_bytes!" => "crypto_random_bytes!",
-    "std.crypto.ed25519_public" => "ed25519_public", "std.crypto.ed25519_sign" => "ed25519_sign",
-    "std.crypto.ed25519_verify" => "ed25519_verify",
-};
+let host_members = list.fold (fn m [k, v] -> m.[k => v]) %{} host_member_list;
 
 /// Runtime functions that may block, so that they take the stack and are jumped to
 /// rather than called: `name => arguments`.
@@ -823,7 +999,7 @@ let machine_natives = %{"join_m!" => 1, "recv_m!" => 1, "await_message_m!" => 2,
 
 let native_call : :any -> :string -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let native_call cx module_ member args env s = match native_named cx module_ member {
-    Option.none => not_built cx (str.concat_all ["`", module_, ".", member, "`"]) s,
+    Option.none => missing_member cx module_ member s,
     Option.some(fn_name) =>
         if arity_of_native cx fn_name == list.length args { native_exactly fn_name cx args env s }
         else {
@@ -832,13 +1008,88 @@ let native_call cx module_ member args env s = match native_named cx module_ mem
         },
 };
 
+/// What the VM has and this has not built is refused, since a program using it would
+/// fail where it should not. Anything else is the program's own mistake, and as under the
+/// VM it is an error when it is reached, which a program may be testing for.
+let vm_only : :map;
+let vm_only = list.fold (fn m k -> m.[k => true]) %{} [
+    "std.tls.connect!", "std.tls.accept!", "std.tls.info!", "std.tls.backend",
+    "std.os.replace!", "std.os.pty_spawn!", "std.os.pty_resize!", "std.os.pty_status!", "std.os.pty_signal!", "std.os.pty_foreground!",
+    "std.vm.eval_image!", "std.vm.open_image!", "std.vm.call_image!", "std.vm.close_image!", "std.vm.image_function",
+    "std.vm.pure_image_function", "std.vm.locate_image!", "std.vm.image_digest", "std.vm.share_arenas", "std.vm.node_section", "std.vm.index_section",
+];
+
+let missing_member : :any -> :string -> :string -> St -> [Expr, St];
+let missing_member cx module_ member s = {
+    let full = str.concat_all [module_, ".", member];
+    if map.has full vm_only || module_ == "std.ffi" || module_ == "std.browser" {
+        not_built cx (str.concat_all ["`", full, "`"]) s
+    } else {
+        let [path, s1] = intern_string module_ s;
+        let [name, s2] = intern_string member s1;
+        let [x, s3] = fresh (St.set_natives ((St.natives s2).["no_such_member!" => true]) s2);
+        [Expr.bind x (Rhs.native "no_such_member!" [Atom.address path, Atom.address name]) (Expr.ret (Atom.var x)), s3]
+    }
+};
+
+/// `vm.host_members`'s table: `module.member arity` a line.
+let host_table : :any -> :string;
+let host_table cx = str.join_str "\n" (list.map (fn [full, fn_name] ->
+    str.concat_all [full, " ", to_string (arity_of_native cx fn_name)]) host_member_list);
+
 let native_named : :any -> :string -> :string -> :any;
 let native_named cx module_ member =
     // The library names runtime functions directly: that is what `rt.native` is. A
     // native's own `!` is the dialect's, for reading memory, and is not the library's
     // business: to it, an answer that depends only on its arguments is pure.
     if module_ == "rt.native" { Option.some (member + "!") }
-    else { map.lookup (str.concat_all [module_, ".", member]) host_members };
+    else { member_or_its_twin (str.concat_all [module_, ".", member]) };
+
+/// A name with or without its `!` finds the same member: purity is the caller's to check,
+/// and the VM looks both up.
+let member_or_its_twin : :string -> :any;
+let member_or_its_twin full = match map.lookup full host_members {
+    Option.some(found) => Option.some found,
+    Option.none => map.lookup (if str.ends_with "!" full { str.slice 0 (len full - 1) full } else { full + "!" }) host_members,
+};
+
+/// A host module as a value: a map from its members' names to functions, which is all that
+/// can be done with one. It is built only for a program that does this.
+let module_value : :any -> :string -> St -> [Expr, St];
+let module_value cx path s = {
+    let prefix = path + ".";
+    let members = list.filter (fn [full, _] -> str.starts_with prefix full) host_member_list;
+    let rec fill rest current st = match rest {
+        [] => {
+            let [wrapped, st1] = fresh st;
+            let [text, st2] = intern_string path st1;
+            [Expr.bind wrapped (Rhs.native "module_of!" [current, Atom.address text]) (Expr.ret (Atom.var wrapped)), st2]
+        },
+        [[full, fn_name], ..more] => {
+            let name = str.slice (len prefix) (len full - len prefix) full;
+            let [key, s1] = intern_string name st;
+            let [f, s2] = wrapper_of_native cx fn_name s1;
+            let [x, s3] = fresh s2;
+            let [after, s4] = fill more (Atom.var x) s3;
+            [Expr.bind x (Rhs.native "map_put!" [current, Atom.address key, f]) after, s4]
+        },
+    };
+    let s0 = list.fold (fn st name -> St.set_natives ((St.natives st).[name => true]) st) s ["map_empty!", "map_put!"];
+    let [m, s5] = fresh s0;
+    let [path_text, s6] = intern_string path (St.set_natives ((St.natives s5).["module_of!" => true]) s5);
+    let [body, s7] = fill members (Atom.var m) s6;
+    [Expr.bind m (Rhs.native "map_empty!" []) body, s7]
+};
+
+/// `value.member`, where the value is not named at the top level.
+let dynamic_member : :any -> image.Node -> Env -> St -> [Expr, St];
+let dynamic_member cx n env s = {
+    let [name, s1] = intern_string (image.string cx.[:img] (image.Node.b n)) s;
+    value cx (image.Node.a n) env (St.set_natives ((St.natives s1).["member_of!" => true]) s1) (fn object _ s2 -> {
+        let [x, s3] = fresh s2;
+        [Expr.bind x (Rhs.native "member_of!" [object, Atom.address name]) (Expr.ret (Atom.var x)), s3]
+    })
+};
 
 let not_built : :any -> :string -> St -> [Expr, St];
 let not_built cx what s =
@@ -963,12 +1214,24 @@ let host_value cx n s = {
     let member = image.string cx.[:img] (image.Node.b n);
     match native_named cx path member {
         Option.some(fn_name) => wrapper_of_native cx fn_name s,
-        Option.none => [Atom.word unit_word, refuse_in cx.[:name] (str.concat_all ["`", path, ".", member, "` is not compiled yet"]) s],
+        Option.none => {
+            // Not there at all: an error when it is reached, by a function that raises it.
+            let [path_text, s1] = intern_string path s;
+            let [name_text, s2] = intern_string member s1;
+            let [params, s3] = fresh_many 1 s2;
+            let [id, s4] = fresh s3;
+            let [x, s5] = fresh s4;
+            let symbol = "@wm" + to_string id;
+            let body = Expr.bind x (Rhs.native "no_such_member!" [Atom.address path_text, Atom.address name_text]) (Expr.ret (Atom.var x));
+            let f = Function.make symbol symbol :function true params [] body member [];
+            [static_closure symbol, s5 |> St.set_natives ((St.natives s5).["no_such_member!" => true])
+                                       |> St.set_functions (list.cons f (St.functions s5))]
+        },
     }
 };
 
 /// A builtin, in three kinds: written out here, a runtime function, or a function
-/// of the library (mind/std/src/rt/lib.dr), which is ordinary Dream.
+/// of the library (mind/std/rt/lib.dr), which is ordinary Dream.
 let builtin : :any -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let builtin cx name args env s = match [name, args] {
     ["raise!", [e]] => value cx e env s (fn v _ s1 -> [Expr.raised v, s1]),
@@ -1105,8 +1368,11 @@ let lazily cx i env s k = {
             k f env s1
         },
         12 => {
-            let [f, s1] = host_value cx n s;
-            k f env s1
+            let object = image.node cx.[:img] a;
+            if image.Node.op object == 10 && image.Global.kind (image.global cx.[:img] (image.Node.a object)) == 1 {
+                let [f, s1] = host_value cx n s;
+                k f env s1
+            } else { suspended cx i env s k }
         },
         36 => list_literal cx (image.kids cx.[:img] a (image.Node.b n)) env s k,
         44 => lazily_alloc cx "cons" [a, image.Node.b n] env s k,

@@ -467,7 +467,7 @@ let build! l out shebang depfile specs said stats kept o = {
                                            else { ", " + to_string (list.length payloads) + " payloads, "
                                                   + to_string payload_bytes + " payload bytes" })
                                         + ")";
-                            console.error! said_line
+                            if os.env! "DREAMS_AOT_QUIET" == () { console.error! said_line }
                             let code = print_diags! (compile.files b) (compile.diags b);
                             // Kept for the next build of the same program
                             // (dreams/src/cache.dr): the image, what it read,
@@ -1117,11 +1117,11 @@ let image_of! o src image = {
     }
 };
 
-/// The runtime's source, found as `std` is: it is part of the standard library, so
-/// that an installation carries it.
+/// The runtime's source, found as `std` is. It sits beside `std`'s modules and not among
+/// them, because `import std;` takes every module in `src`, and a program should not.
 let runtime_file! o name = {
     let found = list.filter (fn dir -> io.exists! dir)
-        (list.flat_map (fn root -> [path.join root ("std/src/rt/" + name), path.join root ("src/rt/" + name)])
+        (list.flat_map (fn root -> [path.join root ("std/rt/" + name), path.join root ("rt/" + name)])
                        (list.append (opt o :roots) (install.dirs! ())));
     match found { [first, .._] => first, [] => () }
 };
@@ -1132,15 +1132,19 @@ let runtime_file! o name = {
 let native_build! o src = {
     let out = opt o :output;
     let hosts = o |> append_opt :hosts aot.primitives |> append_opt :hosts aot.natives;
+    os.set_env! "DREAMS_AOT_QUIET" "1";
     let bytes = if str.ends_with ".dream" src {
         match file.read! src { Option.some(b) => b, Option.none => { console.error! ("error: cannot read " + src); () } }
     } else { image_of! hosts src (out + ".image") };
+    // An image made on the way to an executable is no news to anyone.
+    os.set_env! "DREAMS_AOT_QUIET" "1";
     let lib = runtime_file! o "lib.dr";
     let rt = runtime_file! o "main.dr";
     if bytes == () { 1 }
     else if lib == () || rt == () { console.error! "error: the runtime's source was not found with the standard library"; 1 }
     else {
-        let runtime = hosts |> with_opt :supercompile :none |> with_opt :defines [] |> with_opt :cache ();
+        // The runtime is the compiler's own input: nothing it builds of it is news.
+        let runtime = hosts |> with_opt :supercompile :none |> with_opt :defines [] |> with_opt :cache () |> with_opt :quiet true;
         let lib_image = image_of! runtime lib (out + ".lib.image");
         let rt_image = image_of! runtime rt (out + ".rt.image");
         if lib_image == () || rt_image == () { 1 }

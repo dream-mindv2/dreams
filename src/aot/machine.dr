@@ -519,6 +519,7 @@ let fixed_infos g = {
      info_text "@i_process" (rt "code_value!") 14 1 0,
      info_text "@i_trunk" (rt "code_value!") 15 3 0,
      info_text "@i_tensor" (rt "code_value!") 16 0 0,
+     info_text "@i_module" (rt "code_value!") 17 2 0,
      info_text "@i_m_join" (rt "join_m!") 0 0 0,
      info_text "@i_m_recv" (rt "recv_m!") 0 0 0,
      info_text "@i_m_await" (rt "await_message_m!") 0 0 0,
