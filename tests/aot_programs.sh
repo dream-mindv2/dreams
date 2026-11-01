@@ -53,6 +53,8 @@ count() { grep -lx "$1" "$dir"/*.verdict 2>/dev/null | wc -l; }
 echo "aot programs: $(count pass) pass, $(count wrong) wrong, $(count refused) refused"
 wrong=$(grep -lx wrong "$dir"/*.verdict 2>/dev/null | xargs -r -n1 basename | sed 's/\.verdict$//')
 for n in $wrong; do echo "  wrong: $n"; done
+refused=$(grep -lx refused "$dir"/*.verdict 2>/dev/null | xargs -r -n1 basename | sed 's/\.verdict$//')
+for n in $refused; do echo "  refused: $n"; done
 if ls "$dir"/*.reasons >/dev/null 2>&1; then
   echo "what stopped the refused ones, most common first:"
   cat "$dir"/*.reasons | sort | uniq -c | sort -rn | cut -c1-110

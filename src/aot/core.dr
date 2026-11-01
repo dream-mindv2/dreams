@@ -32,6 +32,11 @@ union Atom {
 }
 
 union Rhs {
+    /// Small-integer arithmetic done now if it can be, on evaluated operands, and otherwise
+    /// the suspension (`symbol`, `payload`) that would have been made.
+    /// The closure this function was entered with, at its entry.
+    self_closure,
+    speculate(op : :string, a : Atom, b : Atom, symbol : :string, payload : [Atom]),
     /// `+` and the rest, on values in hand.
     arith(op : :string, a : Atom, b : Atom),
     /// `==` and the rest, answering a boolean or a suspended comparison.
@@ -64,6 +69,12 @@ union Expr {
     enter(a : Atom),
     /// A function of known arity, with exactly its arguments.
     call(symbol : :string, args : [Atom]),
+    /// At a function's entry: go on with `a` as `x` if it is evaluated, and otherwise evaluate it
+    /// in a frame holding `live` and run `retry`, the same call again with `x` in its place.
+    /// So the body exists once, and the common case stores nothing.
+    entry_force(a : Atom, x : :integer, live : [:integer], retry : Expr, body : Expr),
+    /// A closure whose code is known, with exactly its arguments.
+    call_closure(f : Atom, symbol : :string, args : [Atom]),
     /// A value in weak head normal form applied to arguments.
     apply(f : Atom, args : [Atom]),
     /// An evaluated boolean decides.
@@ -151,6 +162,8 @@ let atom_vars a = match a { Atom.var(i) => [i], _ => [] };
 
 let rhs_vars : Rhs -> [:integer];
 let rhs_vars r = match r {
+    Rhs.self_closure => [],
+    Rhs.speculate(_, a, b, _, payload) => list.concat [atom_vars a, atom_vars b, list.flat_map atom_vars payload],
     Rhs.arith(_, a, b) => list.append (atom_vars a) (atom_vars b),
     Rhs.compare(_, a, b) => list.append (atom_vars a) (atom_vars b),
     Rhs.native(_, args) => list.flat_map atom_vars args,
@@ -173,6 +186,8 @@ let free e = match e {
     Expr.ret(a) => set_of (atom_vars a),
     Expr.enter(a) => set_of (atom_vars a),
     Expr.call(_, args) => set_of (list.flat_map atom_vars args),
+    Expr.entry_force(a, x, live, _, body) => union_of (set_of (atom_vars a)) (union_of (set_of live) (map.remove x (free body))),
+    Expr.call_closure(f, _, args) => set_of (list.append (atom_vars f) (list.flat_map atom_vars args)),
     Expr.apply(f, args) => set_of (list.append (atom_vars f) (list.flat_map atom_vars args)),
     Expr.choose(a, y, n) => union_of (set_of (atom_vars a)) (union_of (free y) (free n)),
     Expr.seq(x, live, inner, _) => union_of (free inner) (set_of live),
@@ -242,85 +257,169 @@ let node_kids img n = {
 // an effect could come first, and why nothing under a `try!` counts, since the raise would then
 // happen outside it.
 
+/// What the analysis knows: each function's mask, and which calls have a known closure.
+group Demand {
+    masks : :map,
+    calls : :map,
+}
+
 /// The parameters `i` forces, as a mask. `lets` says what forcing a local forces.
-let forced_by : image.Image -> :map -> :integer -> :map -> :integer;
-let forced_by img masks i lets = if i == image.no_node { 0 } else {
+let forced_by : image.Image -> Demand -> :integer -> :map -> :integer;
+let forced_by img d i lets = if i == image.no_node { 0 } else {
     let n = image.node img i;
     let op = image.Node.op n;
     let a = image.Node.a n;
     let b = image.Node.b n;
     let c = image.Node.c n;
-    let of_ = fn k -> forced_by img masks k lets;
+    let of_ = fn k -> forced_by img d k lets;
     match op {
         8 => match map.lookup a lets {
             Option.some(m) => m,
             Option.none => if a < 60 { 1 << a } else { 0 },
         },
-        13 => forced_by_call img masks a (image.kids img b c) lets,
+        13 => forced_by_call img d a (image.kids img b c) lets,
         14 => of_ a | (of_ b & (if c == image.no_node { 0 } else { of_ c })),
-        15 => forced_by_block img masks (image.kids img a b) lets 0,
+        15 => forced_by_block img d (image.kids img a b) lets 0,
         20 => of_ a,
         o if o == 32 || o == 33 => of_ a,
         o if o == 34 || o == 35 || o == 43 || o == 45 || o == 46 || o == 84 || o == 85 || o == 78 => of_ a,
         o if o >= 21 && o <= 31 => of_ a | of_ b,
         o if o == 75 || o == 76 || o == 77 || o == 79 || o == 80 => of_ a | of_ b,
         39 => of_ a,
-        41 => forced_by_arms img masks (of_ a) (image.kids img b c) lets,
-        42 => forced_by_arms img masks (of_ a) (image.kids img b c) lets,
+        41 => forced_by_arms img d (of_ a) (image.kids img b c) lets,
+        42 => forced_by_arms img d (of_ a) (image.kids img b c) lets,
         _ => 0,
     }
 };
 
-let forced_by_call : image.Image -> :map -> :integer -> [:integer] -> :map -> :integer;
-let forced_by_call img masks callee args lets = {
+/// The function a call runs, if that is known and it is called with exactly its arguments.
+let known_callee : image.Image -> Demand -> :integer -> :integer -> Option :integer;
+let known_callee img d callee count = {
     let n = image.node img callee;
-    match image.Node.op n {
+    let f = match image.Node.op n {
         10 => {
             let g = image.global img (image.Node.a n);
-            let wanted = if image.Global.kind g == 0 && image.Func.arity (image.func img (image.Global.target g)) == list.length args {
-                masks.[image.Global.target g else 0]
-            } else { 0 };
-            list.fold (fn acc [k, arg] ->
-                if k < 60 && (wanted >> k) & 1 == 1 { acc | forced_by img masks arg lets } else { acc })
-                0 (list.enumerate args)
+            if image.Global.kind g == 0 { image.Global.target g } else { 0 - 1 }
         },
-        8 => forced_by img masks callee lets,
-        _ => 0,
-    }
+        o if o == 8 || o == 9 => (Demand.calls d).[callee else 0 - 1],
+        _ => 0 - 1,
+    };
+    if f >= 0 && image.Func.arity (image.func img f) == count { Option.some f } else { Option.none }
+};
+
+let forced_by_call : image.Image -> Demand -> :integer -> [:integer] -> :map -> :integer;
+let forced_by_call img d callee args lets = {
+    let wanted = match known_callee img d callee (list.length args) {
+        Option.some(f) => (Demand.masks d).[f else 0],
+        Option.none => 0,
+    };
+    let own = if image.Node.op (image.node img callee) == 8 { forced_by img d callee lets } else { 0 };
+    list.fold (fn acc [k, arg] ->
+        if k < 60 && (wanted >> k) & 1 == 1 { acc | forced_by img d arg lets } else { acc })
+        own (list.enumerate args)
 };
 
 /// A switch forces its subject, and what every arm and its fallback force.
-let forced_by_arms : image.Image -> :map -> :integer -> [:integer] -> :map -> :integer;
-let forced_by_arms img masks subject kids lets = {
+let forced_by_arms : image.Image -> Demand -> :integer -> [:integer] -> :map -> :integer;
+let forced_by_arms img d subject kids lets = {
     let rec arms rest !acc = match rest {
-        [fallback] => acc & forced_by img masks fallback lets,
-        [_, target, ..more] => arms more (acc & forced_by img masks target lets),
+        [fallback] => acc & forced_by img d fallback lets,
+        [_, target, ..more] => arms more (acc & forced_by img d target lets),
         _ => 0,
     };
     subject | arms kids (0 - 1)
 };
 
-let forced_by_block : image.Image -> :map -> [:integer] -> :map -> :integer -> :integer;
-let forced_by_block img masks statements lets acc = match statements {
+let forced_by_block : image.Image -> Demand -> [:integer] -> :map -> :integer -> :integer;
+let forced_by_block img d statements lets acc = match statements {
     [] => acc,
     [i, ..rest] => {
         let n = image.node img i;
         let strict = image.Node.flags n & flag_strict != 0;
         if image.Node.op n == 16 {
-            let m = forced_by img masks (image.Node.b n) lets;
-            forced_by_block img masks rest lets.[image.Node.a n => m] (if strict { acc | m } else { acc })
+            let m = forced_by img d (image.Node.b n) lets;
+            forced_by_block img d rest lets.[image.Node.a n => m] (if strict { acc | m } else { acc })
         } else if rest == [] || strict {
-            forced_by_block img masks rest lets (acc | forced_by img masks i lets)
-        } else { forced_by_block img masks rest lets acc }
+            forced_by_block img d rest lets (acc | forced_by img d i lets)
+        } else { forced_by_block img d rest lets acc }
     },
 };
 
+// A local function is usually called by name where it is in scope, and `let rec go` by its own
+// capture inside itself. Which one a read of a slot or capture means is known by walking from
+// the binding, and that makes a call direct and lets the strictness above see through it. One
+// node may be shared between functions, so a read that means two things means nothing.
+
+let note_call : :map -> :integer -> :integer -> :map;
+let note_call calls node f = match map.lookup node calls {
+    Option.some(known) => if known == f { calls } else { calls.[node => 0 - 1] },
+    Option.none => calls.[node => f],
+};
+
+let closure_calls_in : image.Image -> :integer -> :map -> :map -> :map -> :map;
+let closure_calls_in img i scope caps calls = if i == image.no_node { calls } else {
+    let n = image.node img i;
+    let op = image.Node.op n;
+    let a = image.Node.a n;
+    let each = fn kids acc -> list.fold (fn cs k -> closure_calls_in img k scope caps cs) acc kids;
+    match op {
+        15 => {
+            let [_, out] = list.fold (fn [sc, cs] st -> {
+                let node = image.node img st;
+                if image.Node.op node == 16 {
+                    let target = image.node img (image.Node.b node);
+                    let is_fn = image.Node.op target == 17 || image.Node.op target == 18;
+                    let sc1 = if is_fn { sc.[image.Node.a node => image.Node.a target] } else { map.remove (image.Node.a node) sc };
+                    [sc1, closure_calls_in img (image.Node.b node) sc1 caps cs]
+                } else { [sc, closure_calls_in img st sc caps cs] }
+            }) [scope, calls] (image.kids img a (image.Node.b n));
+            out
+        },
+        13 => {
+            let callee = image.node img a;
+            let found = match image.Node.op callee {
+                8 => scope.[image.Node.a callee else 0 - 1],
+                9 => caps.[image.Node.a callee else 0 - 1],
+                _ => 0 - 1,
+            };
+            let cs = if image.Node.op callee == 8 || image.Node.op callee == 9 { note_call calls a found } else { calls };
+            each (image.kids img (image.Node.b n) (image.Node.c n)) (closure_calls_in img a scope caps cs)
+        },
+        o if o == 17 || o == 18 => {
+            let inner = list.fold (fn m [k, d] -> {
+                let known = if d >= 2147483648 { caps.[d - 2147483648 else 0 - 1] } else { scope.[d else 0 - 1] };
+                if known >= 0 { m.[k => known] } else { m }
+            }) %{} (list.enumerate (capture_descriptors img a));
+            closure_calls_in img (image.Func.body (image.func img a)) %{} inner calls
+        },
+        _ => each (node_kids img n) calls,
+    }
+};
+
+let closure_calls : image.Image -> :map;
+let closure_calls img = list.fold (fn cs f -> {
+    let fr = image.func img f;
+    if image.Func.captures fr == 0 { closure_calls_in img (image.Func.body fr) %{} %{} cs } else { cs }
+}) %{} (list.range 0 (image.count img "FUNC"));
+
+/// Whether a function may perform effects: named so, or with a body the compiler marked. A lambda
+/// has no name to be impure by, and is held to the second, as the VM does (`callee_is_impure`).
+let flag_impure = 2;
+
+let may_effect : image.Image -> :integer -> :bool;
+let may_effect img f = {
+    let fr = image.func img f;
+    image.Func.flags fr & image.func_impure != 0
+        || (image.Func.body fr != image.no_node && image.Node.flags (image.node img (image.Func.body fr)) & flag_impure != 0)
+};
+
 /// The masks of an image's functions, by function.
-let strict_masks : image.Image -> :map;
+let strict_masks : image.Image -> Demand;
 let strict_masks img = {
+    let calls = closure_calls img;
     let eligible = list.filter (fn f -> {
         let fr = image.func img f;
-        image.Func.arity fr > 0 && image.Func.captures fr == 0 && image.Func.flags fr & image.func_impure == 0
+        image.Func.arity fr > 0 && not (may_effect img f)
     }) (list.range 0 (image.count img "FUNC"));
     let start = list.fold (fn m f -> {
         let arity = image.Func.arity (image.func img f);
@@ -330,44 +429,32 @@ let strict_masks img = {
         let [next, changed] = list.fold (fn [m, ch] f -> {
             let old = m.[f];
             if old == 0 { [m, ch] } else {
-                let now = old & forced_by img m (image.Func.body (image.func img f)) %{};
+                let now = old & forced_by img (Demand.make m calls) (image.Func.body (image.func img f)) %{};
                 if now == old { [m, ch] } else { [m.[f => now], true] }
             }
         }) [masks, false] eligible;
         if changed { round next } else { next }
     };
-    round start
+    Demand.make (round start) calls
 };
 
 /// Whether evaluating `i` now rather than later could not be seen, in a function with effects:
 /// only pure calls and arithmetic on what it has. A pure function's arguments are all like that.
 let effect_free : image.Image -> :integer -> :bool;
-let effect_free img i = {
-    let n = image.node img i;
-    let op = image.Node.op n;
-    match op {
-        o if o <= 9 && o >= 1 => true,
-        o if o >= 21 && o <= 31 => effect_free img (image.Node.a n) && effect_free img (image.Node.b n),
-        o if o == 34 || o == 35 => effect_free img (image.Node.a n),
-        13 => {
-            let callee = image.node img (image.Node.a n);
-            image.Node.op callee == 10 && {
-                let g = image.global img (image.Node.a callee);
-                image.Global.kind g == 0 && image.Func.flags (image.func img (image.Global.target g)) & image.func_impure == 0
-            } && list.all (effect_free img) (image.kids img (image.Node.b n) (image.Node.c n))
-        },
-        _ => false,
-    }
+let effect_free img i = image.Node.flags (image.node img i) & flag_impure == 0;
+
+/// Whether everything `i` reads has a value yet, which `let rec` may not.
+let bound_in : :any -> :integer -> Env -> :bool;
+let bound_in cx i env = {
+    let [slots, _, made] = reads cx.[:img] i;
+    list.all (fn v -> made.[v else false] || map.has v (Env.slots env)) (map.keys slots)
 };
 
 /// Each of `args` as an atom, those `mask` names evaluated. A slot not yet bound is `let rec`,
 /// and only suspending can read that.
 let call_args : :any -> :integer -> [:integer] -> Env -> St -> :any -> [Expr, St];
 let call_args cx mask args env s k = {
-    let bound_here = fn i env1 -> {
-        let [slots, _, made] = reads cx.[:img] i;
-        list.all (fn v -> made.[v else false] || map.has v (Env.slots env1)) (map.keys slots)
-    };
+    let bound_here = bound_in cx;
     let rec go ns !at acc env1 s1 = match ns {
         [] => k (list.reverse acc) env1 s1,
         [n, ..rest] => {
@@ -894,11 +981,17 @@ let applied cx callee args env s = {
         lazies cx args env1 s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2]));
     match image.Node.op n {
         11 => builtin cx names_of_builtins.[image.Node.a n] args env s,
+        o if o == 8 || o == 9 => match known_callee cx.[:img] cx.[:strict] callee (list.length args) {
+            Option.some(f) => value cx callee env (queue cx f s) (fn fa env1 s1 ->
+                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env1 s1 (fn atoms _ s2 ->
+                    [Expr.call_closure fa (symbol_of cx.[:unit] f) atoms, s2])),
+            Option.none => unknown (),
+        },
         10 => {
             let g = image.global cx.[:img] (image.Node.a n);
             let f = image.Global.target g;
             if image.Global.kind g == 0 && image.Func.arity (image.func cx.[:img] f) == list.length args {
-                call_args cx cx.[:strict].[f else 0] args env (queue cx f s) (fn atoms _ s2 -> [Expr.call (symbol_of cx.[:unit] f) atoms, s2])
+                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env (queue cx f s) (fn atoms _ s2 -> [Expr.call (symbol_of cx.[:unit] f) atoms, s2])
             } else { unknown () }
         },
         12 => {
@@ -1551,6 +1644,16 @@ let lazily cx i env s k = {
             }
         },
         o if o == 17 || o == 18 => closure_of cx a env s k,
+        o if (o >= 21 && o <= 23 || o >= 26 && o <= 31) && ready_operand cx a env && ready_operand cx (image.Node.b n) env => {
+            let [symbol, payload, _, s1] = lifted_thunk cx i env s;
+            let [x, s2] = fresh s1;
+            let name = match o { 21 => "add", 22 => "sub", 23 => "mul", _ => comparison_ops.[o] };
+            let atom_of = fn m -> atom_ready cx m env;
+            let [ax, s3] = atom_of a s2;
+            let [bx, s4] = atom_of (image.Node.b n) s3;
+            let [rest, s5] = k (Atom.var x) env s4;
+            [Expr.bind x (Rhs.speculate name ax bx symbol payload) rest, s5]
+        },
         11 => {
             let [f, s1] = builtin_value cx a s;
             k f env s1
@@ -1645,6 +1748,18 @@ let fresh_many n s = {
 /// the update writes its answer.
 let suspended : :any -> :integer -> Env -> St -> :any -> [Expr, St];
 let suspended cx i env s k = {
+    let [symbol, payload, holes, s4] = lifted_thunk cx i env s;
+    let [x, s5] = fresh s4;
+    let var = Atom.var x;
+    let env1 = Env.set_holes (list.append (list.map (fn [index, slot] -> [var, index, slot]) holes) (Env.holes env)) env;
+    let [rest, s6] = k var env1 s5;
+    [Expr.bind x (Rhs.alloc symbol payload) rest, s6]
+};
+
+/// `i` lifted out as a thunk's function: its info, what to allocate it with, and what is not
+/// bound yet.
+let lifted_thunk : :any -> :integer -> Env -> St -> [:any];
+let lifted_thunk cx i env s = {
     let pieces = captured cx i env;
     let [vars, s1] = fresh_many (list.length pieces) s;
     let [id, s2] = fresh s1;
@@ -1662,12 +1777,33 @@ let suspended cx i env s k = {
         Option.none => [index, piece.[1]],
         _ => (),
     }) (list.enumerate pieces);
-    let payload = if list.is_empty values_ { [Atom.word "1"] } else { values_ };
-    let [x, s5] = fresh s4;
-    let var = Atom.var x;
-    let env1 = Env.set_holes (list.append (list.map (fn [index, slot] -> [var, index, slot]) holes) (Env.holes env)) env;
-    let [rest, s6] = k var env1 s5;
-    [Expr.bind x (Rhs.alloc symbol payload) rest, s6]
+    [symbol, (if list.is_empty values_ { [Atom.word "1"] } else { values_ }), holes, s4]
+};
+
+/// An operand that can be read without evaluating anything: a small literal, or what has been
+/// evaluated already.
+let ready_operand : :any -> :integer -> Env -> :bool;
+let ready_operand cx i env = {
+    let n = image.node cx.[:img] i;
+    match image.Node.op n {
+        1 => fits_fixnum (image.integer cx.[:img] (image.Node.a n)),
+        8 => match map.lookup (image.Node.a n) (Env.slots env) {
+            Option.some(atom) => forced_atom env atom,
+            Option.none => false,
+        },
+        9 => forced_atom env (Env.captures env).[image.Node.a n],
+        _ => false,
+    }
+};
+
+let atom_ready : :any -> :integer -> Env -> St -> [Atom, St];
+let atom_ready cx i env s = {
+    let n = image.node cx.[:img] i;
+    match image.Node.op n {
+        1 => [Atom.word (fixnum_word (image.integer cx.[:img] (image.Node.a n))), s],
+        8 => [(Env.slots env).[image.Node.a n], s],
+        _ => [(Env.captures env).[image.Node.a n], s],
+    }
 };
 
 /// A closure of image function `f`, reading what its descriptors say.
@@ -1718,7 +1854,11 @@ let statement cx i rest env s = {
         let suspends = target_op == 17 || target_op == 18;
         let binding = fn atom env1 s1 -> settle_holes slot atom (Env.set_slots ((Env.slots env1).[slot => atom]) env1) s1
             (fn env2 s2 -> block cx rest env2 s2);
-        if strict && not suspends { value cx (image.Node.b n) env s binding }
+        // A local that what follows is sure to force costs nothing to evaluate now, and saves
+        // its suspension. With effects about, what follows may do one first.
+        let demanded = not strict && not suspends && slot < 60 && cx.[:pure else false] && bound_in cx (image.Node.b n) env
+            && (forced_by_block cx.[:img] cx.[:strict] rest %{} 0 >> slot) & 1 == 1;
+        if (strict || demanded) && not suspends { value cx (image.Node.b n) env s binding }
         else { lazily cx (image.Node.b n) env s binding }
     }
     else if strict {
@@ -1742,6 +1882,23 @@ let settle_holes slot atom env s k = {
     }) [body, s1] waiting
 };
 
+/// The parameters `mask` names forced, in order; `current` is what each is called by now, and
+/// `again` the same call with those.
+let forcing_params : :integer -> [:integer] -> [:integer] -> :any -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let forcing_params mask todo current again keep env s k = match todo {
+    [] => k env s,
+    [i, ..rest] => {
+        let v = current.[i];
+        let [x, s1] = fresh s;
+        let now = list.map (fn [j, c] -> if j == i { x } else { c }) (list.enumerate current);
+        let var = Atom.var x;
+        let env1 = mark_forced var (Env.set_slots ((Env.slots env).[i => var]) env);
+        let [after, s2] = forcing_params mask rest now again keep env1 s1 k;
+        let live = list.sort (list.unique (list.append keep (list.filter (fn c -> c != v) current)));
+        [Expr.entry_force (Atom.var v) x live (again now) after, s2]
+    },
+};
+
 /// Image function `f` as a core function, in the form it was asked for.
 let translate : :any -> :integer -> :atom -> St -> St;
 let translate cx f how s = {
@@ -1755,8 +1912,21 @@ let translate cx f how s = {
     let env = Env.make slots captures %{} [];
     let place = [name, image.func_source cx.[:img] f, image.func_line cx.[:img] f, image.func_col cx.[:img] f];
     let cx1 = cx |> (fn c -> c.[:name => name]) |> (fn c -> c.[:place => place])
-                 |> (fn c -> c.[:pure => image.Func.flags fr & image.func_impure == 0]);
-    let [body, s3] = tail cx1 (image.Func.body fr) env s2;
+                 |> (fn c -> c.[:pure => not (may_effect cx.[:img] f)]);
+    // What every path forces is forced first, so that the body knows it has it: a test of what
+    // is evaluated then goes away, and what is built from it can be built now.
+    let wanted = if how == :function { (Demand.masks cx.[:strict]).[f else 0] } else { 0 };
+    let indices = list.filter (fn i -> i < 60 && (wanted >> i) & 1 == 1) (list.range 0 (list.length params));
+    let self_symbol = symbol_of cx.[:unit] f;
+    let [self_var, s2a] = fresh s2;
+    let has_self = not (list.is_empty caps) && not (list.is_empty indices);
+    let again = fn current -> {
+        let args = list.map (fn c -> Atom.var c) current;
+        if has_self { Expr.call_closure (Atom.var self_var) self_symbol args } else { Expr.call self_symbol args }
+    };
+    let [forced_body, s3] = forcing_params wanted indices params again (if has_self { [self_var] } else { [] }) env s2a
+        (fn env1 s21 -> tail cx1 (image.Func.body fr) env1 s21);
+    let body = if has_self { Expr.bind self_var Rhs.self_closure forced_body } else { forced_body };
     let func_ = Function.make symbol symbol how (image.Func.flags fr & image.func_impure != 0) params caps body name
         (list.append place [0]);
     St.set_functions (list.cons func_ (St.functions s3)) s3
