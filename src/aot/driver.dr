@@ -5,22 +5,26 @@
 // running this, whose own header holds a loader that exists on this machine, and
 // a build for another machine will have to say otherwise.
 //
-// Today this compiles only the runtime dialect; the machine for ordinary Dream is
-// the next step in dreams/docs/aot.md. A program it cannot compile yet is refused
-// by name, function by function, rather than built into something that fails later.
+// A program it cannot compile yet is refused by name, function by function, rather
+// than built into something that fails later.
 
 import std.file;
 import std.io;
 import std.list;
+import std.os;
 import std.str;
 import std.vm;
 
 import dreams.aot.dialect;
 import dreams.aot.image;
 import dreams.aot.link;
+import dreams.aot.machine;
 
 /// The host module a dialect program imports; a build has to be told it exists.
 let primitives = "rt.prim";
+
+/// What the runtime's Dream half reaches its dialect half through.
+let natives = "rt.native";
 
 /// What a `-O2` is worth keeping out of a debugging session is a later question;
 /// this is the level everything is built at.
@@ -49,22 +53,49 @@ let loader! () = match file.read! "/proc/self/exe" {
     },
 };
 
-/// Write `bytes`, an image, to `out` as an executable: its size, or what stopped it.
-let build! : :string -> :string -> Result :integer [:string];
-let build! bytes out = match image.read bytes {
-    Result.error(why) => Result.error [why],
-    Result.ok(img) => match dialect.to_ir img {
-        Result.error(why) => Result.error why,
-        Result.ok(ir) => match vm.llvm_object! ir opt_level {
-            Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
-            Result.ok(object) => match link.link (link.Options.make (loader! ()) ["libc.so.6"]) object {
-                Result.error(why) => Result.error [why],
-                Result.ok(exe) => {
-                    file.write! out exe;
-                    io.chmod! out 493;
-                    Result.ok (len exe)
-                },
-            },
+/// `ir` made an executable at `out`: its size, or what stopped it.
+let written! : :string -> :string -> Result :integer [:string];
+let written! ir out = {
+    // The IR, for a debugger: built with clang it has the symbols this writer omits.
+    match os.env! "DREAMS_AOT_KEEP_IR" { () => (), path => file.write! path ir };
+    object_and_link! ir out
+};
+
+let object_and_link! : :string -> :string -> Result :integer [:string];
+let object_and_link! ir out = match vm.llvm_object! ir opt_level {
+    Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
+    Result.ok(object) => match link.link (link.Options.make (loader! ()) ["libc.so.6"]) object {
+        Result.error(why) => Result.error [why],
+        Result.ok(exe) => {
+            file.write! out exe;
+            io.chmod! out 493;
+            Result.ok (len exe)
         },
+    },
+};
+
+/// Whether an image was written in the runtime's dialect and stands alone: it says so
+/// by importing the primitives, which nothing else can.
+let is_dialect : image.Image -> :bool;
+let is_dialect img = list.any (fn i -> image.import_path img i == primitives) (list.range 0 (image.count img "IMPT"));
+
+/// Write `bytes`, an image, to `out` as an executable, given the two images that are
+/// the runtime: how to get those is the caller's, since it means building a program.
+let build! : :string -> :string -> :any -> :any -> Result :integer [:string];
+let build! bytes out lib_bytes rt_bytes = match image.read bytes {
+    Result.error(why) => Result.error [why],
+    Result.ok(img) => if is_dialect img {
+        match dialect.to_ir img {
+            Result.error(why) => Result.error why,
+            Result.ok(ir) => written! ir out,
+        }
+    } else {
+        match [image.read lib_bytes, image.read rt_bytes] {
+            [Result.ok(lib), Result.ok(rt)] => match machine.to_ir img lib rt {
+                Result.error(why) => Result.error why,
+                Result.ok(ir) => written! ir out,
+            },
+            _ => Result.error ["the runtime's images are not images"],
+        }
     },
 };

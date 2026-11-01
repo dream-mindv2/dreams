@@ -119,3 +119,19 @@ makes the object, and `aot/link.dr` writes the executable, x86-64 Linux only. He
 to its behaviour by `dreams/tests/aot.sh`. **Ordinary Dream does not compile yet**:
 it is refused, function by function. There is no runtime, no collector and no
 heap; the design above for those is untried.
+
+**2026-11-01: step 2, in part.** Ordinary Dream compiles and runs: `aot/core.dr`
+makes evaluation explicit, `aot/machine.dr` writes the IR, `rt/main.dr` is the
+collector and the machine in the dialect, and `rt/lib.dr` is the builtins that force
+what they are given, in ordinary Dream. Thunks, closures, partial application,
+lists, strings, a semispace collector and a 2,000,000-deep recursion work. Not yet:
+`try!`, floats, bignums, arrays by index, maps, records beyond allocating them, and
+processes. A program using one is refused by name. `dreams/tests/aot_programs.sh`
+says how many recorded programs pass, and lists what stops the rest.
+
+One thing the first run taught: an object's `code` is what *entering* it does, and a
+closure entered as a value must answer itself. Applying it is a separate field. With
+one field, forcing a captured function ran its body with no arguments.
+
+It is not an optimizing compiler yet: every lazy argument is a thunk, as there is no
+strictness analysis. `fib 30` takes about what the VM takes.

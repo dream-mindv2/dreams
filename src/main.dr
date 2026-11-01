@@ -16,6 +16,7 @@
 import std.console;
 
 import std.file;
+import std.install;
 import std.io;
 import std.list;
 import std.os;
@@ -1105,36 +1106,55 @@ let cached_build! o src = {
     }
 };
 
-/// A native executable, from an image: the one named, or the one this builds
-/// first. The image is made as any build makes one, beside where the executable
-/// is going, and is not kept. See dreams/docs/aot.md.
+/// An image of `src`, by the ordinary build, kept nowhere: its bytes, or `()` with the
+/// reasons already printed.
+let image_of! o src image = {
+    let answer = cached_build! (o |> with_opt :output image |> with_opt :test false) src;
+    if answer != 0 { () } else {
+        let Option.some(bytes) = file.read! image;
+        file.remove_all! image;
+        bytes
+    }
+};
+
+/// The runtime's source, found as `std` is: it is part of the standard library, so
+/// that an installation carries it.
+let runtime_file! o name = {
+    let found = list.filter (fn dir -> io.exists! dir)
+        (list.flat_map (fn root -> [path.join root ("std/src/rt/" + name), path.join root ("src/rt/" + name)])
+                       (list.append (opt o :roots) (install.dirs! ())));
+    match found { [first, .._] => first, [] => () }
+};
+
+/// A native executable, from an image: the one named, or the one this builds first.
+/// The images are made as any build makes one, beside where the executable is going,
+/// and are not kept. See dreams/docs/aot.md.
 let native_build! o src = {
     let out = opt o :output;
-    let finished! bytes = match aot.build! bytes out {
-        Result.ok(size) => {
-            console.error! ("compiled -> " + out + " (" + to_string size + " bytes, native)");
-            0
-        },
-        Result.error(why) => {
-            list.each! (fn line -> console.error! ("error: " + line)) why;
-            1
-        },
-    };
-    if str.ends_with ".dream" src {
-        match file.read! src {
-            Option.some(bytes) => finished! bytes,
-            Option.none => {
-                console.error! ("error: cannot read " + src);
-                1
-            },
-        }
-    } else {
-        let image = out + ".image";
-        let answer = cached_build! (o |> with_opt :output image |> append_opt :hosts aot.primitives) src;
-        if answer != 0 { answer } else {
-            let Option.some(bytes) = file.read! image;
-            file.remove_all! image;
-            finished! bytes
+    let hosts = o |> append_opt :hosts aot.primitives |> append_opt :hosts aot.natives;
+    let bytes = if str.ends_with ".dream" src {
+        match file.read! src { Option.some(b) => b, Option.none => { console.error! ("error: cannot read " + src); () } }
+    } else { image_of! hosts src (out + ".image") };
+    let lib = runtime_file! o "lib.dr";
+    let rt = runtime_file! o "main.dr";
+    if bytes == () { 1 }
+    else if lib == () || rt == () { console.error! "error: the runtime's source was not found with the standard library"; 1 }
+    else {
+        let runtime = hosts |> with_opt :supercompile :none |> with_opt :defines [] |> with_opt :cache ();
+        let lib_image = image_of! runtime lib (out + ".lib.image");
+        let rt_image = image_of! runtime rt (out + ".rt.image");
+        if lib_image == () || rt_image == () { 1 }
+        else {
+            match aot.build! bytes out lib_image rt_image {
+                Result.ok(size) => {
+                    console.error! ("compiled -> " + out + " (" + to_string size + " bytes, native)");
+                    0
+                },
+                Result.error(why) => {
+                    list.each! (fn line -> console.error! ("error: " + line)) why;
+                    1
+                },
+            }
         }
     }
 };

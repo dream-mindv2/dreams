@@ -1,0 +1,1034 @@
+// The core: what an image's execution trees mean, with evaluation order explicit.
+//
+// A node says "this is lazy" by where it stands, and leaves the machine to work out
+// the rest. Here every thunk is an allocation, every force is an `enter`, and what
+// happens next is a syntactic part of the term. That is what makes the two things
+// the machine needs simple: what must survive a suspension is the free variables of
+// what comes after it, so a frame holds nothing dead and a list being consumed is
+// not pinned by a frame that has finished with it; and strictness and unboxing,
+// when they come, are questions about this form.
+//
+// The shape is one rule. `Seq(x, e, rest)` runs `e` to its answer, which it gives by
+// `ret`, and runs `rest` with that as `x`: a frame is pushed for `rest`, and `e`
+// behaves as any function does. A `match` in the middle of a function and a call are
+// therefore the same thing, and there are no join points.
+//
+// Translation refuses what is not built yet, by name, rather than guess.
+
+import std.list;
+import std.map;
+import std.str;
+
+import dreams.aot.image;
+import dreams.builtins;
+
+union Atom {
+    /// A variable of the current function.
+    var(id : :integer),
+    /// A value known now: its 64-bit word, as text.
+    word(text : :string),
+    /// The address of something static.
+    address(symbol : :string),
+}
+
+union Rhs {
+    /// `+` and the rest, on values in hand.
+    arith(op : :string, a : Atom, b : Atom),
+    /// `==` and the rest, answering a boolean or a suspended comparison.
+    compare(op : :string, a : Atom, b : Atom),
+    /// A runtime function, forced arguments, which answers 0 to raise.
+    native(name : :string, args : [Atom]),
+    /// An object: its info and payload words, which may hold holes.
+    alloc(info : :string, args : [Atom]),
+    /// A payload word of `object` set after the fact, for what refers to itself.
+    patch(object : Atom, index : :integer, value : Atom),
+    /// A payload word read, unforced: a list's head, say.
+    field(object : Atom, index : :integer),
+    /// Whether an evaluated value is an object of this kind.
+    has_kind(a : Atom, kind : :integer),
+    /// Whether an evaluated value is exactly this word.
+    same(a : Atom, word : :string),
+    is_fix(a : Atom),
+    /// Whether it is an immediate of this kind.
+    has_tag(a : Atom, tag : :integer),
+    is_list(a : Atom),
+}
+
+union Expr {
+    /// Answer an atom already in weak head normal form.
+    ret(a : Atom),
+    /// Evaluate an atom, and answer that.
+    enter(a : Atom),
+    /// A function of known arity, with exactly its arguments.
+    call(symbol : :string, args : [Atom]),
+    /// A value in weak head normal form applied to arguments.
+    apply(f : Atom, args : [Atom]),
+    /// An evaluated boolean decides.
+    choose(a : Atom, yes : Expr, no : Expr),
+    seq(x : :integer, live : [:integer], e : Expr, rest : Expr),
+    bind(x : :integer, rhs : Rhs, rest : Expr),
+    raise_text(text : :string),
+}
+
+/// A function of the core: a global, a closure's code, or a thunk's.
+group Function {
+    symbol : :string,
+    info : :string,
+    how : :atom,
+    params : [:integer],
+    captures : [:integer],
+    body : Expr,
+    name : :string,
+}
+
+/// Everything translation has found so far. Threaded rather than kept, as all state
+/// is here; `next` numbers variables and lifted functions across the whole program.
+group St {
+    next : :integer,
+    functions : [Function],
+    queued : [[:any]],
+    strings : %{:string => :string},
+    floats : :map,
+    atoms : %{:string => :integer},
+    natives : :map,
+    refused : [:string],
+    needed_lib : :map,
+    wrapped : :map,
+}
+
+/// The slots of the function being translated: a slot's atom, and which variables are
+/// already evaluated, which spares the machine a test and a frame.
+group Env {
+    slots : :map,
+    captures : :map,
+    forced : :map,
+    holes : [[:any]],
+}
+
+let empty_st : St;
+let empty_st = St.make 0 [] [] %{} %{} %{} %{} [] %{} %{};
+
+let fresh : St -> [:integer, St];
+let fresh s = [St.next s, St.set_next (St.next s + 1) s];
+
+let refuse_in : :string -> :string -> St -> St;
+let refuse_in where why s = St.set_refused (list.cons (str.concat_all [where, ": ", why]) (St.refused s)) s;
+
+// --- words -----------------------------------------------------------------------
+//
+// How a value is one word, the compiler's half of what mind/std/src/rt/main.dr says.
+
+let fixnum_word : :integer -> :string;
+let fixnum_word n = to_string (n * 2 + 1);
+let immediate_word : :integer -> :integer -> :string;
+let immediate_word kind payload = to_string (payload * 256 + kind * 8 + 2);
+let unit_word = immediate_word 0 0;
+let false_word = immediate_word 1 0;
+let true_word = immediate_word 1 1;
+let nil_word = immediate_word 4 0;
+let char_word : :integer -> :string;
+let char_word c = immediate_word 2 c;
+
+/// Fixnums are 63 bits; what is larger is a bignum, which is not built yet.
+let fits_fixnum : :integer -> :bool;
+let fits_fixnum n = n >= -4611686018427387904 && n < 4611686018427387904;
+
+// --- free variables ----------------------------------------------------------------
+
+let atom_vars : Atom -> [:integer];
+let atom_vars a = match a { Atom.var(i) => [i], _ => [] };
+
+let rhs_vars : Rhs -> [:integer];
+let rhs_vars r = match r {
+    Rhs.arith(_, a, b) => list.append (atom_vars a) (atom_vars b),
+    Rhs.compare(_, a, b) => list.append (atom_vars a) (atom_vars b),
+    Rhs.native(_, args) => list.flat_map atom_vars args,
+    Rhs.alloc(_, args) => list.flat_map atom_vars args,
+    Rhs.patch(o, _, v) => list.append (atom_vars o) (atom_vars v),
+    Rhs.field(o, _) => atom_vars o,
+    Rhs.has_kind(a, _) => atom_vars a,
+    Rhs.same(a, _) => atom_vars a,
+    Rhs.is_fix(a) => atom_vars a,
+    Rhs.has_tag(a, _) => atom_vars a,
+    Rhs.is_list(a) => atom_vars a,
+};
+
+/// The variables `e` reads and does not bind, as a set. A `seq` holds its own, so
+/// this stops there and a long body is not walked once per statement in it.
+let free : Expr -> :map;
+let free e = match e {
+    Expr.ret(a) => set_of (atom_vars a),
+    Expr.enter(a) => set_of (atom_vars a),
+    Expr.call(_, args) => set_of (list.flat_map atom_vars args),
+    Expr.apply(f, args) => set_of (list.append (atom_vars f) (list.flat_map atom_vars args)),
+    Expr.choose(a, y, n) => union_of (set_of (atom_vars a)) (union_of (free y) (free n)),
+    Expr.seq(x, live, inner, _) => union_of (free inner) (set_of live),
+    Expr.bind(x, r, rest) => union_of (set_of (rhs_vars r)) (map.remove x (free rest)),
+    Expr.raise_text(_) => %{},
+};
+
+let set_of : [:integer] -> :map;
+let set_of xs = list.fold (fn m x -> m.[x => true]) %{} xs;
+
+let union_of : :map -> :map -> :map;
+let union_of a b = list.fold (fn m x -> m.[x => true]) a (map.keys b);
+
+/// `seq` with what `rest` needs written down, in a fixed order so that a program
+/// compiles to the same bytes each time.
+let seq_of : :integer -> Expr -> Expr -> Expr;
+let seq_of x e rest = Expr.seq x (list.sort (map.keys (map.remove x (free rest)))) e rest;
+
+// --- what a node reads ------------------------------------------------------------
+
+/// The nodes directly under `n`, as the format lays them out. What suspends is a
+/// question about all of these, so it is answered once.
+let node_kids : image.Image -> image.Node -> [:integer];
+let node_kids img n = {
+    let op = image.Node.op n;
+    let a = image.Node.a n;
+    let b = image.Node.b n;
+    let c = image.Node.c n;
+    let present = fn xs -> list.filter (fn k -> k != image.no_node) xs;
+    match op {
+        12 => [a], 16 => [b], 19 => [a, b], 20 => [a], 34 => [a], 35 => [a], 78 => [a],
+        13 => list.cons a (image.kids img b c),
+        14 => [a, b, c],
+        15 => image.kids img a b,
+        36 => image.kids img a b,
+        37 => image.kids img a b,
+        38 => image.kids img a (b * 2),
+        39 => present [a, b, c],
+        40 => [a, b, c],
+        41 => list.cons a (image.kids img b c),
+        42 => list.cons a (image.kids img b c),
+        43 => [a], 44 => [a, b], 45 => [a], 46 => [a], 84 => [a], 85 => [a],
+        81 => image.kids img a b,
+        82 => list.cons a (image.kids img b (c * 2)),
+        83 => [a, b],
+        o if o >= 21 && o <= 33 => [a, b],
+        o if o >= 47 && o <= 74 => image.kids img b c,
+        o if o >= 75 && o <= 77 => [a, b],
+        o if o == 79 || o == 80 => [a, b],
+        _ => [],
+    }
+};
+
+/// What `n` reads of the frame it runs in: `[slots, captures, bound]`, each a set.
+let reads : image.Image -> :integer -> [:map];
+let reads img root = {
+    let rec walk work seen slots caps bound = match work {
+        [] => [slots, caps, bound],
+        [i, ..rest] => if seen.[i else false] { walk rest seen slots caps bound } else {
+            let n = image.node img i;
+            let op = image.Node.op n;
+            let seen1 = seen.[i => true];
+            match op {
+                8 => walk rest seen1 slots.[image.Node.a n => true] caps bound,
+                9 => walk rest seen1 slots caps.[image.Node.a n => true] bound,
+                16 => walk (list.cons (image.Node.b n) rest) seen1 slots caps bound.[image.Node.a n => true],
+                o if o == 17 || o == 18 => {
+                    let [s1, c1] = capture_reads img (image.Node.a n) slots caps;
+                    walk rest seen1 s1 c1 bound
+                },
+                _ => walk (list.append (node_kids img n) rest) seen1 slots caps bound,
+            }
+        },
+    };
+    walk [root] %{} %{} %{} %{}
+};
+
+/// What building a closure of function `f` reads of the frame it is built in: the
+/// format's capture descriptors, high bit for a capture of the parent's.
+let capture_reads : image.Image -> :integer -> :map -> :map -> [:map];
+let capture_reads img f slots caps = {
+    let rec_ = image.func img f;
+    list.fold (fn [s, c] d ->
+        if d >= 2147483648 { [s, c.[d - 2147483648 => true]] } else { [s.[d => true], c] })
+        [slots, caps] (capture_descriptors img f)
+};
+
+let capture_descriptors : image.Image -> :integer -> [:integer];
+let capture_descriptors img f = image.kids img (image.func_captures_at img f) (image.Func.captures (image.func img f));
+
+// --- translation -------------------------------------------------------------------
+//
+// In continuation-passing style at compile time: `value` is given what to do with an
+// atom, because what comes next may be in a frame or may be the next instruction, and
+// only the node being translated knows which.
+
+let names_of_builtins = builtins.names;
+
+let symbol_of : :string -> :integer -> :string;
+let symbol_of prefix f = str.concat_all ["@", prefix, to_string f];
+
+let forced_atom : Env -> Atom -> :bool;
+let forced_atom env a = match a {
+    Atom.var(i) => (Env.forced env).[i else false],
+    Atom.word(_) => true,
+    Atom.address(_) => false,
+};
+
+let mark_forced : Atom -> Env -> Env;
+let mark_forced a env = match a {
+    Atom.var(i) => Env.set_forced ((Env.forced env).[i => true]) env,
+    _ => env,
+};
+
+let queue : :any -> :integer -> St -> St;
+let queue cx f s = St.set_queued (list.cons [cx.[:unit], f] (St.queued s)) s;
+
+let intern_string : :string -> St -> [:string, St];
+let intern_string text s = match map.lookup text (St.strings s) {
+    Option.some(symbol) => [symbol, s],
+    Option.none => {
+        let symbol = str.concat_all ["@str", to_string (map.size (St.strings s))];
+        [symbol, St.set_strings ((St.strings s).[text => symbol]) s]
+    },
+};
+
+let intern_atom : :string -> St -> [:integer, St];
+let intern_atom name s = match map.lookup name (St.atoms s) {
+    Option.some(i) => [i, s],
+    Option.none => {
+        let i = map.size (St.atoms s);
+        [i, St.set_atoms ((St.atoms s).[name => i]) s]
+    },
+};
+
+/// A global function's closure, for where it is used as a value.
+let static_closure : :string -> Atom;
+let static_closure symbol = Atom.address (str.concat_all ["@c_", str.slice 1 (len symbol - 1) symbol]);
+
+let arithmetic_ops : %{:integer => :string};
+let arithmetic_ops = %{21 => "add", 22 => "sub", 23 => "mul", 24 => "div", 25 => "mod"};
+let comparison_ops : %{:integer => :string};
+let comparison_ops = %{26 => "eq", 27 => "ne", 28 => "lt", 29 => "le", 30 => "gt", 31 => "ge"};
+
+/// `n` evaluated, given to `k` as an atom in weak head normal form.
+let value : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let value cx i env s k = {
+    let n = image.node cx.[:img] i;
+    let op = image.Node.op n;
+    let a = image.Node.a n;
+    let b = image.Node.b n;
+    let forcing = fn atom -> 
+        if forced_atom env atom { k atom env s }
+        else {
+            let [x, s1] = fresh s;
+            let var = Atom.var x;
+            let [rest, s2] = k var (remember i atom var (mark_forced var env)) s1;
+            [seq_of x (Expr.enter atom) rest, s2]
+        };
+    match op {
+        1 => {
+            let v = image.integer cx.[:img] a;
+            if fits_fixnum v { k (Atom.word (fixnum_word v)) env s }
+            else { k (Atom.word unit_word) env (refuse_in cx.[:name] "an integer too large for a fixnum" s) }
+        },
+        3 => {
+            let [symbol, s1] = intern_string (image.string cx.[:img] a) s;
+            k (Atom.address symbol) (env) s1
+        },
+        4 => k (Atom.word (char_word a)) env s,
+        5 => k (Atom.word (if a == 1 { true_word } else { false_word })) env s,
+        6 => {
+            let [index, s1] = intern_atom (image.atom cx.[:img] a) s;
+            k (Atom.word (immediate_word 3 index)) env s1
+        },
+        7 => k (Atom.word unit_word) env s,
+        8 => match map.lookup a (Env.slots env) {
+            Option.some(atom) => forcing atom,
+            Option.none => k (Atom.word unit_word) env (refuse_in cx.[:name] "a slot read before it is bound" s),
+        },
+        9 => forcing (Env.captures env).[a],
+        21 => arithmetic cx op n env s k,
+        22 => arithmetic cx op n env s k,
+        23 => arithmetic cx op n env s k,
+        24 => arithmetic cx op n env s k,
+        25 => arithmetic cx op n env s k,
+        26 => comparing cx op n env s k,
+        27 => comparing cx op n env s k,
+        28 => comparing cx op n env s k,
+        29 => comparing cx op n env s k,
+        30 => comparing cx op n env s k,
+        31 => comparing cx op n env s k,
+        84 => tested cx (fn atom -> Rhs.has_kind atom 5) a env s k,
+        46 => tested cx (fn atom -> Rhs.same atom nil_word) a env s k,
+        43 => type_test cx n env s k,
+        o if o == 17 || o == 18 => lazily cx i env s k,
+        o if o == 36 || o == 37 || o == 44 || o == 81 => lazily cx i env s k,
+        85 => {
+            value cx a env s (fn list_ env1 s1 -> {
+                let [x, s2] = fresh s1;
+                let var = Atom.var x;
+                let [y, s3] = fresh s2;
+                let [rest, s4] = k (Atom.var y) (mark_forced (Atom.var y) env1) s3;
+                [Expr.bind x (Rhs.field list_ 0) (seq_of y (Expr.enter var) rest), s4]
+            })
+        },
+        45 => {
+            value cx a env s (fn list_ env1 s1 -> {
+                let [x, s2] = fresh s1;
+                let var = Atom.var x;
+                let [y, s3] = fresh s2;
+                let [rest, s4] = k (Atom.var y) (mark_forced (Atom.var y) env1) s3;
+                [Expr.bind x (Rhs.field list_ 1) (seq_of y (Expr.enter var) rest), s4]
+            })
+        },
+        _ => {
+            let [x, s1] = fresh s;
+            let [e, s2] = tail cx i env s1;
+            let var = Atom.var x;
+            let [rest, s3] = k var (mark_forced var env) s2;
+            [seq_of x e rest, s3]
+        },
+    }
+};
+
+/// Once a slot's variable is evaluated, the evaluated one is what the slot holds:
+/// later reads have nothing to test.
+let remember : :integer -> Atom -> Atom -> Env -> Env;
+let remember i old new env = {
+    let slots = list.fold (fn m [slot, atom] -> if atom == old { m.[slot => new] } else { m })
+        (Env.slots env) (map.pairs (Env.slots env));
+    Env.set_slots slots env
+};
+
+let bound : Rhs -> :any -> Env -> St -> :bool -> [Expr, St];
+let bound rhs k env s known = {
+    let [x, s1] = fresh s;
+    let var = Atom.var x;
+    let [rest, s2] = k var (if known { mark_forced var env } else { env }) s1;
+    [Expr.bind x rhs rest, s2]
+};
+
+let arithmetic : :any -> :integer -> image.Node -> Env -> St -> :any -> [Expr, St];
+let arithmetic cx op n env s k =
+    value cx (image.Node.a n) env s (fn a env1 s1 ->
+        value cx (image.Node.b n) env1 s1 (fn b env2 s2 ->
+            bound (Rhs.arith arithmetic_ops.[op] a b) k env2 s2 true));
+
+let comparing : :any -> :integer -> image.Node -> Env -> St -> :any -> [Expr, St];
+let comparing cx op n env s k =
+    value cx (image.Node.a n) env s (fn a env1 s1 ->
+        value cx (image.Node.b n) env1 s1 (fn b env2 s2 ->
+            bound (Rhs.compare comparison_ops.[op] a b) k env2 s2 true));
+
+let tested : :any -> :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let tested cx test subject env s k =
+    value cx subject env s (fn a env1 s1 -> bound (test a) k env1 s1 true);
+
+/// `type_is`, for the surface kinds that are one test.
+let type_test : :any -> image.Node -> Env -> St -> :any -> [Expr, St];
+let type_test cx n env s k = {
+    let invert = image.Node.c n == 1;
+    let test = match image.Node.b n {
+        0 => fn a -> Rhs.is_fix a,
+        3 => fn a -> Rhs.has_tag a 1,
+        4 => fn a -> Rhs.same a unit_word,
+        1 => fn a -> Rhs.has_kind a 6,
+        5 => fn a -> Rhs.has_kind a 7,
+        2 => fn a -> Rhs.has_tag a 2,
+        6 => fn a -> Rhs.has_tag a 3,
+        8 => fn a -> Rhs.has_kind a 8,
+        7 => fn a -> Rhs.is_list a,
+        _ => fn a -> Rhs.has_kind a 10,
+    };
+    value cx (image.Node.a n) env s (fn a env1 s1 ->
+        if invert {
+            let [x, s2] = fresh s1;
+            let [y, s3] = fresh s2;
+            let [rest, s4] = k (Atom.var y) (mark_forced (Atom.var y) env1) s3;
+            [Expr.bind x (test a) (Expr.bind y (Rhs.same (Atom.var x) false_word) rest), s4]
+        } else { bound (test a) k env1 s1 true })
+};
+
+/// `n` as what the function answers.
+let tail : :any -> :integer -> Env -> St -> [Expr, St];
+let tail cx i env s = {
+    let n = image.node cx.[:img] i;
+    let op = image.Node.op n;
+    let a = image.Node.a n;
+    let b = image.Node.b n;
+    let c = image.Node.c n;
+    let answer = fn () -> value cx i env s (fn atom _ s1 -> [Expr.ret atom, s1]);
+    match op {
+        // A read in tail position needs no frame to come back to.
+        8 => match map.lookup a (Env.slots env) {
+            Option.some(atom) => [if forced_atom env atom { Expr.ret atom } else { Expr.enter atom }, s],
+            Option.none => answer (),
+        },
+        9 => {
+            let atom = (Env.captures env).[a];
+            [if forced_atom env atom { Expr.ret atom } else { Expr.enter atom }, s]
+        },
+        10 => global_read cx a env s,
+        11 => {
+            let [f, s1] = builtin_value cx a s;
+            [Expr.ret f, s1]
+        },
+        12 => {
+            let [f, s1] = host_value cx n s;
+            [Expr.ret f, s1]
+        },
+        13 => applied cx a (image.kids cx.[:img] b c) env s,
+        14 => value cx a env s (fn cond env1 s1 -> {
+            let [yes, s2] = tail cx b env1 s1;
+            let [no, s3] = tail cx c env1 s2;
+            [Expr.choose cond yes no, s3]
+        }),
+        15 => block cx (image.kids cx.[:img] a b) env s,
+        20 => tail cx a env s,
+        32 => short_circuit cx true a b env s,
+        33 => short_circuit cx false a b env s,
+        35 => value cx a env s (fn v env1 s1 ->
+            bound (Rhs.same v false_word) (fn x _ s2 -> [Expr.ret x, s2]) env1 s1 true),
+        41 => switching cx n env s,
+        42 => switching cx n env s,
+        o if o >= 47 && o <= 74 => builtin cx (names_of_builtins.[a]) (image.kids cx.[:img] b c) env s,
+        o if o == 1 || o == 3 || o == 4 || o == 5 || o == 6 || o == 7 || o == 17 || o == 18
+             || (o >= 21 && o <= 31) || o == 36 || o == 37 || o == 43 || o == 44 || o == 45 || o == 46
+             || o == 81 || o == 84 || o == 85 => answer (),
+        _ => [Expr.raise_text "not compiled", refuse_in cx.[:name] (str.concat_all ["opcode ", to_string op, " is not compiled yet"]) s],
+    }
+};
+
+let short_circuit : :any -> :bool -> :integer -> :integer -> Env -> St -> [Expr, St];
+let short_circuit cx is_and a b env s =
+    value cx a env s (fn l env1 s1 -> {
+        let [r, s2] = tail cx b env1 s1;
+        let stop = Expr.ret (Atom.word (if is_and { false_word } else { true_word }));
+        [if is_and { Expr.choose l r stop } else { Expr.choose l stop r }, s2]
+    });
+
+/// A `switch`, written out as the tests its arms stand for. The VM's jump table is
+/// the optimization that opcode exists for, and LLVM recovers it from the chain.
+let switching : :any -> image.Node -> Env -> St -> [Expr, St];
+let switching cx n env s = {
+    let kids = image.kids cx.[:img] (image.Node.b n) (image.Node.c n);
+    let on_head = image.Node.op n == 41;
+    let rec arms env1 subject rest s1 = match rest {
+        [fallback] => tail cx fallback env1 s1,
+        [key, target, ..more] => {
+            let [word, s2] = keyword cx key s1;
+            let [x, s3] = fresh s2;
+            let [yes, s4] = tail cx target env1 s3;
+            let [no, s5] = arms env1 subject more s4;
+            [Expr.bind x (Rhs.same subject word) (Expr.choose (Atom.var x) yes no), s5]
+        },
+        _ => [Expr.raise_text "a malformed switch", s1],
+    };
+    value cx (image.Node.a n) env s (fn subject env1 s1 ->
+        if on_head { head_key cx subject env1 s1 (fn k env2 s2 -> arms env2 k kids s2) }
+        else { arms env1 subject kids s1 })
+};
+
+let keyword : :any -> :integer -> St -> [:string, St];
+let keyword cx key s = {
+    let [index, s1] = intern_atom (image.atom cx.[:img] (image.Node.a (image.node cx.[:img] key))) s;
+    [immediate_word 3 index, s1]
+};
+
+/// What a `switch_head` keys on: a list cell's head evaluated, and anything else
+/// takes the default, which a key of unit always does.
+let head_key : :any -> Atom -> Env -> St -> :any -> [Expr, St];
+let head_key cx subject env s k = {
+    let [is_cell, s1] = fresh s;
+    let [h, s2] = fresh s1;
+    let [v, s3] = fresh s2;
+    let [joined, s4] = fresh s3;
+    let [rest, s5] = k (Atom.var joined) (mark_forced (Atom.var joined) env) s4;
+    let read = Expr.bind h (Rhs.field subject 0) (Expr.enter (Atom.var h));
+    let pick = Expr.choose (Atom.var is_cell) read (Expr.ret (Atom.word unit_word));
+    [Expr.bind is_cell (Rhs.has_kind subject 5) (seq_of joined pick rest), s5]
+};
+
+/// A global as a value: a function's static closure, a once-computed value's static
+/// thunk, or an action, performed by being named.
+let global_read : :any -> :integer -> Env -> St -> [Expr, St];
+let global_read cx g env s = {
+    let rec_ = image.global cx.[:img] g;
+    if image.Global.kind rec_ != 0 {
+        [Expr.raise_text "module", refuse_in cx.[:name] "a module used as a value" s]
+    } else {
+        let f = image.Global.target rec_;
+        let fr = image.func cx.[:img] f;
+        let symbol = symbol_of cx.[:unit] f;
+        let s1 = queue cx f s;
+        if image.Func.arity fr > 0 { [Expr.ret (static_closure symbol), s1] }
+        else if image.Func.flags fr & image.func_impure != 0 { [Expr.call symbol [], s1] }
+        else { [Expr.enter (Atom.address (caf_symbol symbol)), s1] }
+    }
+};
+
+let caf_symbol : :string -> :string;
+let caf_symbol symbol = str.concat_all ["@caf_", str.slice 1 (len symbol - 1) symbol];
+
+/// A call: whatever the callee node says it is.
+let applied : :any -> :integer -> [:integer] -> Env -> St -> [Expr, St];
+let applied cx callee args env s = {
+    let n = image.node cx.[:img] callee;
+    let unknown = fn () -> value cx callee env s (fn f env1 s1 ->
+        lazies cx args env1 s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2]));
+    match image.Node.op n {
+        11 => builtin cx names_of_builtins.[image.Node.a n] args env s,
+        10 => {
+            let g = image.global cx.[:img] (image.Node.a n);
+            let f = image.Global.target g;
+            if image.Global.kind g == 0 && image.Func.arity (image.func cx.[:img] f) == list.length args {
+                lazies cx args env (queue cx f s) (fn atoms _ s2 -> [Expr.call (symbol_of cx.[:unit] f) atoms, s2])
+            } else { unknown () }
+        },
+        12 => {
+            let object = image.node cx.[:img] (image.Node.a n);
+            let g = image.global cx.[:img] (image.Node.a object);
+            if image.Node.op object == 10 && image.Global.kind g == 1 {
+                native_call cx (image.import_path cx.[:img] (image.Global.target g))
+                    (image.string cx.[:img] (image.Node.b n)) args env s
+            } else { unknown () }
+        },
+        _ => unknown (),
+    }
+};
+
+/// Members of host modules this machine has: the runtime function, with the
+/// arguments forced. A native takes the context first (rt/main.dr).
+let host_members : :map;
+let host_members = %{
+    "std.io.stdout!" => "io_stdout!",
+    "std.io.stderr!" => "io_stderr!",
+    "std.io.write!" => "io_write!",
+};
+
+let native_call : :any -> :string -> :string -> [:integer] -> Env -> St -> [Expr, St];
+let native_call cx module_ member args env s = match native_named cx module_ member {
+    Option.none => not_built cx (str.concat_all ["`", module_, ".", member, "`"]) s,
+    Option.some(fn_name) =>
+        if arity_of_native cx fn_name == list.length args { native_exactly fn_name cx args env s }
+        else {
+            let [f, s1] = wrapper_of_native cx fn_name s;
+            lazies cx args env s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2])
+        },
+};
+
+let native_named : :any -> :string -> :string -> :any;
+let native_named cx module_ member =
+    // The library names runtime functions directly: that is what `rt.native` is. A
+    // native's own `!` is the dialect's, for reading memory, and is not the library's
+    // business: to it, an answer that depends only on its arguments is pure.
+    if module_ == "rt.native" { Option.some (member + "!") }
+    else { map.lookup (str.concat_all [module_, ".", member]) host_members };
+
+let not_built : :any -> :string -> St -> [Expr, St];
+let not_built cx what s =
+    [Expr.raise_text "not compiled", refuse_in cx.[:name] (what + " is not compiled yet") s];
+
+/// How many arguments a runtime function takes, the context aside. Its own image says.
+let arity_of_native : :any -> :string -> :integer;
+let arity_of_native cx fn_name = cx.[:native_arity].[fn_name else 0];
+
+let native_exactly : :string -> :any -> [:integer] -> Env -> St -> [Expr, St];
+let native_exactly fn_name cx args env s =
+    strict_args cx args env (St.set_natives ((St.natives s).[fn_name => true]) s)
+        (fn atoms env1 s1 -> bound (Rhs.native fn_name atoms) (fn x _ s2 -> [Expr.ret x, s2]) env1 s1 true);
+
+/// A native as a function value: a function of its arity that forces each argument
+/// and calls it, made once. This is what a partial application or `map io.close!` holds.
+let wrapper_of_native : :any -> :string -> St -> [Atom, St];
+let wrapper_of_native cx fn_name s = {
+    let symbol = "@wn" + mangled fn_name;
+    if (St.wrapped s).[symbol else false] { [static_closure symbol, s] } else {
+        let n = arity_of_native cx fn_name;
+        let [params, s1] = fresh_many n (St.set_natives ((St.natives s).[fn_name => true]) s);
+        let [body, s2] = forcing_all params [] fn_name s1;
+        let f = Function.make symbol symbol :function params [] body fn_name;
+        [static_closure symbol, s2 |> St.set_wrapped ((St.wrapped s2).[symbol => true])
+                                   |> St.set_functions (list.cons f (St.functions s2))]
+    }
+};
+
+/// A symbol's part from a name that may hold what LLVM does not allow bare.
+let mangled : :string -> :string;
+let mangled name = str.replace "!" "_x" name;
+
+let forcing_all : [:integer] -> [Atom] -> :string -> St -> [Expr, St];
+let forcing_all params done fn_name s = match params {
+    [] => {
+        let [x, s1] = fresh s;
+        [Expr.bind x (Rhs.native fn_name (list.reverse done)) (Expr.ret (Atom.var x)), s1]
+    },
+    [p, ..rest] => {
+        let [y, s1] = fresh s;
+        let [after, s2] = forcing_all rest (list.cons (Atom.var y) done) fn_name s1;
+        [seq_of y (Expr.enter (Atom.var p)) after, s2]
+    },
+};
+
+/// A library builtin as a function value: the library's function has a closure of its
+/// own, under the name the machine resolves.
+let wrapper_of_library : :any -> :string -> St -> [Atom, St];
+let wrapper_of_library cx name s = {
+    let symbol = "@wl" + mangled name;
+    if (St.wrapped s).[symbol else false] { [static_closure symbol, s] } else {
+        let n = cx.[:lib_arity].[name else 1];
+        let [params, s1] = fresh_many n (St.set_needed_lib ((St.needed_lib s).[name => true]) s);
+        let body = Expr.call ("@lib_" + name) (list.map (fn p -> Atom.var p) params);
+        let f = Function.make symbol symbol :function params [] body name;
+        [static_closure symbol, s1 |> St.set_wrapped ((St.wrapped s1).[symbol => true])
+                                   |> St.set_functions (list.cons f (St.functions s1))]
+    }
+};
+
+/// Builtin number `id` as a value, where it is one.
+let builtin_value : :any -> :integer -> St -> [Atom, St];
+let builtin_value cx id s = {
+    let name = names_of_builtins.[id];
+    match [map.lookup name library_builtins, map.lookup name native_builtins] {
+        [Option.some(fn_name), _] => wrapper_of_library cx fn_name s,
+        [_, Option.some(fn_name)] => wrapper_of_native cx fn_name s,
+        _ => [Atom.word unit_word, refuse_in cx.[:name] (str.concat_all ["the builtin `", name, "` as a value is not compiled yet"]) s],
+    }
+};
+
+/// `module.member` of a host module as a value.
+let host_value : :any -> image.Node -> St -> [Atom, St];
+let host_value cx n s = {
+    let g = image.global cx.[:img] (image.Node.a (image.node cx.[:img] (image.Node.a n)));
+    let path = image.import_path cx.[:img] (image.Global.target g);
+    let member = image.string cx.[:img] (image.Node.b n);
+    match native_named cx path member {
+        Option.some(fn_name) => wrapper_of_native cx fn_name s,
+        Option.none => [Atom.word unit_word, refuse_in cx.[:name] (str.concat_all ["`", path, ".", member, "` is not compiled yet"]) s],
+    }
+};
+
+/// A builtin, in three kinds: written out here, a runtime function, or a function
+/// of the library (mind/std/src/rt/lib.dr), which is ordinary Dream.
+let builtin : :any -> :string -> [:integer] -> Env -> St -> [Expr, St];
+let builtin cx name args env s = match [name, args] {
+    ["raise!", [e]] => value cx e env s (fn v _ s1 -> [Expr.call "@raise!" [v], s1]),
+    ["_match_fail", _] => [Expr.raise_text "no pattern matched", s],
+    ["_list_cons", [h, t]] => lazily_alloc cx "cons" [h, t] env s (fn x _ s1 -> [Expr.ret x, s1]),
+    ["_match_is_cons", [l]] => tested cx (fn a -> Rhs.has_kind a 5) l env s (fn x _ s1 -> [Expr.ret x, s1]),
+    ["_list_is_empty", [l]] => tested cx (fn a -> Rhs.same a nil_word) l env s (fn x _ s1 -> [Expr.ret x, s1]),
+    ["_match_head", [l]] => list_part cx 0 l env s,
+    ["_match_tail", [l]] => list_part cx 1 l env s,
+    ["_list_tail", [l]] => list_part cx 1 l env s,
+    _ => match [map.lookup name library_builtins, map.lookup name native_builtins] {
+        [Option.some(fn_name), _] =>
+            if cx.[:lib_arity].[fn_name else 1] == list.length args { library_call cx fn_name args env s }
+            else {
+                let [f, s1] = wrapper_of_library cx fn_name s;
+                lazies cx args env s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2])
+            },
+        [_, Option.some(fn_name)] =>
+            if arity_of_native cx fn_name == list.length args { native_exactly fn_name cx args env s }
+            else {
+                let [f, s1] = wrapper_of_native cx fn_name s;
+                lazies cx args env s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2])
+            },
+        _ => not_built cx (str.concat_all ["the builtin `", name, "`"]) s,
+    },
+};
+
+let list_part : :any -> :integer -> :integer -> Env -> St -> [Expr, St];
+let list_part cx index l env s = value cx l env s (fn list_ _ s1 -> {
+    let [x, s2] = fresh s1;
+    [Expr.bind x (Rhs.field list_ index) (Expr.enter (Atom.var x)), s2]
+});
+
+let library_builtins : :map;
+let library_builtins = %{
+    "to_string" => "show", "len" => "length", "strict!" => "deep!", "_str_concat" => "concat_list",
+};
+
+let native_builtins : :map;
+let native_builtins = %{
+    "type_of" => "type_of!", "_str_byte" => "str_byte!", "_str_slice" => "str_slice!",
+    "_str_le" => "str_le!", "_str_find" => "str_find!", "_error_new" => "error_new!",
+};
+
+let library_call : :any -> :string -> [:integer] -> Env -> St -> [Expr, St];
+let library_call cx name args env s =
+    lazies cx args env (St.set_needed_lib ((St.needed_lib s).[name => true]) s)
+        (fn atoms _ s1 -> [Expr.call (str.concat_all ["@lib_", name]) atoms, s1]);
+
+let strict_args : :any -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let strict_args cx args env s k = {
+    let rec go ns acc env1 s1 = match ns {
+        [] => k (list.reverse acc) env1 s1,
+        [n, ..rest] => value cx n env1 s1 (fn a env2 s2 -> go rest (list.cons a acc) env2 s2),
+    };
+    go args [] env s
+};
+
+/// Each of `args` as an atom, evaluating none of them.
+let lazies : :any -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let lazies cx args env s k = {
+    let rec go ns acc env1 s1 = match ns {
+        [] => k (list.reverse acc) env1 s1,
+        [n, ..rest] => lazily cx n env1 s1 (fn a env2 s2 -> go rest (list.cons a acc) env2 s2),
+    };
+    go args [] env s
+};
+
+let lazily_alloc : :any -> :string -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let lazily_alloc cx info kids env s k =
+    lazies cx kids env s (fn atoms env1 s1 -> bound (Rhs.alloc info atoms) k env1 s1 true);
+
+/// `n` as an atom, with nothing evaluated: built in place where building it cannot
+/// be observed, and suspended otherwise. A division is not built in place, because
+/// raising is observable; a list is, because its elements stay lazy.
+let lazily : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let lazily cx i env s k = {
+    let n = image.node cx.[:img] i;
+    let op = image.Node.op n;
+    let a = image.Node.a n;
+    match op {
+        8 => match map.lookup a (Env.slots env) {
+            Option.some(atom) => k atom env s,
+            Option.none => hole_read cx a env s k,
+        },
+        9 => k (Env.captures env).[a] env s,
+        o if o == 1 || o == 3 || o == 4 || o == 5 || o == 6 || o == 7 => value cx i env s k,
+        10 => {
+            let g = image.global cx.[:img] a;
+            let f = image.Global.target g;
+            if image.Global.kind g != 0 { suspended cx i env s k }
+            else {
+                let fr = image.func cx.[:img] f;
+                let symbol = symbol_of cx.[:unit] f;
+                if image.Func.arity fr > 0 { k (static_closure symbol) env (queue cx f s) }
+                else if image.Func.flags fr & image.func_impure != 0 { suspended cx i env s k }
+                else { k (Atom.address (caf_symbol symbol)) env (queue cx f s) }
+            }
+        },
+        o if o == 17 || o == 18 => closure_of cx a env s k,
+        11 => {
+            let [f, s1] = builtin_value cx a s;
+            k f env s1
+        },
+        12 => {
+            let [f, s1] = host_value cx n s;
+            k f env s1
+        },
+        36 => list_literal cx (image.kids cx.[:img] a (image.Node.b n)) env s k,
+        44 => lazily_alloc cx "cons" [a, image.Node.b n] env s k,
+        37 => {
+            let kids = image.kids cx.[:img] a (image.Node.b n);
+            lazies cx kids env s (fn atoms env1 s1 ->
+                bound (Rhs.alloc "array" (list.cons (Atom.word (fixnum_word (list.length atoms))) atoms)) k env1 s1 true)
+        },
+        81 => {
+            let kids = image.kids cx.[:img] a (image.Node.b n);
+            let [id, s1] = intern_atom (image.atom cx.[:img] (image.Node.c n % 2147483648)) s;
+            lazies cx kids env s1 (fn atoms env1 s2 ->
+                bound (Rhs.alloc "record" (list.append [Atom.word (fixnum_word (list.length atoms)),
+                                                        Atom.word (immediate_word 3 id)] atoms)) k env1 s2 true)
+        },
+        _ => suspended cx i env s k,
+    }
+};
+
+/// A slot read before anything is in it, which is how `let rec` is written: a word
+/// stands in, and the binding patches it when it comes.
+let hole_read : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let hole_read cx slot env s k =
+    k (Atom.word "0") env (refuse_in cx.[:name] "a value that refers to itself outside a closure or suspension" s);
+
+let list_literal : :any -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let list_literal cx kids env s k =
+    lazies cx kids env s (fn atoms env1 s1 -> {
+        let rec build rest tail_atom s2 = match rest {
+            [] => k tail_atom (mark_forced tail_atom env1) s2,
+            [h, ..more] => {
+                let [x, s3] = fresh s2;
+                let [e, s4] = build more (Atom.var x) s3;
+                [Expr.bind x (Rhs.alloc "cons" [h, tail_atom]) e, s4]
+            },
+        };
+        build (list.reverse atoms) (Atom.word nil_word) s1
+    });
+
+/// The frame `n` will read, as captures: the variables holding the slots and captures
+/// it names. A slot it reads that nothing has bound yet is a hole, to be patched.
+let captured : :any -> :integer -> Env -> [[:any]];
+let captured cx i env = {
+    let [slots, caps, bound_inside] = reads cx.[:img] i;
+    let from_slots = list.map (fn slot -> [:slot, slot, map.lookup slot (Env.slots env)])
+        (list.filter (fn slot -> map.has slot (Env.slots env) || not (map.has slot bound_inside))
+                     (list.sort (map.keys slots)));
+    let from_caps = list.map (fn c -> [:cap, c, Option.some (Env.captures env).[c]]) (list.sort (map.keys caps));
+    list.append from_slots from_caps
+};
+
+/// What a lifted body starts with: its parameters, for the same slots and captures.
+let lifted_env : [[:any]] -> [:integer] -> Env -> Env;
+let lifted_env pieces vars env = {
+    let forced_from = fn piece -> match piece.[2] {
+        Option.some(atom) => forced_atom env atom,
+        Option.none => false,
+    };
+    list.fold (fn e [piece, v] -> {
+        let e1 = if forced_from piece { mark_forced (Atom.var v) e } else { e };
+        match piece.[0] {
+            :slot => Env.set_slots ((Env.slots e1).[piece.[1] => Atom.var v]) e1,
+            _ => Env.set_captures ((Env.captures e1).[piece.[1] => Atom.var v]) e1,
+        }
+    }) (Env.make %{} %{} %{} []) (list.zip pieces vars)
+};
+
+let fresh_many : :integer -> St -> [[:integer], St];
+let fresh_many n s = {
+    let start = St.next s;
+    [list.range start (start + n), St.set_next (start + n) s]
+};
+
+/// `n` suspended: its code lifted to a function of what it reads, and an object
+/// holding those. A thunk with nothing to hold still takes a word, which is where
+/// the update writes its answer.
+let suspended : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let suspended cx i env s k = {
+    let pieces = captured cx i env;
+    let [vars, s1] = fresh_many (list.length pieces) s;
+    let [id, s2] = fresh s1;
+    let inner = lifted_env pieces vars env;
+    let [body, s3] = tail cx i inner s2;
+    let symbol = str.concat_all ["@t", cx.[:unit], to_string id];
+    let f = Function.make symbol symbol :thunk [] vars body (cx.[:name] + " (suspended)");
+    let s4 = St.set_functions (list.cons f (St.functions s3)) s3;
+    let values_ = list.map (fn piece -> match piece.[2] {
+        Option.some(atom) => atom,
+        Option.none => Atom.word "0",
+    }) pieces;
+    let holes = list.filter_map (fn [index, piece] -> match piece.[2] {
+        Option.none => [index, piece.[1]],
+        _ => (),
+    }) (list.enumerate pieces);
+    let payload = if list.is_empty values_ { [Atom.word "1"] } else { values_ };
+    let [x, s5] = fresh s4;
+    let var = Atom.var x;
+    let env1 = Env.set_holes (list.append (list.map (fn [index, slot] -> [var, index, slot]) holes) (Env.holes env)) env;
+    let [rest, s6] = k var env1 s5;
+    [Expr.bind x (Rhs.alloc symbol payload) rest, s6]
+};
+
+/// A closure of image function `f`, reading what its descriptors say.
+let closure_of : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let closure_of cx f env s k = {
+    let descriptors = capture_descriptors cx.[:img] f;
+    let symbol = symbol_of cx.[:unit] f;
+    let s1 = queue cx f s;
+    if list.is_empty descriptors { k (static_closure symbol) env s1 }
+    else {
+        let pieces = list.map (fn d ->
+            if d >= 2147483648 { [:cap, d - 2147483648, Option.some (Env.captures env).[d - 2147483648]] }
+            else { [:slot, d, map.lookup d (Env.slots env)] }) descriptors;
+        let values_ = list.map (fn piece -> match piece.[2] {
+            Option.some(atom) => atom,
+            Option.none => Atom.word "0",
+        }) pieces;
+        let holes = list.filter_map (fn [index, piece] -> match piece.[2] {
+            Option.none => [index, piece.[1]],
+            _ => (),
+        }) (list.enumerate pieces);
+        let [x, s2] = fresh s1;
+        let var = Atom.var x;
+        let env1 = Env.set_holes (list.append (list.map (fn [index, slot] -> [var, index, slot]) holes) (Env.holes env)) (mark_forced var env);
+        let [rest, s3] = k var env1 s2;
+        [Expr.bind x (Rhs.alloc (str.concat_all ["@c", cx.[:unit], to_string f]) values_) rest, s3]
+    }
+};
+
+/// A block's statements, in order. A `let` binds, suspended unless the compiler marked
+/// it strict; a statement that is not last is run only if marked as having effects.
+let block : :any -> [:integer] -> Env -> St -> [Expr, St];
+let block cx statements env s = match statements {
+    [] => [Expr.ret (Atom.word unit_word), s],
+    [only] => if image.Node.op (image.node cx.[:img] only) == 16 { statement cx only [] env s } else { tail cx only env s },
+    [first, ..rest] => statement cx first rest env s,
+};
+
+let flag_strict = 1;
+
+let statement : :any -> :integer -> [:integer] -> Env -> St -> [Expr, St];
+let statement cx i rest env s = {
+    let n = image.node cx.[:img] i;
+    let strict = image.Node.flags n & flag_strict != 0;
+    if image.Node.op n == 16 {
+        let slot = image.Node.a n;
+        let target_op = image.Node.op (image.node cx.[:img] (image.Node.b n));
+        let suspends = target_op == 17 || target_op == 18;
+        let binding = fn atom env1 s1 -> settle_holes slot atom (Env.set_slots ((Env.slots env1).[slot => atom]) env1) s1
+            (fn env2 s2 -> block cx rest env2 s2);
+        if strict && not suspends { value cx (image.Node.b n) env s binding }
+        else { lazily cx (image.Node.b n) env s binding }
+    }
+    else if strict {
+        let [x, s1] = fresh s;
+        let [e, s2] = tail cx i env s1;
+        let [after, s3] = block cx rest env s2;
+        [seq_of x e after, s3]
+    }
+    else { block cx rest env s }
+};
+
+/// `slot` has a value now, so what captured it before it did can be given it.
+let settle_holes : :integer -> Atom -> Env -> St -> :any -> [Expr, St];
+let settle_holes slot atom env s k = {
+    let [waiting, others] = list.partition (fn h -> h.[2] == slot) (Env.holes env);
+    let env1 = Env.set_holes others env;
+    let [body, s1] = k env1 s;
+    list.fold (fn [e, st] h -> {
+        let [x, st1] = fresh st;
+        [Expr.bind x (Rhs.patch h.[0] h.[1] atom) e, st1]
+    }) [body, s1] waiting
+};
+
+/// Image function `f` as a core function.
+let translate : :any -> :integer -> St -> St;
+let translate cx f s = {
+    let fr = image.func cx.[:img] f;
+    let symbol = symbol_of cx.[:unit] f;
+    let [params, s1] = fresh_many (image.Func.arity fr) s;
+    let [caps, s2] = fresh_many (image.Func.captures fr) s1;
+    let name = image.string cx.[:img] (image.Func.name fr);
+    let slots = list.fold (fn m [i, v] -> m.[i => Atom.var v]) %{} (list.enumerate params);
+    let captures = list.fold (fn m [i, v] -> m.[i => Atom.var v]) %{} (list.enumerate caps);
+    let env = Env.make slots captures %{} [];
+    let cx1 = cx.[:name => name];
+    let [body, s3] = tail cx1 (image.Func.body fr) env s2;
+    let pure_value = image.Func.arity fr == 0 && image.Func.flags fr & image.func_impure == 0
+                     && image.Func.captures fr == 0;
+    let how = if pure_value { :caf } else { :function };
+    let func_ = Function.make symbol symbol how params caps body name;
+    St.set_functions (list.cons func_ (St.functions s3)) s3
+};
+
+/// A program, from what `units` hold: `unit => image`. `roots` are `[unit, function]`,
+/// and everything they reach comes with them.
+let program : :map -> [[:any]] -> :map -> :map -> :map -> St -> St;
+let program units roots lib_names native_arity lib_arity s = {
+    let rec go s1 seen lib_seen = match St.queued s1 {
+        [] => {
+            let wanted = list.filter (fn n -> not (lib_seen.[n else false])) (map.keys (St.needed_lib s1));
+            match wanted {
+                [] => s1,
+                [name, ..rest] => match map.lookup name lib_names {
+                    Option.none => go (refuse_in "the library" (str.concat_all ["it has no `", name, "`"]) (St.set_needed_lib (map.remove name (St.needed_lib s1)) s1)) seen lib_seen,
+                    Option.some(f) => go (St.set_queued [["l", f]] s1) seen lib_seen.[name => true],
+                },
+            }
+        },
+        [[unit, f], ..rest] => {
+            let s2 = St.set_queued rest s1;
+            let key = str.concat_all [unit, to_string f];
+            if seen.[key else false] { go s2 seen lib_seen }
+            else {
+                let cx = %{:img => units.[unit], :unit => unit, :name => "", :native_arity => native_arity, :lib_arity => lib_arity};
+                go (translate cx f s2) seen.[key => true] lib_seen
+            }
+        },
+    };
+    go (St.set_queued roots s) %{} %{}
+};

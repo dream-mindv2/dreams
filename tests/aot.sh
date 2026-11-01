@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# `dreams --aot`: what is built today, which is the runtime dialect. Each program
-# is compiled to an executable, run, and held to its output and exit status, and
-# what the dialect has no meaning for must be refused with no executable left
-# behind. An executable naming libdream, or written beside a stray image, fails.
+# `dreams --aot`: the runtime dialect by itself, and ordinary Dream on the runtime.
+# Each program is compiled to an executable, run, and held to its output and exit
+# status, and what cannot be compiled must be refused with no executable left behind.
+# An executable naming libdream, or written beside a stray image, fails.
 #
 # Needs only the VM and the seed; `image` overrides the compiler under test.
 
@@ -86,13 +86,51 @@ DREAMS_CACHE= timeout 60 "$dream" "$image" -L "$root/mind" --host-module rt.prim
 compile -o from_image made.dream || fail "an image did not compile: $(cat said)"
 [[ "$(timeout 10 ./from_image)" == "fact 10 = 3628800" ]] || fail "from_image printed the wrong thing"
 
-# What needs the heap is refused, naming the function, leaving nothing behind.
+# In the dialect, what needs the heap is refused, naming the function, leaving
+# nothing behind.
 cat > heap.dr <<'DR'
+import rt.prim;
 let main! () = { let pair = [1, 2]; 0 };
 DR
-if compile -o heap heap.dr; then fail "a list was accepted"; fi
+if compile -o heap heap.dr; then fail "a list was accepted in the dialect"; fi
 grep -q "main!: opcode 36" said || fail "the refusal did not name main!: $(cat said)"
 [[ ! -e heap && ! -e heap.image ]] || fail "a refused build left something behind"
+
+# Ordinary Dream, on the runtime: what it does not have yet is refused the same way.
+cat > later.dr <<'DR'
+let main! () = try! { 1 } catch e { 2 };
+DR
+if compile -o later later.dr; then fail "try! was accepted before it is built"; fi
+grep -q "is not compiled yet" said || fail "the refusal did not say why: $(cat said)"
+
+# A lazy list consumed as it is built must not be pinned, a list that is held must
+# survive being copied, and recursion is bounded by memory, not a machine stack.
+cat > collect.dr <<'DR'
+import std.console;
+let range !a !b = if a >= b { [] } else { a :: range (a + 1) b };
+let sum xs !acc = match xs { [] => acc, [x, ..r] => sum r (acc + x) };
+let deep n = if n == 0 { 0 } else { 1 + deep (n - 1) };
+let main! () = {
+    console.print! (sum (range 0 5000000) 0);
+    let held = range 0 1000000;
+    console.print! (sum held 0);
+    console.print! (sum held 0);
+    console.print! (deep 2000000);
+    console.print! [:a, "s", 'c', 1, true, ()];
+};
+DR
+compile -o collect collect.dr || fail "collect did not compile: $(cat said)"
+[[ ! -e collect.lib.image && ! -e collect.rt.image ]] || fail "the runtime's images were left behind"
+if command -v ldd >/dev/null && ldd ./collect | grep -q libdream; then fail "collect needs libdream"; fi
+(ulimit -s 256; ulimit -v 12000000; timeout 60 ./collect) > collected
+cat > collect.expected <<'OUT'
+12499997500000
+499999500000
+499999500000
+2000000
+[:a, "s", 'c', 1, true, ()]
+OUT
+diff collected collect.expected >/dev/null || fail "collect printed: $(cat collected)"
 
 [[ $failed == 0 ]] && echo "aot: ok"
 exit $failed

@@ -92,7 +92,7 @@ let comparisons = %{26 => "eq", 27 => "ne", 28 => "slt", 29 => "sle", 30 => "sgt
 let slot : :integer -> :string;
 let slot n = str.concat_all ["%slot", to_string n];
 let function_name : :integer -> :string;
-let function_name f = str.concat_all ["@f", to_string f];
+let function_name f = str.concat_all ["@r", to_string f];
 
 let args_text : [:string] -> :string;
 let args_text vals = str.join_str ", " (list.map (fn v -> "i64 " + v) vals);
@@ -166,6 +166,18 @@ let primitive cx name args s = match name {
     "c4!" => c_call cx args s,
     "c5!" => c_call cx args s,
     "c6!" => c_call cx args s,
+    // The address of an info the machine lays out. By name, since it is the
+    // compiler's and is not a value anything here could compute.
+    "info" => match args {
+        [first] => {
+            let n = image.node cx.[:img] first;
+            if image.Node.op n != 3 { refuse (cx.[:name] + ": an info's name must be a literal") s }
+            else {
+                instr (str.concat_all ["ptrtoint ptr @i_", image.string cx.[:img] (image.Node.a n), " to i64"]) s
+            }
+        },
+        _ => refuse (cx.[:name] + ": `info` takes a name") s,
+    },
     _ => {
         let [vals, s1] = values cx args s;
         match [name, vals] {
@@ -182,6 +194,8 @@ let primitive cx name args s = match name {
                 let [back, s2] = binary "sub" a "8" s1;
                 loaded "i64" back s2
             },
+            ["ugt", [a, b]] => widened (str.concat_all ["icmp ugt i64 ", a, ", ", b]) s1,
+            ["uge", [a, b]] => widened (str.concat_all ["icmp uge i64 ", a, ", ", b]) s1,
             ["ult", [a, b]] => widened (str.concat_all ["icmp ult i64 ", a, ", ", b]) s1,
             ["ule", [a, b]] => widened (str.concat_all ["icmp ule i64 ", a, ", ", b]) s1,
             ["ushr", [a, b]] => binary "lshr" a b s1,
@@ -231,6 +245,18 @@ let call_of cx n args tail s = {
                 let call = str.concat_all ["call tailcc i64 ", function_name target, "(", args_text vals, ")"];
                 instr (if tail { "musttail " + call } else { call }) s2
             },
+        // A jump is a call that must not come back, so it means nothing but in tail
+        // position: the code address is called with the machine's own signature.
+        ["jump!", _] => {
+            let [vals, s1] = values cx args s;
+            match [tail, vals] {
+                [true, [code, ..rest]] => {
+                    let [fn_, s2] = instr (str.concat_all ["inttoptr i64 ", code, " to ptr"]) s1;
+                    instr (str.concat_all ["musttail call tailcc i64 ", fn_, "(", args_text rest, ")"]) s2
+                },
+                _ => refuse (cx.[:name] + ": a jump must be in tail position") s1,
+            }
+        },
         [name, _] => primitive cx name args s,
     }
 };
@@ -433,10 +459,10 @@ let start_text = str.concat_all (list.map (fn l -> str.concat_all ["module asm \
     "  movq %rsp, %rdx", "  andq $-16, %rsp", "  pushq %rax", "  pushq %rsp", "  xorl %r8d, %r8d",
     "  xorl %ecx, %ecx", "  movq $main, %rdi", "  call __libc_start_main", "  hlt"]);
 
-/// Every function reachable from `f`, generated once each. A worklist because the
+/// Every function reachable from `work`, generated once each. A worklist because the
 /// image also carries what nothing here calls, the prelude first of all.
 let reachable : image.Image -> [:integer] -> :map -> [:string] -> State -> [[:string], State];
-let rec reachable img work seen texts s = match work {
+let reachable img work seen texts s = match work {
     [] => [texts, s],
     [f, ..rest] =>
         if seen.[f else false] { reachable img rest seen texts s }
@@ -447,7 +473,34 @@ let rec reachable img work seen texts s = match work {
         },
 };
 
-/// `img` as LLVM IR, or everything in it the dialect has no meaning for.
+/// What a dialect image is, as the machine links it: the text of what `roots`
+/// reach, its constants and C declarations, and each root's symbol.
+group Unit { text : :string, imports : :map, symbols : %{:string => :string}, refused : [:string] }
+
+/// A top-level function of `img` by its name. Names are unique because the runtime
+/// is written so; a dialect image is the compiler's own input.
+let by_name : image.Image -> :map;
+let by_name img = list.fold (fn m i -> {
+    let g = image.global img i;
+    if image.Global.kind g == 0 { m.[image.string img (image.Global.name g) => image.Global.target g] }
+    else { m }
+}) %{} (list.range 0 (image.count img "GLBL"));
+
+let unit_of : image.Image -> [:string] -> Unit;
+let unit_of img roots = {
+    let named = by_name img;
+    let known = list.filter (fn r -> map.has r named) roots;
+    let missing = list.filter (fn r -> not (map.has r named)) roots;
+    let [texts, s] = reachable img (list.map (fn r -> named.[r]) known) %{} [] empty_state;
+    let strings = list.map (string_text img) (map.keys (State.strings s));
+    let symbols = list.fold (fn m r -> m.[r => function_name named.[r]]) %{} known;
+    Unit.make (str.concat_all (list.append strings (list.reverse texts))) (State.imports s) symbols
+        (list.append (list.reverse (State.refused s))
+                     (list.map (fn r -> "the runtime has no `" + r + "`") missing))
+};
+
+/// A dialect program by itself: `img` as LLVM IR, or everything in it the dialect
+/// has no meaning for.
 let to_ir : image.Image -> Result :string [:string];
 let to_ir img = {
     let entry = image.Image.entry img;
@@ -458,14 +511,10 @@ let to_ir img = {
             [] => {
                 let arity = image.Func.arity (image.func img entry);
                 let units = list.replicate arity "0";
-                let declares = list.map (fn [symbol, n] ->
-                    str.concat_all ["declare i64 @", symbol, "(",
-                                    str.join_str ", " (list.replicate n "i64"), ")\n"])
-                    (map.pairs (State.imports s));
                 Result.ok (str.concat_all (list.concat [
                     ["target triple = \"x86_64-unknown-linux-gnu\"\n", start_text,
                      "declare void @__libc_start_main()\n"],
-                    declares,
+                    declarations (State.imports s),
                     list.map (string_text img) (map.keys (State.strings s)),
                     list.reverse texts,
                     [str.concat_all ["define dso_local i32 @main() {\n  %r = call tailcc i64 ",
@@ -477,3 +526,9 @@ let to_ir img = {
         }
     }
 };
+
+/// A C function's declaration, for each of the ones a unit called.
+let declarations : :map -> [:string];
+let declarations imports = list.map (fn [symbol, n] ->
+    str.concat_all ["declare i64 @", symbol, "(", str.join_str ", " (list.replicate n "i64"), ")\n"])
+    (map.pairs imports);

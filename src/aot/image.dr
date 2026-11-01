@@ -105,3 +105,19 @@ let integer img i = i64_at (Image.bytes img) (at img "KINT" + 8 * i);
 /// The path of import `i`: what a module global's target names.
 let import_path : Image -> :integer -> :string;
 let import_path img i = string img (u32_at (Image.bytes img) (at img "IMPT" + 8 * i));
+
+/// Where function `i`'s capture descriptors are, in `KIDS`.
+let func_captures_at : Image -> :integer -> :integer;
+let func_captures_at img i = u32_at (Image.bytes img) (at img "FUNC" + 32 * i + 16);
+
+/// An atom's name: `KATM` is a table of `KSTR` indices.
+let atom : Image -> :integer -> :string;
+let atom img i = string img (u32_at (Image.bytes img) (at img "KATM" + 4 * i));
+
+/// A float constant's bits, as two 32-bit halves, low first: a Dream integer holds
+/// them exactly, and a bit pattern is all the machine wants.
+let float_bits : Image -> :integer -> [:integer];
+let float_bits img i = {
+    let o = at img "KFLT" + 8 * i;
+    [u32_at (Image.bytes img) o, u32_at (Image.bytes img) (o + 4)]
+};
