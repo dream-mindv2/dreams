@@ -1083,6 +1083,12 @@ let host_member_list = [
     ["std.os.platform", "os_platform!"],
     ["std.os.arch", "os_arch!"],
     ["std.os.exit!", "os_exit!"],
+    ["std.os.replace!", "os_replace!"],
+    ["std.os.pty_spawn!", "os_pty_spawn!"],
+    ["std.os.pty_resize!", "pty_resize!"],
+    ["std.os.pty_status!", "pty_status!"],
+    ["std.os.pty_signal!", "pty_signal!"],
+    ["std.os.pty_foreground!", "pty_foreground!"],
     ["std.os.install_dirs!", "os_install_dirs!"],
     ["std.os.exec!", "exec!"],
     ["std.os.exec_for!", "exec_for!"],
@@ -1300,7 +1306,6 @@ let native_call cx module_ member args env s = match native_named cx module_ mem
 /// VM it is an error when it is reached, which a program may be testing for.
 let vm_only : :map;
 let vm_only = list.fold (fn m k -> m.[k => true]) %{} [
-    "std.os.replace!", "std.os.pty_spawn!", "std.os.pty_resize!", "std.os.pty_status!", "std.os.pty_signal!", "std.os.pty_foreground!",
     "std.vm.eval_image!", "std.vm.open_image!", "std.vm.call_image!", "std.vm.close_image!", "std.vm.image_function",
     "std.vm.pure_image_function", "std.vm.locate_image!", "std.vm.image_digest", "std.vm.share_arenas", "std.vm.node_section", "std.vm.index_section",
 ];
@@ -1398,7 +1403,7 @@ let library_natives = %{"kill_value!" => 2, "remove_all!" => 1, "mkdir_all!" => 
                         "share!" => 1, "trunk_of" => 1, "trunk_concat" => 2, "trunk_contains" => 2, "trunk_index_of" => 2,
                         "trunk_count" => 2, "trunk_lookup" => 2, "trunk_put" => 3, "ed25519_public" => 1,
                         "ed25519_sign" => 2, "ed25519_verify" => 3, "wire_encode" => 1, "wire_decode" => 1,
-                        "wire_pack" => 1, "json_encode" => 1, "ffi_function!" => 4, "ffi_pure_function!" => 4, "ffi_call!" => 2, "ffi_locate!" => 1, "ffi_release!" => 1, "ffi_alive!" => 1, "ffi_owned!" => 1, "ffi_buffer!" => 1, "ffi_size!" => 1, "ffi_address!" => 1, "ffi_peek!" => 3, "ffi_poke!" => 4, "ffi_read!" => 3, "ffi_read_string!" => 2, "ffi_write!" => 3, "ffi_sizeof" => 1, "ffi_alignof" => 1, "ffi_payload_index" => 1, "ffi_open!" => 1, "ffi_close!" => 1, "ffi_bind!" => 4, "ffi_load!" => 4, "ffi_alloc!" => 1, "ffi_free!" => 1, "ffi_read_cstr!" => 1, "ffi_read_u8!" => 2, "ffi_write_u8!" => 3, "tls_connect!" => 2, "tls_accept!" => 2, "tls_info!" => 1, "as_tensor" => 1, "tensor_to_list" => 1, "t_zeros" => 1, "t_ones" => 1, "t_fill" => 2, "t_identity" => 1, "t_range" => 1, "t_random" => 2, "t_random_like" => 2, "t_shape" => 1, "t_rank" => 1, "t_size" => 1, "t_device" => 1, "t_dtype" => 1, "t_reshape" => 2, "t_transpose" => 1, "t_at" => 2, "t_matmul" => 2, "t_dot" => 2, "t_outer" => 2, "t_sum" => 1, "t_sum_tensor" => 1, "t_minimum" => 1, "t_maximum" => 1, "t_mean" => 1, "t_norm" => 1, "t_sum_axis" => 2, "t_min_axis" => 2, "t_max_axis" => 2, "t_argmin_axis" => 2, "t_argmax_axis" => 2, "t_sqrt" => 1, "t_exp" => 1, "t_log" => 1, "t_abs" => 1, "t_tanh" => 1, "t_sin" => 1, "t_cos" => 1, "t_relu" => 1, "t_sigmoid" => 1, "t_floor" => 1, "t_ceil" => 1, "t_round" => 1, "t_sign" => 1, "t_erf" => 1, "t_max" => 2, "t_min" => 2, "t_pow" => 2, "t_lt" => 2, "t_le" => 2, "t_gt" => 2, "t_ge" => 2, "t_eq" => 2, "t_ne" => 2, "t_fill_like" => 2, "t_repeat" => 2, "t_slice" => 3, "t_take" => 2, "t_concat" => 1, "t_one_hot" => 2, "t_normal" => 2, "t_to_bytes" => 1, "t_im2col" => 5, "t_permute" => 2, "t_col2im" => 6, "t_of_bytes" => 2, "t_gpu" => 1, "t_gpu64" => 1, "t_host" => 1, "t_gpu_available" => 1, "t_gpu_name" => 1, "t_cpu_kernels" => 1};
+                        "wire_pack" => 1, "json_encode" => 1, "os_replace!" => 2, "os_pty_spawn!" => 6, "ffi_function!" => 4, "ffi_pure_function!" => 4, "ffi_call!" => 2, "ffi_locate!" => 1, "ffi_release!" => 1, "ffi_alive!" => 1, "ffi_owned!" => 1, "ffi_buffer!" => 1, "ffi_size!" => 1, "ffi_address!" => 1, "ffi_peek!" => 3, "ffi_poke!" => 4, "ffi_read!" => 3, "ffi_read_string!" => 2, "ffi_write!" => 3, "ffi_sizeof" => 1, "ffi_alignof" => 1, "ffi_payload_index" => 1, "ffi_open!" => 1, "ffi_close!" => 1, "ffi_bind!" => 4, "ffi_load!" => 4, "ffi_alloc!" => 1, "ffi_free!" => 1, "ffi_read_cstr!" => 1, "ffi_read_u8!" => 2, "ffi_write_u8!" => 3, "tls_connect!" => 2, "tls_accept!" => 2, "tls_info!" => 1, "as_tensor" => 1, "tensor_to_list" => 1, "t_zeros" => 1, "t_ones" => 1, "t_fill" => 2, "t_identity" => 1, "t_range" => 1, "t_random" => 2, "t_random_like" => 2, "t_shape" => 1, "t_rank" => 1, "t_size" => 1, "t_device" => 1, "t_dtype" => 1, "t_reshape" => 2, "t_transpose" => 1, "t_at" => 2, "t_matmul" => 2, "t_dot" => 2, "t_outer" => 2, "t_sum" => 1, "t_sum_tensor" => 1, "t_minimum" => 1, "t_maximum" => 1, "t_mean" => 1, "t_norm" => 1, "t_sum_axis" => 2, "t_min_axis" => 2, "t_max_axis" => 2, "t_argmin_axis" => 2, "t_argmax_axis" => 2, "t_sqrt" => 1, "t_exp" => 1, "t_log" => 1, "t_abs" => 1, "t_tanh" => 1, "t_sin" => 1, "t_cos" => 1, "t_relu" => 1, "t_sigmoid" => 1, "t_floor" => 1, "t_ceil" => 1, "t_round" => 1, "t_sign" => 1, "t_erf" => 1, "t_max" => 2, "t_min" => 2, "t_pow" => 2, "t_lt" => 2, "t_le" => 2, "t_gt" => 2, "t_ge" => 2, "t_eq" => 2, "t_ne" => 2, "t_fill_like" => 2, "t_repeat" => 2, "t_slice" => 3, "t_take" => 2, "t_concat" => 1, "t_one_hot" => 2, "t_normal" => 2, "t_to_bytes" => 1, "t_im2col" => 5, "t_permute" => 2, "t_col2im" => 6, "t_of_bytes" => 2, "t_gpu" => 1, "t_gpu64" => 1, "t_host" => 1, "t_gpu_available" => 1, "t_gpu_name" => 1, "t_cpu_kernels" => 1};
 
 let native_exactly : :string -> :any -> [:integer] -> Env -> St -> [Expr, St];
 let native_exactly fn_name cx args env s =

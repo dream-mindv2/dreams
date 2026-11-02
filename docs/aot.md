@@ -198,3 +198,13 @@ Not done: passing unboxed floats or integers between functions (a worker/wrapper
 entered once, stack allocation of what does not escape, and a generational collector, which is what
 `maps` and anything with a large live heap would want. Native runs on **one OS thread**, where the VM
 uses every core, so a parallel program will be slower than these numbers suggest.
+
+**2026-11-01: released as toolchain v0.3.10** (dreams 0.2.4, std 0.3.4, mind 0.3.5, lucid 0.1.4). `--aot`
+works from the Linux x86-64 tarball. It does not yet work on Linux aarch64 or macOS, whose toolchains
+carry it only to say so: the linker, the C calls and the runtime's system numbers are x86-64 Linux's.
+
+**Build time and the rest of `std.os`.** A hello-world build went from 7.2 s to 3.9 s and 713 KB to
+508 KB. The runtime's two images are kept between builds in `~/.cache/dreams` whatever the working
+directory (`cache.shared_key`), since they were most of the cost and never change, and `equal` matches
+on one type rather than a pair, which had been a third of the code. `os.replace!` and the `pty_*`
+natives are in, so nothing is refused now but what loads bytecode at run time.

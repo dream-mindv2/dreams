@@ -47,6 +47,25 @@ let key! asked = io.digest (str.join_str "\n" [
     to_string (list.fold (fn m k -> map.remove k m) asked [:output, :depfile, :cache]),
 ]);
 
+/// The key of a build whose options do not matter and which is the same wherever it is asked
+/// for: the part of a native build that is the runtime, by the file it starts from. What it reads
+/// is checked against the entry as for any other, so a changed `std` is a rebuild.
+let shared_key : :string -> :string;
+let shared_key file = io.digest (str.join_str "\n" [vm.image_digest (), file]);
+
+/// Where those are kept when no cache was asked for: most of what a small native build costs is
+/// compiling a runtime that has not changed since the last one.
+let shared_dir! : :unit -> :string | :unit;
+let shared_dir! u = match os.env! "DREAMS_CACHE" {
+    "" => (),
+    () => match os.env! "XDG_CACHE_HOME" {
+        () => match os.env! "HOME" { () => (), "" => (), h => h + "/.cache/dreams" },
+        "" => match os.env! "HOME" { () => (), "" => (), h => h + "/.cache/dreams" },
+        d => d + "/dreams",
+    },
+    d => d,
+};
+
 /// What an entry holds besides the image: `[path, digest]` for every file
 /// the build read, the line it printed, and its diagnostics as printed. A
 /// list, as it is written: what `wire` carries is data.

@@ -1081,17 +1081,18 @@ let load! o file = expansion.expand! (read! o file);
 let cached_build! o src = {
     let built! kept = build! (load! o src) (opt o :output) (opt o :shebang) (opt o :depfile)
                             (opt o :payloads) (opt o :said) (opt o :sc_stats == true) kept (compile_options o);
-    match (if opt o :output == () { () } else { cache.dir! (opt o :cache) }) {
+    let shared = opt o :runtime_part == true;
+    match (if opt o :output == () { () } else if shared { cache.shared_dir! () } else { cache.dir! (opt o :cache) }) {
         () => built! (),
         d => {
-            let key = cache.key! o;
+            let key = if shared { cache.shared_key (path.absolute! src) } else { cache.key! o };
             match cache.fresh! d key {
                 () => built! [d, key],
                 [reads, said_line, diagnostics] => {
                     let out = opt o :output;
                     cache.place! d key out
                     match opt o :shebang { () => (), _ => io.chmod! out 493 }
-                    console.error! said_line
+                    if not shared { console.error! said_line }
                     if diagnostics != "" { console.error! diagnostics }
                     match opt o :depfile {
                         () => 0,
@@ -1146,7 +1147,7 @@ let native_build! o src = {
     else if lib == () || rt == () { console.error! "error: the runtime's source was not found with the standard library"; 1 }
     else {
         // The runtime is the compiler's own input: nothing it builds of it is news.
-        let runtime = hosts |> with_opt :supercompile :none |> with_opt :defines [] |> with_opt :cache () |> with_opt :quiet true;
+        let runtime = hosts |> with_opt :supercompile :none |> with_opt :defines [] |> with_opt :cache () |> with_opt :quiet true |> with_opt :runtime_part true;
         let lib_image = image_of! runtime lib (out + ".lib.image");
         let rt_image = image_of! runtime rt (out + ".rt.image");
         if lib_image == () || rt_image == () { 1 }

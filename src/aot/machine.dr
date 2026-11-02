@@ -733,7 +733,7 @@ let frame_for x live rest env sp g = {
     [below, "@k" + to_string n, list.fold (fn st [i, v] -> store_at below (8 * (i + 1)) env.[v] st) g4 (list.enumerate live)]
 };
 
-let inline_budget = 128;
+let inline_budget = 64;
 
 /// What is left of `budget` after `e`, below zero when it does not fit. It stops counting there,
 /// since a function's chain of statements may be long and this is asked at each.

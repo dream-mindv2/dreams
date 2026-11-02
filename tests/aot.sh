@@ -133,5 +133,37 @@ cat > collect.expected <<'OUT'
 OUT
 diff collected collect.expected >/dev/null || fail "collect printed: $(cat collected)"
 
+# A program on a terminal of its own, and one replacing itself: only sh, stty and cat are asked of
+# the machine.
+cat > term.dr <<'DR'
+import std.console;
+import std.pty;
+import std.os;
+let opts = fn prog args -> pty.Options.new () |> pty.Options.set_program prog |> pty.Options.set_args args |> pty.Options.set_cols 100 |> pty.Options.set_rows 30;
+let rec drain! t !acc = match pty.read! t { "" => acc, s => drain! t (acc + s) };
+let main! = {
+    let t = pty.spawn! (opts "sh" ["-c", "stty size; exit 7"]);
+    console.print! (drain! t "");
+    console.print! (pty.wait! t);
+    let c = pty.spawn! (opts "cat" []);
+    pty.signal! c :interrupt;
+    drain! c "";
+    console.print! (pty.wait! c);
+    console.print! (try! { pty.spawn! (opts "no-such-program-x" []) } catch e { e });
+    os.replace! "echo" ["replaced"];
+};
+DR
+compile -o term term.dr || fail "term did not compile: $(cat said)"
+timeout 20 ./term 2>&1 | tr -d '\r' > termed
+cat > term.expected <<'OUT'
+30 100
+
+Exit.exited(7)
+Exit.signalled(2)
+<error :not_found cannot run `no-such-program-x`: it is not on PATH>
+replaced
+OUT
+diff termed term.expected >/dev/null || fail "term printed: $(cat termed)"
+
 [[ $failed == 0 ]] && echo "aot: ok"
 exit $failed
