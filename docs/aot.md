@@ -208,3 +208,6 @@ carry it only to say so: the linker, the C calls and the runtime's system number
 directory (`cache.shared_key`), since they were most of the cost and never change, and `equal` matches
 on one type rather than a pair, which had been a third of the code. `os.replace!` and the `pty_*`
 natives are in, so nothing is refused now but what loads bytecode at run time.
+
+**Many threads: planned, not built.** `aot-parallel.md` is the plan: M:N green processes, a heap per
+process rather than a stop-the-world collector, no language-level async.
