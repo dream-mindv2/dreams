@@ -1288,7 +1288,7 @@ let host_members = list.fold (fn m [k, v] -> m.[k => v]) %{} host_member_list;
 let machine_natives : :map;
 let machine_natives = %{"join_m!" => 1, "recv_m!" => 1, "await_message_m!" => 2, "sleep_until_m!" => 1,
                        "io_read_m!" => 2, "io_write_m!" => 2, "net_accept_m!" => 1, "net_connect_m!" => 2,
-                       "tls_handshake_m!" => 1, "ffi_call_m!" => 2};
+                       "tls_handshake_m!" => 1, "ffi_call_m!" => 2, "child_wait_m!" => 2};
 
 let native_call : :any -> :string -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let native_call cx module_ member args env s = match native_named cx module_ member {

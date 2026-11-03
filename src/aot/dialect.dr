@@ -304,6 +304,8 @@ let primitive cx name args s = match name {
             // A worker: an OS thread that runs the scheduler with a context of its own. Its body
             // is in the machine's text, as it starts with C's calling convention.
             ["start_worker!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_worker(i64 ", ctx, ")"]) s1,
+            // A thread of the blocking pool, which runs C calls a worker must not wait in.
+            ["start_pool!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_pool(i64 ", ctx, ")"]) s1,
             // A C `int` answer's top half is not promised to mean anything.
             ["sext32", [a]] => {
                 let [t, s2] = instr (str.concat_all ["trunc i64 ", a, " to i32"]) s1;

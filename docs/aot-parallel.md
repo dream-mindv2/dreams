@@ -316,3 +316,48 @@ and 24 workers with no difference from the VM. The whole program suite passes on
 
 Not done yet: the `epoll` poller and a pool of threads for calls that block a worker (step 4),
 pinning a foreign library's server to one thread (step 5), and a stress run with a faster tick.
+
+**2026-11-02: step 4, nothing waits in a worker.**
+
+- **`epoll`** replaces `poll` over a list rebuilt from every waiter on every call. A descriptor
+  is registered once, edge-triggered, the first time anyone waits on it, in a slot of a table the
+  size of the handle table with a spin lock of its own, so a wait is a list push and no system
+  call. An edge with nobody waiting sets a ready bit, and a process about to park that finds its
+  direction there goes round again instead, which closes the window between `EAGAIN` and the
+  wait. Only the waiters an event's direction is for are woken. Two measured steps on the way:
+  one-shot registration cost an `epoll_ctl` per wait, and one lock for every slot -- the
+  scheduler's -- had the workers queueing on it, 146,000 futex calls on `net`.
+- **Timers** are a binary heap under the scheduler's lock. A process woken some other way leaves
+  its entry, which is dropped when it reaches the top; the deadlock test counts only the timers
+  still meant (`live_timers!`), so a stale one cannot hold off the report.
+- **The blocking pool**: four threads, started at the first job, for what the system cannot do
+  without blocking. A name lookup in `connect!` goes there (a literal address does not), and the
+  process parks with the job in its retry frame. Jobs in flight count against a deadlock.
+- **Children**: `posix_spawnp` instead of `fork`, and a wait on a `pidfd` instead of `waitpid`
+  polled with a backoff. Two hundred concurrent `exec!` calls took 158 ms before this work; with
+  `fork` from many workers they took 520, as the copies of the page tables queue on the address
+  space's lock, and with `posix_spawnp` they take 65.
+- **A heap's budget** stops doubling at 64 KB for every process but the first, unless the
+  process has the live data or the stack to need more. At `min_chunk`, two hundred busy
+  connections each mapped and unmapped a to-space at every collection and faulted every page of
+  it in again: 103,000 faults where the shared heap had 12,000.
+
+Found on the way: the runtime's own library bound `native.spawn_child`'s answer with a lazy
+destructuring, and since a native looks pure to the compiler, the two processes `exec!` starts
+were each given a copy of that suspension and started the child again. Ordinary code is not
+affected -- an impure call runs where it is written -- but the library forces it now.
+
+`net` is new in `benchmark/native`: a listener, a process a connection, and 100 clients doing 250
+round trips each. With 500 clients it measured the kernel retransmitting the connections the
+backlog of 128 dropped, a second each, on the VM too.
+
+| | tree | maps | sorts | recs | strs | procs | fanout | net |
+|---|---|---|---|---|---|---|---|---|
+| before step 1 | 75 | 602 | 510 | 476 | 164 | 145 | 123 | 344 |
+| now, 24 workers | 72 | 603 | 506 | 469 | 161 | 199-231 | 23 | 122 |
+| now, one worker | | | | | | | | 345 |
+
+Not done, on purpose for now: reading and writing regular files stays on the worker. The plan put
+them in the pool, but a read from the page cache is a microsecond and a hand-off to the pool is
+two thread switches; it wants measuring with a slow disk before it is moved. `fsync` and the
+directory calls likewise.
