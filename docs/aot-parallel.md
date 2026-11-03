@@ -361,3 +361,29 @@ Not done, on purpose for now: reading and writing regular files stays on the wor
 them in the pool, but a read from the page cache is a microsecond and a hand-off to the pool is
 two thread switches; it wants measuring with a slow disk before it is moved. `fsync` and the
 directory calls likewise.
+
+**2026-11-02: step 5, foreign libraries and TLS on workers.**
+
+- **Pinning without an API**: a process pins itself to its worker the first time it calls C
+  (`ffi_call_m!`), as a library may keep state for its thread -- a GUI toolkit, a GL context, a
+  thread-local error. A library server is such a process, so `foreign.run!` gets this with no
+  change to `std.foreign`, and so does code that calls C itself. A pinned process is pushed to its
+  own worker's queue, stealing stops at the first pinned process in a queue, and a push onto
+  another worker's queue wakes every sleeper, since which one a signal wakes is the kernel's
+  choice. The deadlock test counts every queue, pinned or not.
+- **A TLS session is held** for the stretch of work between two parks, by the process's id, so a
+  reader and a writer on one connection -- HTTP/2, WebSockets -- on two workers do not interleave
+  inside OpenSSL. It is let go before every park, answer and failure.
+- **A push from outside the workers** -- the blocking pool's -- interrupts `epoll_wait` if the
+  worker it is for may be the one waiting there. On one worker an HTTPS request named by host
+  waited out its whole 30 s timeout without it, as the only worker was the one in `epoll`.
+
+`dreams/tests/aot.sh` now builds `dream/tests/tls/tls.dr` and `http.dr` native and holds them to
+the VM's output on one worker and on 24; before, nothing ran TLS native. Both pass, and so does
+"the server stops, and every connection with it", which the native build failed before this work.
+
+Step 6 is in the log above: `fanout` is the parallel benchmark, `caf_race` and `process_heaps`
+the stress of CAFs and of a kill in the middle of one, and the suites run on 1, 3 and 24 workers.
+No race detector for generated code was found. Step 7 -- generational heaps per process, and
+sharing large immutable data by reference -- waits, as decision 7 says, for a measurement to
+ask for it.

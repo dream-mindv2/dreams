@@ -165,5 +165,24 @@ replaced
 OUT
 diff termed term.expected >/dev/null || fail "term printed: $(cat termed)"
 
+# std.tls and HTTPS over it, native, against what the VM prints: the same two suites as
+# dream/tests/tls/run.sh, on one worker and on many, as a session is shared between processes
+# that may be on different threads. OpenSSL is found as a binary finds it, or as the VM was
+# linked against it where the loader would not (NixOS).
+tls_dir="$root/dream/tests/tls"
+if [[ -z "${DREAM_OPENSSL_LIB:-}" ]] && ! ldconfig -p 2>/dev/null | grep -q 'libssl.so.3'; then
+  linked=$(ldd "$dream" 2>/dev/null | grep -o '/[^ ]*libssl\.so[^ ]*' | head -1)
+  [[ -n "$linked" ]] && export DREAM_OPENSSL_LIB="$linked"
+fi
+for suite in tls http; do
+  "$dream" "$image" -L "$root/mind" -o "$suite.dream" "$tls_dir/$suite.dr" >said 2>&1 || { fail "$suite did not compile: $(cat said)"; continue; }
+  timeout 120 "$dream" "$suite.dream" "$tls_dir" >"$suite.vm" 2>&1
+  compile -o "$suite.native" "$suite.dream" || { fail "$suite did not build native: $(cat said)"; continue; }
+  for cores in 1 24; do
+    DREAM_CORES=$cores timeout 120 "./$suite.native" "$tls_dir" >"$suite.out" 2>&1
+    diff -q "$suite.out" "$suite.vm" >/dev/null || fail "$suite on $cores worker(s) printed: $(diff "$suite.vm" "$suite.out" | head -20)"
+  done
+done
+
 [[ $failed == 0 ]] && echo "aot: ok"
 exit $failed
