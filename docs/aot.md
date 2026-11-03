@@ -196,8 +196,8 @@ was a lazy merge with a generic comparison (`sorts` was 19.9 s; `sort_prim!` for
 Not done: passing unboxed floats or integers between functions (a worker/wrapper split, which is what
 `pi` still lacks), returning records in registers, omitting a thunk's update when it can only be
 entered once, stack allocation of what does not escape, and a generational collector, which is what
-`maps` and anything with a large live heap would want. Native runs on **one OS thread**, where the VM
-uses every core, so a parallel program will be slower than these numbers suggest.
+`maps` and anything with a large live heap would want. Native ran on **one OS thread** then;
+it uses every core now (`aot-parallel.md`).
 
 **2026-11-01: released as toolchain v0.3.10** (dreams 0.2.4, std 0.3.4, mind 0.3.5, lucid 0.1.4). `--aot`
 works from the Linux x86-64 tarball. It does not yet work on Linux aarch64 or macOS, whose toolchains
@@ -209,5 +209,5 @@ directory (`cache.shared_key`), since they were most of the cost and never chang
 on one type rather than a pair, which had been a third of the code. `os.replace!` and the `pty_*`
 natives are in, so nothing is refused now but what loads bytecode at run time.
 
-**Many threads: planned, not built.** `aot-parallel.md` is the plan: M:N green processes, a heap per
-process rather than a stop-the-world collector, no language-level async.
+**Many threads.** `aot-parallel.md` is the plan and its log: M:N green processes, a heap per process
+rather than a stop-the-world collector, no language-level async. A heap per process and workers on every core are built; the log there says what is left.

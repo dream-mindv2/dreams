@@ -1,8 +1,8 @@
 # Native on many threads: the plan
 
-Status: **a plan; none of this is built.** Native still runs on one OS thread
-(`rt/main.dr`, "processes"). Read `aot.md` first. This was written from a reading of the
-runtime, without a prototype, so the costs below are predictions to be measured.
+Status: **being built; the log at the end says how far.** Read `aot.md` first. The plan was
+written from a reading of the runtime, without a prototype, so its costs were predictions; the
+log has the measurements.
 
 ## What was asked
 
@@ -205,3 +205,114 @@ build it before a measurement asks for it.
 - Machine: 24 cores here; aarch64 and macOS native remain unbuilt (`aot.md`), and the plan keeps
   their one new constraint, the acquire at shared thunks, written above.
 - `std.proc`/`spawn!`'s surface does not change. No program should need editing.
+
+## Log
+
+**2026-11-02: step 1, a heap per process on one thread.** Built as designed above, in
+`mind/std/rt/main.dr`:
+
+- Each process has its own chunk list, saved to its record when another runs (`save_heap!`,
+  `load_heap!`), and a collection is of the running process alone: its stack, its resume value and
+  the messages it has taken in. Its first allocation area is what is left of the segment its work
+  was copied into, then a budget that doubles at each collection from 4 KB to `min_chunk`. The first
+  process starts at `min_chunk`, so a program of one process allocates as before.
+- Chunks of a megabyte or less come from free lists by power of two, carved from 2 MB slabs
+  (`chunk_get!`); larger ones are mapped and the largest few freed are kept, as before.
+- `copy_out!` is the collector's walk with a log to put the source back. It writes a message,
+  a spawn's work and a monitor's `[:down, ..]` into segments the receiver takes in as chunks
+  (`take_mail!`), and promotes into the shared region: a process's answer, a kill's reason, the
+  foreign-handle table and every CAF's value. A thunk being evaluated arrives as an error, as on
+  the VM; a suspension in a message travels as itself.
+- **The shared region** starts at 4 GB and grows upwards by fixed mappings (`shared_more!`), so
+  the collector's test of an address is one compare against its end, a load from the world block.
+  It is not collected.
+- **A CAF is a shared thunk**: `[info, suspension, owner]`, whose suspension is never written.
+  Whoever claims it evaluates a copy in its own heap and promotes the answer
+  (`code_shared!`, `frame_shared_update!`). On a raise or a kill the claim is given back
+  (`frame_shared` in `unwind!`), so killing a process in the middle of a CAF poisons nothing: the
+  next process to ask evaluates it again. A suspension reached in a promotion becomes one too.
+  This answered the plan's open question about a raised CAF: it is evaluated again, not promoted
+  as raising.
+- Mailboxes, joiners and monitors are raw `malloc`ed lists, as other processes write them.
+- An error in the shared region is copied before `where` is written on it (`own_error!`).
+
+Found on the way: a tick yielded only when the run queue had something in it, so a process
+sleeping on a timer could not wake until a busy one finished. It now yields while anyone waits
+on a timer or a descriptor too.
+
+Measured A/B against the commit before, same VM, interleaved, ms, best of three
+(`benchmark/native/run.sh`, which is new):
+
+| | tree | maps | sorts | recs | strs | procs | fanout |
+|---|---|---|---|---|---|---|---|
+| before | 75 | 586 | 501 | 470 | 159 | 137 | 120 |
+| a heap each | 75 | 585 | 497 | 461 | 158 | 156 | 142 |
+
+`procs` pays 14% for copying and for a heap per process, against the VM's 939. The first try was
+1,267: every receive walked the whole mailbox looking for messages not yet taken in, which a
+pointer to the first such fixed, and then 229, from touching a fresh page for each of 50,000 live
+processes, which starting in the work's segment fixed. `fanout` is code placement: its IR is the
+same function for function, and built from the same IR with clang the two are within 3%.
+**The decision stands: go on to threads.**
+
+`dream/tests/programs/process_heaps.dr` holds the new behaviour to the VM's: a CAF from many
+processes, sharing kept in a copy, a closure, a big integer and a 200,000-element list through
+messages, a lazy answer joined twice, a CAF that depends on itself, a kill's reason, and a kill
+in the middle of a CAF.
+
+**2026-11-02: steps 2 and 3, the world block and workers.** Native programs now run on every core.
+
+- **The world block** (`@i_world`, `w_*` in `rt/main.dr`) holds what no one process owns: the
+  process table, now one mapping of 16M entries touched as it fills rather than reallocated under
+  readers; the handle table, the same at a million; the counts, by atomic add; the scheduler's
+  lock, condition and wake descriptor; and the libraries, terminals and foreign table opened, under
+  a lock of their own. The foreign table's read-modify-write moved into the runtime
+  (`foreign_put!`, `foreign_drop!`), as two workers adding a handle at once would lose one.
+- **Workers** start at the first `spawn!`: `DREAM_CORES` of them, as on the VM, or the cores the
+  process may run on. Each is an OS thread with a context of its own, so `p` is the worker and no
+  generated code changed. The tick thread sets every worker's guard from a table.
+- **A run queue a worker**; a wake pushes to the waker's own, and a worker with nothing takes half
+  of another's. Before sleeping it spins a while, but at most two do at once: a crowd of spinners
+  reading the queues slowed the worker running the root by a third.
+- **Parking is check-then-sleep without holding a lock across both**: a wake of a process that is
+  not parked yet sets `pcb_woken`, and the park that follows goes round again. A record's state,
+  mailbox, joiners, monitors, kill, `wake_at` and `wait_fd` are under its lock, which, like a run
+  queue's, is a word spun on. A mutex there cost a system call each time two workers met at one,
+  and on `procs` that was most of the run.
+- **Shared thunks** are claimed by compare-and-swap of the info, and a process that finds one
+  claimed by another parks on its list of waiters, woken when it is updated or given back.
+  Promotion is under one lock. The update stores the value, then the info with release.
+- **Waiting for the system**: one worker at a time asks `poll`, with the scheduler's lock, now and
+  then while others are busy and blocking when it has nothing else, the lock let go and an
+  `eventfd` in the set that a new waiter writes to. Timers are under each process's lock, so a
+  new one is not mistaken for one that ran out. The deadlock test is every worker counted idle,
+  nobody polling and nobody waiting on the system.
+- A callback from C finds its worker by a thread-specific key, and its function is promoted when the
+  stub is made, so any worker's process may be called back on and no collection moves it.
+- Small raw cells (a waiting message, a joiner) and first stacks are kept by the worker that freed
+  them: from `malloc`, each thread that freed one grew an arena of its own.
+
+Found on the way: a push made while holding the scheduler's lock -- a timer running out -- took the
+lock again to signal a sleeper, and the run hung with four workers or more. A worker now knows
+whether it holds that lock (`ctx_sched_held`).
+
+Measured A/B against the commit before step 1, same VM, interleaved, ms, best of three:
+
+| | tree | maps | sorts | recs | strs | procs | fanout |
+|---|---|---|---|---|---|---|---|
+| before | 74 | 588 | 504 | 471 | 159 | 144 | 121 |
+| 24 workers | 74 | 599 | 502 | 473 | 161 | 212 | 22 |
+| one worker | | | | | | 158 | 130 |
+
+`fanout` is 5.5 times faster, and its sixteen pieces are not of one size, so that is near what it
+can be. `procs` is one process exchanging a message with each of 50,000 others, which is serial
+by construction, and pays on many workers for handing each process to another core: 212 against
+158 on one and 939 on the VM. What is left of it is `malloc` of records and stacks on whichever
+thread the root has moved to, and the futex calls of waking sleepers.
+
+`dream/tests/programs/caf_race.dr` forces CAFs that depend on one another, a shared lazy list and
+a failing CAF from 64 processes at once; it and `process_heaps.dr` were run forty times each on 2
+and 24 workers with no difference from the VM. The whole program suite passes on 1, 3 and 24.
+
+Not done yet: the `epoll` poller and a pool of threads for calls that block a worker (step 4),
+pinning a foreign library's server to one thread (step 5), and a stress run with a faster tick.

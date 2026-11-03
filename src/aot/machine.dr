@@ -854,8 +854,11 @@ let function f g = {
             str.concat_all ["@c_", plain, " = internal constant <{ ptr }> <{ ptr @i_c", plain, " }>, align 8\n"],
         ],
     };
+    // A CAF is a shared thunk (`code_shared!` in rt/main.dr): every process may force it, and
+    // whoever does evaluates a copy of the suspension beside it, in its own heap.
     let cafs = if how == :caf {
-        [str.concat_all ["@caf_", plain, " = internal global <{ ptr, i64 }> <{ ptr ", info_symbol symbol, ", i64 1 }>, align 8\n"]]
+        [str.concat_all ["@caf_", plain, " = internal global <{ ptr, ptr, i64, i64 }> <{ ptr @i_shared, ptr @caft_", plain, ", i64 0, i64 0 }>, align 8\n"],
+         str.concat_all ["@caft_", plain, " = internal constant <{ ptr, i64 }> <{ ptr ", info_symbol symbol, ", i64 1 }>, align 8\n"]]
     } else { [] };
     drain (Gen.set_data (list.concat [cafs, infos, Gen.data g7]) g7)
 };
@@ -887,6 +890,10 @@ let fixed_infos g = {
      info_text "@i_raised" (rt "code_raised!") 0 1 0,
      info_text "@i_deferred2" (rt "code_deferred2!") 0 3 0,
      info_text "@i_update" (rt "frame_update!") 21 2 0,
+     info_text "@i_shared" (rt "code_shared!") 0 3 0,
+     info_text "@i_shared_hole" (rt "code_shared_hole!") 2 3 0,
+     info_text "@i_m_enter" (rt "m_enter!") 0 0 0,
+     info_text "@i_shared_update" (rt "frame_shared_update!") 24 2 0,
      info_text "@i_halt" (rt "code_halt!") 22 1 0,
      info_text "@i_retry" (rt "frame_resume_entry!") 0 0 0,
      info_text "@i_retry_call" (rt "frame_retry_call!") 0 5 0,
@@ -912,7 +919,7 @@ let fixed_infos g = {
 /// The functions the machine itself calls or lays out.
 let runtime_roots : [:string];
 let runtime_roots = ["init!", "alloc!", "enter!", "apply!", "raise!", "collect_at_entry!", "code_value!",
-                     "code_ind!", "code_hole!", "frame_update!", "code_halt!", "frame_apply_rest!", "code_raised!",
+                     "code_ind!", "code_hole!", "frame_update!", "code_shared!", "code_shared_hole!", "frame_shared_update!", "worker_loop!", "m_enter!", "code_halt!", "frame_apply_rest!", "code_raised!",
                      "code_deferred2!", "frame_catch_return!", "native_failed!", "not_bool!", "frame_resume_entry!",
                      "frame_retry_call!", "frame_enter_again!", "frame_start!", "join_m!", "recv_m!",
                      "await_message_m!", "sleep_until_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!", "tls_handshake_m!", "ffi_call_m!", "cb_enter!", "frame_cb_return!", "cb_raised!",
@@ -960,18 +967,31 @@ let to_ir user lib rt = {
     }
 };
 
-/// The clock that preempts. A store from another thread, with no synchronization
-/// because a late or a lost one costs only a later switch.
+/// The clock that preempts: every worker's guard, from a table `rt/main.dr` fills as it starts
+/// them. A store from another thread, with no synchronization because a late or a lost one costs
+/// only a later switch.
 let tick_text : :string;
 let tick_text = str.concat_all [
-    "@i_tick_target = internal global i64 0\n",
+    "@i_tick_targets = internal global [256 x i64] zeroinitializer, align 8\n",
+    "@i_tick_count = internal global i64 0\n",
     "declare i32 @usleep(i32)\n",
     "declare i32 @pthread_create(ptr, ptr, ptr, ptr)\n",
     "@dream_tick_handle = internal global i64 0\n",
     "define internal ptr @dream_tick(ptr %u) {\nentry:\n  br label %again\nagain:\n",
-    "  call i32 @usleep(i32 10000)\n  %t = load atomic i64, ptr @i_tick_target monotonic, align 8\n",
-    "  %q = inttoptr i64 %t to ptr\n  store atomic i64 -1, ptr %q monotonic, align 8\n  br label %again\n}\n",
+    "  call i32 @usleep(i32 10000)\n  %n = load atomic i64, ptr @i_tick_count monotonic, align 8\n  br label %each\n",
+    "each:\n  %i = phi i64 [ 0, %again ], [ %i1, %one ]\n  %more = icmp ult i64 %i, %n\n  br i1 %more, label %one, label %again\n",
+    "one:\n  %at = getelementptr i64, ptr @i_tick_targets, i64 %i\n  %t = load atomic i64, ptr %at monotonic, align 8\n",
+    "  %q = inttoptr i64 %t to ptr\n  store atomic i64 -1, ptr %q monotonic, align 8\n  %i1 = add i64 %i, 1\n  br label %each\n}\n",
     "define internal i64 @dream_start_tick() {\n  %r = call i32 @pthread_create(ptr @dream_tick_handle, ptr null, ptr @dream_tick, ptr null)\n  ret i64 0\n}\n"];
+
+/// A worker's thread: C's calling convention on the way in, then the scheduler, which never
+/// comes back. The context is the thread's argument.
+let worker_text : :string -> :string;
+let worker_text loop_ = str.concat_all [
+    "define internal ptr @dream_worker(ptr %c) {\nentry:\n  %v = ptrtoint ptr %c to i64\n",
+    "  %r = call tailcc i64 ", loop_, "(i64 %v, i64 0, i64 0, i64 0, i64 0, i64 0)\n  ret ptr null\n}\n",
+    "define internal i64 @dream_start_worker(i64 %c) {\nentry:\n  %h = alloca i64\n  %cp = inttoptr i64 %c to ptr\n",
+    "  %r = call i32 @pthread_create(ptr %h, ptr null, ptr @dream_worker, ptr %cp)\n  %w = sext i32 %r to i64\n  ret i64 %w\n}\n"];
 
 /// The C callbacks OpenSSL wants, which the dialect has no way to write. Each is reached
 /// through addresses `rt/main.dr` stores once it has opened the library. A certificate
@@ -1025,11 +1045,6 @@ let assemble user st unit_ lib_names entry = {
     let atom_count = str.concat_all ["@i_atom_count = internal constant i64 ", to_string (list.length atom_list), "\n"];
     let atom_table = str.concat_all ["@i_atoms = internal constant [", to_string (list.length atom_list), " x ptr] [",
         str.join_str ", " (list.map (fn [_, i] -> "ptr @atom" + to_string i) atom_list), "]\n"];
-    let caf_functions = list.filter (fn f -> core.Function.how f == :caf) (core.St.functions st);
-    let cafs = list.map (fn f -> {
-        let symbol = core.Function.symbol f;
-        str.concat_all ["ptr @caf_", str.slice 1 (len symbol - 1) symbol]
-    }) caf_functions;
     let table = image.data_table user;
     let payload_labels = list.flat_map (fn [i, row] -> match row.[2] {
         () => [],
@@ -1053,8 +1068,8 @@ let assemble user st unit_ lib_names entry = {
         str.join_str ", " (list.map (fn [_, i] -> "i64 " + to_string (match map.lookup i records { Option.some(r) => r.[0], _ => i })) atom_list), "]\n"];
     let display_table = str.concat_all ["@i_atom_display = internal constant [", to_string (list.length atom_list), " x ptr] [",
         str.join_str ", " (list.map (fn [_, i] -> if map.has i records { "ptr @shown" + to_string i } else { "ptr @atom" + to_string i }) atom_list), "]\n"];
-    let cafs_table = str.concat_all ["@i_cafs = internal constant <{ i64", str.concat_all (list.map (fn _ -> ", ptr") cafs),
-        " }> <{ i64 ", to_string (list.length cafs), str.concat_all (list.map (fn c -> ", " + c) cafs), " }>\n"];
+    // What no one process owns (the shared region's ends, in rt/main.dr).
+    let world = "@i_world = internal global [64 x i64] zeroinitializer, align 8\n";
     let arity = image.Func.arity (image.func user entry);
     let args = list.take 3 (list.replicate arity core.unit_word);
     let pad = list.replicate (3 - list.length args) "0";
@@ -1079,7 +1094,7 @@ let assemble user st unit_ lib_names entry = {
         [payload_table],
         floats,
         closures,
-        [atom_count, atom_table, types_table, display_table, cafs_table, tick_text, tls_text, cold_text (dialect.Unit.symbols unit_), callback_text (dialect.Unit.symbols unit_).["cb_enter!"]],
+        [atom_count, atom_table, types_table, display_table, world, tick_text, worker_text (dialect.Unit.symbols unit_).["worker_loop!"], tls_text, cold_text (dialect.Unit.symbols unit_), callback_text (dialect.Unit.symbols unit_).["cb_enter!"]],
         Gen.data g,
         [dialect.Unit.text unit_],
         list.reverse (Gen.code g),

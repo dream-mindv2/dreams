@@ -275,6 +275,35 @@ let primitive cx name args s = match name {
                 let [e, s2] = instr (str.concat_all ["inttoptr i64 ", end, " to ptr"]) s1;
                 strtod_call buf e s2
             },
+            // What threads share is reached through these. Every one is sequentially consistent
+            // but the acquire and release pair, which are what a published value needs: on
+            // x86-64 those are ordinary moves, and only the compiler is told not to reorder.
+            ["cas64!", [a, expected, v]] => {
+                let [p, s2] = instr (str.concat_all ["inttoptr i64 ", a, " to ptr"]) s1;
+                let [pair, s3] = instr (str.concat_all ["cmpxchg ptr ", p, ", i64 ", expected, ", i64 ", v, " seq_cst seq_cst"]) s2;
+                instr (str.concat_all ["extractvalue { i64, i1 } ", pair, ", 0"]) s3
+            },
+            ["xadd64!", [a, v]] => {
+                let [p, s2] = instr (str.concat_all ["inttoptr i64 ", a, " to ptr"]) s1;
+                instr (str.concat_all ["atomicrmw add ptr ", p, ", i64 ", v, " seq_cst"]) s2
+            },
+            ["xchg64!", [a, v]] => {
+                let [p, s2] = instr (str.concat_all ["inttoptr i64 ", a, " to ptr"]) s1;
+                instr (str.concat_all ["atomicrmw xchg ptr ", p, ", i64 ", v, " seq_cst"]) s2
+            },
+            ["load_acq!", [a]] => {
+                let [p, s2] = instr (str.concat_all ["inttoptr i64 ", a, " to ptr"]) s1;
+                instr (str.concat_all ["load atomic i64, ptr ", p, " acquire, align 8"]) s2
+            },
+            ["store_rel!", [a, v]] => {
+                let [p, s2] = instr (str.concat_all ["inttoptr i64 ", a, " to ptr"]) s1;
+                ["0", line (str.concat_all ["  store atomic i64 ", v, ", ptr ", p, " release, align 8"]) s2]
+            },
+            ["fence!", [_]] => ["0", line "  fence seq_cst" s1],
+            ["pause!", [_]] => ["0", line "  call void @llvm.x86.sse2.pause()" s1],
+            // A worker: an OS thread that runs the scheduler with a context of its own. Its body
+            // is in the machine's text, as it starts with C's calling convention.
+            ["start_worker!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_worker(i64 ", ctx, ")"]) s1,
             // A C `int` answer's top half is not promised to mean anything.
             ["sext32", [a]] => {
                 let [t, s2] = instr (str.concat_all ["trunc i64 ", a, " to i32"]) s1;
@@ -684,7 +713,7 @@ let to_ir img = {
 /// A C function's declaration, for each of the ones a unit called.
 let declarations : :map -> [:string];
 let declarations imports = list.append
-    ["declare double @llvm.fabs.f64(double)\n"]
+    ["declare double @llvm.fabs.f64(double)\n", "declare void @llvm.x86.sse2.pause()\n"]
     (list.map (fn [symbol, shape] -> match shape {
         :variadic => "declare i32 @snprintf(ptr, i64, ptr, ...)\n",
         :strtod => "declare double @strtod(ptr, ptr)\n",
