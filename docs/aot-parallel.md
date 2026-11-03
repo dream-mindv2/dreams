@@ -408,3 +408,35 @@ So nothing native keeps grows without a matching growth on the VM. Collecting th
 would mean knowing that no heap points into it, which is every heap traced, the global pause this
 design was chosen to avoid, or a census each process contributes at its own collections; it is
 worth building with process records that can be reaped, and not before.
+
+**2026-11-03: the census -- the shared region collected, finished processes reaped.** Each process
+reports at its own collections, as the VM's shared areas do (`request_census` in
+dream/src/scheduler.cpp is the pattern), and the census decides two things at once:
+
+- **The region is blocks of a megabyte** (`take_blocks!`), filled by promotion as a message fills
+  segments, a large object taking a run. A block nothing marked in a round, and nothing wrote to
+  since it began, has its pages given back (`madvise`) and is used again, so the region stays one
+  range and the collector's test one compare.
+- **A round** begins when the region has grown past what the last one kept, or 65,536 processes
+  have finished since. Every live process is then due: one running collects at its next function
+  entry, one parked is collected by whoever began the round, in a context kept for it, holding its
+  record so that nothing wakes it. That collection is the report: every shared object it meets is
+  marked and traced through the region, every pid's id noted. The last report marks the roots no
+  heap holds -- answers, kill reasons, CAFs (`@i_cafs` again), foreign handles, callbacks.
+- **A copy made during a round** -- a message, a spawn, a promotion -- marks what it leaves in
+  place and the pids it carries, so a reference cannot slip past by moving from a process yet to
+  report into one that has. A message not yet taken in is read at its owner's report.
+- **Reaping**: a finished process whose pid no heap held is gone, record and answer, since nobody
+  can join or monitor it again. A failure nobody joined stays, for the report at the end.
+
+One measured trap: marking was right and nothing was freed. A CAF's lazy list, forced a cell at a
+time between processes' answers, left one live cell in every block. Promotion now fills two sets of
+blocks -- what goes with a process (an answer, a kill's reason, a thunk inside them) and what lives
+for the run -- and a thunk's value goes where the thunk is (`shared_mode_of!`).
+
+300,000 processes each answering a 50-element list, joined in batches: the shared region kept holds
+at 45 MB from the fourth round on, and the run's peak memory is 179 MB on one worker where it was
+335 MB. Five times as many: 195 MB where it was 1.49 GB, and 4.83 s where it was 5.41.
+`DREAM_CENSUS_TRACE=1` says each round. `dream/tests/programs/census.dr` crosses a round and then
+uses what must survive it: a pid kept throughout, a pid that only travelled in a message, a monitor
+set up after, a CAF.
