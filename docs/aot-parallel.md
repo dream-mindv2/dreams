@@ -387,3 +387,24 @@ the stress of CAFs and of a kill in the middle of one, and the suites run on 1, 
 No race detector for generated code was found. Step 7 -- generational heaps per process, and
 sharing large immutable data by reference -- waits, as decision 7 says, for a measurement to
 ask for it.
+
+**2026-11-03: what the shared region keeps.** Asked whether to collect it, the first question was
+what grows in it that should not. In order of size:
+
+- **A finished process's answer** stays for as long as its record, and records are never freed --
+  on the VM too: `Runtime::retire_process` exists and nothing calls it, so every `exit_value` lives
+  as long as the run. Native is no worse here, and freeing either needs a rule for when a pid can no
+  longer be joined, which neither runtime has.
+- **The foreign-handle table** was a map promoted at every change, so every version of its path was
+  kept: hundreds of bytes for every handle made or released, where the VM keeps a C++ table. It is
+  raw memory now (`foreign_put!`, `foreign_get!`, `foreign_children!`, `foreign_owned!` in
+  `rt/main.dr`): an array of entries by id, each `malloc`ed and freed on release, the live ones
+  linked oldest first. A handle leaves nothing behind unless a field of it is an object, which no
+  address on x86-64 is.
+- **A shared thunk's suspension**, once it is evaluated, and a kill's reason: small, and once each.
+- **A CAF's value**: what it holds, which any runtime keeps.
+
+So nothing native keeps grows without a matching growth on the VM. Collecting the region itself
+would mean knowing that no heap points into it, which is every heap traced, the global pause this
+design was chosen to avoid, or a census each process contributes at its own collections; it is
+worth building with process records that can be reaped, and not before.
