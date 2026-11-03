@@ -453,3 +453,16 @@ set up after, a CAF.
   `$DREAM_LIBRARY_PATH`, the installation's `lib`, the loader, and Nix's profiles. On NixOS, where no
   loader knows of it, a native program using TLS found nothing unless told the file; the error now
   says where it looked.
+
+**2026-11-03: the stress the plan asked for.** `DREAM_TICK_US` sets the tick (10 ms by default,
+at least 50 us), and the program suite runs clean with it at 1 ms and 100 us on 2, 3 and 24
+workers. It found one thing, in `examples/16_registry`, which polls a registry 500 times for a
+server a supervisor is starting: on exactly two workers the server came after 260 to 670 asks
+where the VM, and native on any other count, needs two. A worker new to a size of chunk carved a
+whole 2 MB slab at once, writing a link into every chunk and faulting in all 512 pages, which held
+the supervisor's worker for the length of a tick in the middle of its first message. Slabs, and
+the cells messages wait in, are carved a chunk at a time now. Two changes to fairness came with
+it: a park that is woken before it sleeps goes to the back of the queue when others are waiting
+there, and every 64th receive that could go straight on gives way first if anything is queued,
+as the VM does after so many reductions. `DREAM_DUMP` prints every process's state when the first
+one fails.

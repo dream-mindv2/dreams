@@ -1399,17 +1399,19 @@ let to_ir user lib rt = {
 };
 
 /// The clock that preempts: every worker's guard, from a table `rt/main.dr` fills as it starts
-/// them. A store from another thread, with no synchronization because a late or a lost one costs
+/// them, every `@i_tick_us` microseconds (10 ms, or `DREAM_TICK_US`). A store from another thread, with no synchronization because a late or a lost one costs
 /// only a later switch.
 let tick_text : :string;
 let tick_text = str.concat_all [
     "@i_tick_targets = internal global [256 x i64] zeroinitializer, align 8\n",
     "@i_tick_count = internal global i64 0\n",
+    "@i_tick_us = internal global i64 10000\n",
     "declare i32 @usleep(i32)\n",
     "declare i32 @pthread_create(ptr, ptr, ptr, ptr)\n",
     "@dream_tick_handle = internal global i64 0\n",
     "define internal ptr @dream_tick(ptr %u) {\nentry:\n  br label %again\nagain:\n",
-    "  call i32 @usleep(i32 10000)\n  %n = load atomic i64, ptr @i_tick_count monotonic, align 8\n  br label %each\n",
+    "  %us = load i64, ptr @i_tick_us\n  %us32 = trunc i64 %us to i32\n  call i32 @usleep(i32 %us32)\n",
+    "  %n = load atomic i64, ptr @i_tick_count monotonic, align 8\n  br label %each\n",
     "each:\n  %i = phi i64 [ 0, %again ], [ %i1, %one ]\n  %more = icmp ult i64 %i, %n\n  br i1 %more, label %one, label %again\n",
     "one:\n  %at = getelementptr i64, ptr @i_tick_targets, i64 %i\n  %t = load atomic i64, ptr %at monotonic, align 8\n",
     "  %q = inttoptr i64 %t to ptr\n  store atomic i64 -1, ptr %q monotonic, align 8\n  %i1 = add i64 %i, 1\n  br label %each\n}\n",
