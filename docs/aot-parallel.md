@@ -466,3 +466,15 @@ it: a park that is woken before it sleeps goes to the back of the queue when oth
 there, and every 64th receive that could go straight on gives way first if anything is queued,
 as the VM does after so many reductions. `DREAM_DUMP` prints every process's state when the first
 one fails.
+
+**Reading regular files stays on the worker, measured.** Routed through the blocking pool, reading a
+200 MB file from the page cache took 435 ms in 4 KB reads where reading it directly took 59, and
+66 against 34 in 64 KB reads: two thread switches a read for a call that does not block. A slow
+disk would change the answer; nothing here has one to measure.
+
+**A callback from a thread C made** is refused, as on the VM: it answers zero without running and
+the call into C raises "in a callback passed to `f`: a callback was called from a thread other than
+the one that passed it" once it returns. Before, it ran on the context of the worker that made it,
+from another thread, while that worker might be running something else. `apply_on_thread` in
+`dream/tests/ffi/sample.c` calls one from a thread of its own, and the VM's two tiers and native
+print the same.
