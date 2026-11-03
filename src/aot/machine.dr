@@ -32,6 +32,16 @@ group Gen {
     rt : %{:string => :string},
     names : %{:string => :string},
     conts : %{:integer => :integer},
+    /// The block a `ret` branches to while an inner expression is compiled in line, or "".
+    join : :string,
+    /// Each such `ret` so far: `[block, word or "", double or ""]`.
+    leaves : [[:string]],
+    /// The functions with a worker taking doubles, and which of their parameters those are.
+    workers : %{:string => [:integer]},
+    /// Thunks made where they can be entered at most once, by the variable they are bound to,
+    /// and the thunks that have such an entry (`once`).
+    once_vars : :map,
+    once_syms : :map,
 }
 
 let args_text : [:string] -> :string;
@@ -434,8 +444,21 @@ let pushing extra sp g = match extra {
 /// Generate `e`, which ends the current block.
 let expr : core.Expr -> :map -> :string -> Gen -> Gen;
 let expr e env sp g = match e {
+    core.Expr.ret(a) if Gen.join g != "" => {
+        // In line: the value goes to the join block. A double goes by a block of its own, where
+        // it is boxed if the join turns out to need words (`join_point`).
+        let d = if float_atom env a { double_text env a } else { "" };
+        let w = match a { core.Atom.var(x) => match map.lookup x env { Option.some(t) => t, Option.none => "" }, _ => atom_text env a };
+        if d == "" { Gen.set_leaves (list.cons [Gen.label g, w, d] (Gen.leaves g)) g |> emit ("  br label %" + Gen.join g) }
+        else {
+            let [via, g1] = label_of "leaf" g;
+            Gen.set_leaves (list.cons [via, w, d] (Gen.leaves g1)) g1 |> emit ("  br label %" + via)
+        }
+    },
     core.Expr.ret(a) => answer sp (atom_text env a) g,
     core.Expr.enter(a) => jump (rt_symbol g "enter!") ["%p", sp, atom_text env a] g,
+    core.Expr.call(symbol, args) if worker_fits g symbol args env => call_worker symbol "0" args env sp g,
+    core.Expr.call_closure(f, symbol, args) if worker_fits g symbol args env => call_worker symbol (atom_text env f) args env sp g,
     core.Expr.call(symbol, args) => {
         let vals = list.map (atom_text env) args;
         let regs = list.take 3 vals;
@@ -498,6 +521,12 @@ let expr e env sp g = match e {
         let env1 = env.[float_key y => env.[float_key x]];
         expr rest (match map.lookup x env { Option.some(w) => env1.[y => w], Option.none => env1 }) sp g
     },
+    core.Expr.seq(x, live, inner, rest) if in_line inner && Gen.join g == "" => join_point x inner rest env sp g,
+    core.Expr.entry_force(core.Atom.var(v), x, _, _, body) if map.has (float_key v) env => {
+        // A double is evaluated: it is what it is called by now.
+        let env1 = env.[float_key x => env.[float_key v]];
+        expr body (match map.lookup v env { Option.some(w) => env1.[x => w], Option.none => env1 }) sp g
+    },
     core.Expr.entry_force(a, x, live, retry, body) => {
         let v = atom_text env a;
         let [low, g1] = instr (str.concat_all ["and i64 ", v, ", 7"]) g;
@@ -549,7 +578,7 @@ let expr e env sp g = match e {
                     |> Gen.set_pending (list.cons [symbol, live, x, rest] (Gen.pending g1));
         let [below, g3] = reserve sp size g2;
         let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr ", info, " to i64)"]) g3;
-        let g5 = list.fold (fn st [i, v] -> store_at below (8 * (i + 1)) env.[v] st) g4 (list.enumerate live);
+        let g5 = store_live below live env g4;
         expr inner env below g5
     },
     core.Expr.catching(x, live, body, handler, cleanup) => {
@@ -562,7 +591,7 @@ let expr e env sp g = match e {
                     |> Gen.set_pending (list.cons [symbol, live, x, handler] (Gen.pending g1));
         let [below, g3] = reserve sp size g2;
         let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr ", info, " to i64)"]) g3;
-        let g5 = list.fold (fn st [i, v] -> store_at below (8 * (i + 1)) env.[v] st) g4 (list.enumerate live);
+        let g5 = store_live below live env g4;
         expr body env below g5
     },
     core.Expr.bind(x, core.Rhs.native("to_float!", [a]), rest) => {
@@ -580,12 +609,392 @@ let expr e env sp g = match e {
             expr rest env.[x => v] sp g1
         }
     },
+    core.Expr.bind(x, core.Rhs.alloc(info, args), rest) if map.has x (Gen.once_vars g) => {
+        // Entered at most once: the entry that does not update it (`once_thunks`).
+        let [v, g1] = rhs (core.Rhs.alloc (info + "o") args) env sp g;
+        expr rest env.[x => v] sp g1
+    },
     core.Expr.bind(x, r, rest) => {
         let [v, g1] = rhs r env sp g;
         expr rest env.[x => v] sp g1
     },
     core.Expr.raised(a) => jump (rt_symbol g "raise!") ["%p", sp, str.concat_all ["ptrtoint (ptr ", Gen.place g, " to i64)"], atom_text env a, "0", "0"] g,
     core.Expr.raise_text(text) => jump (rt_symbol g "native_failed!") ["%p", sp, "0", "0", "0", "0"] g,
+};
+
+// --- join points -----------------------------------------------------------------------------
+//
+// A `seq` pushes a frame and its answer comes back through it, which is right when what it runs
+// may call, enter or apply and so leave the function. When it cannot -- only binds, choices,
+// raises and answers, as a small inlined function often is -- the frame is a store, a load and an
+// indirect jump for nothing, and its answer a box if it is a float. Such an inner expression is
+// compiled in line instead, each `ret` a branch to one block where a phi takes the value, a
+// double if every branch has one.
+
+let in_line : core.Expr -> :bool;
+let in_line e = match e {
+    core.Expr.ret(_) => true,
+    core.Expr.bind(_, _, rest) => in_line rest,
+    core.Expr.choose(_, yes, no) => in_line yes && in_line no,
+    core.Expr.raise_text(_) => true,
+    core.Expr.raised(_) => true,
+    _ => false,
+};
+
+let join_point : :integer -> core.Expr -> core.Expr -> :map -> :string -> Gen -> Gen;
+let join_point x inner rest env sp g = {
+    let [j, g1] = label_of "join" g;
+    let outer = Gen.leaves g1;
+    let g2 = expr inner env sp (g1 |> Gen.set_join j |> Gen.set_leaves []);
+    let leaves = list.reverse (Gen.leaves g2);
+    let g3 = g2 |> Gen.set_join "" |> Gen.set_leaves outer;
+    if list.is_empty leaves {
+        // Every way through raises: nothing joins, and nothing follows.
+        g3
+    } else if list.all (fn l -> l.[2] != "") leaves {
+        let g4 = list.fold (fn st l -> emit ("  br label %" + j) (start l.[0] st)) g3 leaves;
+        let [d, g5] = instr ("phi double " + phi_args (list.map (fn l -> [l.[2], l.[0]]) leaves)) (start j g4);
+        float_result x d rest env sp g5
+    } else {
+        // Not all doubles: every branch needs a word, and a double with none is boxed on its way.
+        let [ws, g4] = list.fold (fn [acc, st] l ->
+            if l.[2] == "" { [list.cons [l.[1], l.[0]] acc, st] }
+            else {
+                let st1 = start l.[0] st;
+                let [w, st2] = if l.[1] != "" { [l.[1], st1] } else { boxed_float l.[2] st1 };
+                [list.cons [w, Gen.label st2] acc, emit ("  br label %" + j) st2]
+            }) [[], g3] leaves;
+        let [v, g5] = instr ("phi i64 " + phi_args (list.reverse ws)) (start j g4);
+        expr rest env.[x => v] sp g5
+    }
+};
+
+let phi_args : [[:string]] -> :string;
+let phi_args pairs = str.join_str ", " (list.map (fn pr -> str.concat_all ["[ ", pr.[0], ", %", pr.[1], " ]"]) pairs);
+
+let double_text : :map -> core.Atom -> :string;
+let double_text env a = match a {
+    core.Atom.var(x) => env.[float_key x else ""],
+    _ => "",
+};
+
+// --- thunks entered once ------------------------------------------------------------------------
+//
+// A thunk is made so that its work is done once however often it is forced: entering it marks it
+// a hole, pushes a frame that writes the answer back, and leaves an indirection that each later
+// reader follows. When it can only be entered once, none of that is wanted. That is so when the
+// variable it is bound to is used once on any path, and that use forces it or hands it to a
+// parameter that is used so in turn -- `once_params`, a greatest fixed point over the program, as
+// a parameter is assumed so until something says otherwise. Such a thunk is made with a second
+// entry, `..o`, the same code without the update; a copy of it a message carries is still made
+// with that entry, and is still entered at most once, by whoever receives it.
+
+/// Every occurrence of `v` in `e` on its worst path, `[count, all good]`, where good is a force or
+/// an argument to a parameter in `once`.
+let occurs : :integer -> core.Expr -> :map -> [:integer, :bool];
+let occurs v e once = {
+    let in_atoms = fn atoms -> list.length (list.filter (fn a -> a == core.Atom.var v) atoms);
+    let bad = fn atoms -> { let n = in_atoms atoms; [n, n == 0] };
+    let plus = fn a b -> [a.[0] + b.[0], a.[1] && b.[1]];
+    let worst = fn a b -> [if a.[0] > b.[0] { a.[0] } else { b.[0] }, a.[1] && b.[1]];
+    let args_of = fn symbol args -> list.fold (fn acc [i, a] ->
+        if a == core.Atom.var v { [acc.[0] + 1, acc.[1] && map.has (once_key symbol i) once] } else { acc }) [0, true] (list.enumerate args);
+    match e {
+        core.Expr.enter(a) => [in_atoms [a], true],
+        core.Expr.ret(a) => bad [a],
+        core.Expr.raised(a) => bad [a],
+        core.Expr.raise_text(_) => [0, true],
+        core.Expr.call(symbol, args) => args_of symbol args,
+        core.Expr.call_closure(f, symbol, args) => plus (bad [f]) (args_of symbol args),
+        core.Expr.apply(f, args) => bad (list.cons f args),
+        core.Expr.entry_force(a, _, _, retry, body) =>
+            plus [in_atoms [a], true] (worst (occurs v body once) (occurs v retry once)),
+        core.Expr.choose(a, yes, no) => plus (bad [a]) (worst (occurs v yes once) (occurs v no once)),
+        core.Expr.seq(_, _, inner, rest) => plus (occurs v inner once) (occurs v rest once),
+        core.Expr.catching(_, _, body, handler, _) => plus (occurs v body once) (occurs v handler once),
+        core.Expr.bind(_, r, rest) => {
+            let n = list.length (list.filter (fn x -> x == v) (core.rhs_vars r));
+            plus [n, n == 0] (occurs v rest once)
+        },
+    }
+};
+
+let once_key : :string -> :integer -> :string;
+let once_key symbol i = symbol + "#" + to_string i;
+
+let used_once : :integer -> core.Expr -> :map -> :bool;
+let used_once v e once = { let [n, good] = occurs v e once; n <= 1 && good };
+
+/// The parameters used once, as `once_key`s: every parameter, less those found otherwise, until
+/// nothing changes.
+let once_params : [core.Function] -> :map;
+let once_params fs = {
+    let all = list.fold (fn m f -> list.fold (fn m1 [i, _] -> m1.[once_key (core.Function.symbol f) i => true]) m
+        (list.enumerate (core.Function.params f))) %{} fs;
+    once_round fs all
+};
+
+let once_round : [core.Function] -> :map -> :map;
+let once_round fs once = {
+    let next = list.fold (fn m f -> list.fold (fn m1 [i, p] ->
+        if map.has (once_key (core.Function.symbol f) i) once && not (used_once p (core.Function.body f) once) {
+            map.remove (once_key (core.Function.symbol f) i) m1
+        } else { m1 }) m (list.enumerate (core.Function.params f))) once fs;
+    if map.size next == map.size once { once } else { once_round fs next }
+};
+
+/// `[variables, thunk symbols]`: where a thunk is made that is entered at most once.
+let once_thunks : [core.Function] -> [:map, :map];
+let once_thunks fs = {
+    let thunks = list.fold (fn m f -> if core.Function.how f == :thunk { m.[core.Function.symbol f => true] } else { m }) %{} fs;
+    let once = once_params fs;
+    list.fold (fn acc f -> once_sites (core.Function.body f) thunks once acc) [%{}, %{}] fs
+};
+
+let once_sites : core.Expr -> :map -> :map -> [:map, :map] -> [:map, :map];
+let once_sites e thunks once acc = match e {
+    core.Expr.bind(x, core.Rhs.alloc(info, _), rest) if map.has info thunks => {
+        let acc1 = if used_once x rest once { [acc.[0].[x => true], acc.[1].[info => true]] } else { acc };
+        once_sites rest thunks once acc1
+    },
+    core.Expr.bind(_, _, rest) => once_sites rest thunks once acc,
+    core.Expr.choose(_, yes, no) => once_sites no thunks once (once_sites yes thunks once acc),
+    core.Expr.seq(_, _, inner, rest) => once_sites rest thunks once (once_sites inner thunks once acc),
+    core.Expr.entry_force(_, _, _, retry, body) => once_sites retry thunks once (once_sites body thunks once acc),
+    core.Expr.catching(_, _, body, handler, _) => once_sites handler thunks once (once_sites body thunks once acc),
+    _ => acc,
+};
+
+/// A thunk's entry that does not update it: the same code, with no frame and no hole.
+let thunk_once : core.Function -> Gen -> Gen;
+let thunk_once f g = {
+    let symbol = core.Function.symbol f;
+    let osym = symbol + "o";
+    let captures = core.Function.captures f;
+    let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry";
+    let g1 = safepoint osym 0 g0;
+    let [env, g2] = list.fold (fn [m, st] [i, v] -> {
+        let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
+        [m.[v => loaded], st1]
+    }) [%{}, g1] (list.enumerate captures);
+    let g3 = expr (core.Function.body f) env "%sp0" g2;
+    let size = if list.is_empty captures { 1 } else { list.length captures };
+    let g4 = finish osym (emit (str.concat_all ["; ", core.Function.name f, " (entered once)"]) g3);
+    drain (Gen.set_data (list.cons (info_text (info_symbol osym) osym 0 size 0) (Gen.data g4)) g4)
+};
+
+// --- workers: floats across calls -------------------------------------------------------------
+//
+// A function whose parameters among the first three are used as floats -- an operand of float
+// arithmetic with another float -- gets a worker beside it, `@..w`, which takes those as doubles,
+// their bits in the registers. A call with doubles in hand goes to the worker; everything else
+// goes to the function as before, which asks at its entry whether those arguments are floats and,
+// if they are, goes on in the worker. So a loop carrying a float stays in the worker, and
+// whatever reaches it as a value -- a closure, a retry -- finds its way there too.
+//
+// The collector must never see a double where a word belongs. Parameters past the third are on
+// the stack, which it scans, so only registers are doubles; at the worker's safepoint the doubles
+// are boxed and the function proper is what runs again; and a frame takes a double's box
+// (`store_live`), made where the frame is.
+
+let float_params : core.Function -> [:integer];
+let float_params f = if core.Function.how f != :function { [] } else {
+    let params = list.take 3 (core.Function.params f);
+    let assumed = float_vars (core.Function.body f) (list.fold (fn m v -> m.[v => true]) %{} params);
+    let used = float_operands (core.Function.body f) assumed %{};
+    list.map (fn pr -> pr.[0]) (list.filter (fn [i, v] -> map.has v used) (list.enumerate params))
+};
+
+let float_known : :map -> core.Atom -> :bool;
+let float_known floats a = match a {
+    core.Atom.var(x) => map.has x floats,
+    core.Atom.address(name) => str.starts_with "@flt" name,
+    _ => false,
+};
+
+/// The variables `e` makes floats, given those already known.
+let float_vars : core.Expr -> :map -> :map;
+let float_vars e floats = match e {
+    core.Expr.bind(x, core.Rhs.native("to_float!", _), rest) => float_vars rest floats.[x => true],
+    core.Expr.bind(x, core.Rhs.arith(op, a, b), rest) =>
+        float_vars rest (if op != "mod" && float_known floats a && float_known floats b { floats.[x => true] } else { floats }),
+    core.Expr.bind(_, _, rest) => float_vars rest floats,
+    core.Expr.choose(_, yes, no) => float_vars no (float_vars yes floats),
+    core.Expr.seq(x, _, inner, rest) => {
+        let f1 = float_vars inner floats;
+        float_vars rest (if answers_float inner f1 { f1.[x => true] } else { f1 })
+    },
+    core.Expr.entry_force(core.Atom.var(v), x, _, _, body) => float_vars body (if map.has v floats { floats.[x => true] } else { floats }),
+    core.Expr.entry_force(_, _, _, _, body) => float_vars body floats,
+    core.Expr.catching(_, _, body, handler, _) => float_vars handler (float_vars body floats),
+    _ => floats,
+};
+
+let answers_float : core.Expr -> :map -> :bool;
+let answers_float e floats = match e {
+    core.Expr.ret(a) => float_known floats a,
+    core.Expr.bind(_, _, rest) => answers_float rest floats,
+    core.Expr.choose(_, yes, no) => answers_float yes floats && answers_float no floats,
+    _ => false,
+};
+
+/// The variables `e` uses as an operand of float arithmetic with a float.
+let float_operands : core.Expr -> :map -> :map -> :map;
+let float_operands e floats used = match e {
+    core.Expr.bind(_, core.Rhs.arith(op, a, b), rest) => {
+        let u1 = if op != "mod" && float_known floats a && float_known floats b {
+            list.fold (fn m v -> m.[v => true]) used (list.append (core.atom_vars a) (core.atom_vars b))
+        } else { used };
+        float_operands rest floats u1
+    },
+    core.Expr.bind(_, _, rest) => float_operands rest floats used,
+    core.Expr.choose(_, yes, no) => float_operands no floats (float_operands yes floats used),
+    core.Expr.seq(_, _, inner, rest) => float_operands rest floats (float_operands inner floats used),
+    core.Expr.entry_force(core.Atom.var(v), x, _, _, body) => {
+        let u1 = float_operands body floats used;
+        if map.has x u1 { u1.[v => true] } else { u1 }
+    },
+    core.Expr.entry_force(_, _, _, _, body) => float_operands body floats used,
+    core.Expr.catching(_, _, body, handler, _) => float_operands handler floats (float_operands body floats used),
+    _ => used,
+};
+
+let worker_symbol : :string -> :string;
+let worker_symbol symbol = symbol + "w";
+
+/// Whether a call to `symbol` can go to its worker: it has one, and every argument the worker
+/// takes as a double is one here.
+let worker_fits : Gen -> :string -> [core.Atom] -> :map -> :bool;
+let worker_fits g symbol args env = match map.lookup symbol (Gen.workers g) {
+    Option.none => false,
+    Option.some(mask) => list.all (fn i -> i < list.length args && double_text env args.[i] != "") mask,
+};
+
+let call_worker : :string -> :string -> [core.Atom] -> :map -> :string -> Gen -> Gen;
+let call_worker symbol closure args env sp g = {
+    let mask = (Gen.workers g).[symbol];
+    let [vals, g1] = list.fold (fn [acc, st] [i, a] ->
+        if list.contains i mask {
+            let [bits, st1] = instr (str.concat_all ["bitcast double ", double_text env a, " to i64"]) st;
+            [list.cons bits acc, st1]
+        } else {
+            let [w, st1] = word_of env a st;
+            [list.cons w acc, st1]
+        }) [[], g] (list.enumerate args);
+    let all = list.reverse vals;
+    let regs = list.take 3 all;
+    let [below, g2] = pushing (list.drop 3 all) sp g1;
+    let pad = list.replicate (3 - list.length regs) "0";
+    jump (worker_symbol symbol) (list.concat [["%p", below, closure], regs, pad]) g2
+};
+
+/// An atom's word, boxing a double that has none.
+let word_of : :map -> core.Atom -> Gen -> [:string, Gen];
+let word_of env a g = match a {
+    // Only a double with no word is boxed; anything else is the word, read as lazily as before.
+    core.Atom.var(x) => if map.has (float_key x) env && not (map.has x env) { boxed_float env.[float_key x] g } else { [env.[x], g] },
+    _ => [atom_text env a, g],
+};
+
+/// A frame's words, each live variable's: a double with no box gets one here.
+let store_live : :string -> [:integer] -> :map -> Gen -> Gen;
+let store_live below live env g = list.fold (fn st [i, v] -> {
+    let [w, st1] = word_of env (core.Atom.var(v)) st;
+    store_at below (8 * (i + 1)) w st1
+}) g (list.enumerate live);
+
+let registers_of : [:string];
+let registers_of = ["%b", "%c", "%d"];
+
+/// At the function's entry: if the worker's arguments are floats, go on there.
+let to_worker : :string -> [:integer] -> Gen -> Gen;
+let to_worker symbol mask g = {
+    let [yes, g1] = label_of "worker" g;
+    let [no, g2] = label_of "generic" g1;
+    let [checks, g3] = list.fold (fn [acc, st] i -> {
+        let r = registers_of.[i];
+        let [ok, st1] = is_float_word r st;
+        [list.cons ok acc, st1]
+    }) [[], g2] mask;
+    let [all, g4] = list.fold (fn [acc, st] c -> if acc == "" { [c, st] } else { instr (str.concat_all ["and i1 ", acc, ", ", c]) st }) ["", g3] checks;
+    let g5 = start yes (emit (str.concat_all ["  br i1 ", all, ", label %", yes, ", label %", no]) g4);
+    let [args, g6] = list.fold (fn [acc, st] i -> {
+        let r = registers_of.[i];
+        if list.contains i mask {
+            let [bits, st1] = load_at r 8 st;
+            [list.append acc [bits], st1]
+        } else { [list.append acc [r], st] }
+    }) [[], g5] [0, 1, 2];
+    start no (jump (worker_symbol symbol) (list.concat [["%p", "%sp0", "%a"], args]) g6)
+};
+
+/// Whether a word is a boxed float, as an `i1`, computed without a branch and without reading
+/// what is not an object.
+let is_float_word : :string -> Gen -> [:string, Gen];
+let is_float_word r g = {
+    let [low, g1] = instr (str.concat_all ["and i64 ", r, ", 7"]) g;
+    let [obj, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g1;
+    let [nz, g3] = instr (str.concat_all ["icmp ne i64 ", r, ", 0"]) g2;
+    let [both, g4] = instr (str.concat_all ["and i1 ", obj, ", ", nz]) g3;
+    let [at, g5] = instr (str.concat_all ["select i1 ", both, ", i64 ", r, ", i64 ptrtoint (ptr @flt_zero to i64)"]) g4;
+    let [info, g6] = load_at at 0 g5;
+    let [same, g7] = instr (str.concat_all ["icmp eq i64 ", info, ", ptrtoint (ptr @i_float to i64)"]) g6;
+    instr (str.concat_all ["and i1 ", both, ", ", same]) g7
+};
+
+/// The worker of `f`: the same body, with the parameters in `mask` doubles.
+let worker : core.Function -> [:integer] -> Gen -> Gen;
+let worker f mask g = {
+    let symbol = core.Function.symbol f;
+    let wsym = worker_symbol symbol;
+    let params = core.Function.params f;
+    let captures = core.Function.captures f;
+    let arity = list.length params;
+    let extra = if arity > 3 { arity - 3 } else { 0 };
+    let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry";
+    let g1 = worker_safepoint symbol mask extra g0;
+    let [env0, g2] = list.fold (fn [m, st] [i, v] ->
+        if i >= 3 {
+            let [loaded, st1] = load_at "%sp0" (8 * (i - 3)) st;
+            [m.[v => loaded], st1]
+        } else if list.contains i mask {
+            let [d, st1] = instr (str.concat_all ["bitcast i64 ", registers_of.[i], " to double"]) st;
+            if stays_unboxed v (core.Function.body f) { [m.[float_key v => d], st1] }
+            else {
+                // Needed as a word too: boxed once, here.
+                let [o, st2] = boxed_float d st1;
+                [m.[float_key v => d].[v => o], st2]
+            }
+        } else { [m.[v => registers_of.[i]], st] }) [%{}, g1] (list.enumerate params);
+    let [env1, g3] = list.fold (fn [m, st] [i, v] -> {
+        let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
+        [m.[v => loaded], st1]
+    }) [env0, g2] (list.enumerate captures);
+    let [sp, g4] = instr (str.concat_all ["add i64 %sp0, ", to_string (8 * extra)]) g3;
+    let g5 = expr (core.Function.body f) env1 sp g4;
+    drain (finish wsym (emit (str.concat_all ["; ", core.Function.name f, " (worker)"]) g5))
+};
+
+/// A worker's safepoint: when the guard says stop, its doubles are boxed and the function proper
+/// is what runs again after, with words, which comes back here at its entry.
+let worker_safepoint : :string -> [:integer] -> :integer -> Gen -> Gen;
+let worker_safepoint symbol mask extra g = {
+    let [guard_at, g0a] = instr "add i64 %p, 16" g;
+    let [guard_ptr, g0b] = instr (str.concat_all ["inttoptr i64 ", guard_at, " to ptr"]) g0a;
+    let [guard, g1] = instr ("load volatile i64, ptr " + guard_ptr) g0b;
+    let [asked, g2] = instr (str.concat_all ["icmp ult i64 %sp0, ", guard]) g1;
+    let [collect, g3] = label_of "collect" g2;
+    let [go_on, g4] = label_of "go" g3;
+    let g5 = start collect (emit (str.concat_all ["  br i1 ", asked, ", label %", collect, ", label %", go_on]) g4);
+    let [regs, g6] = list.fold (fn [acc, st] i ->
+        if list.contains i mask {
+            let [d, st1] = instr (str.concat_all ["bitcast i64 ", registers_of.[i], " to double"]) st;
+            let [o, st2] = boxed_float d st1;
+            [list.append acc [o], st2]
+        } else { [list.append acc [registers_of.[i]], st] }) [[], g5] [0, 1, 2];
+    let g7 = store_at "%p" 24 (str.concat_all ["ptrtoint (ptr ", symbol, " to i64)"]) g6;
+    let g8 = store_at "%p" 32 (to_string extra) g7;
+    start go_on (jump (rt_symbol g8 "collect_at_entry!") (list.concat [["%p", "%sp0", "%a"], regs]) g8)
 };
 
 // --- floats in registers ------------------------------------------------------------------
@@ -631,11 +1040,20 @@ let boxed_float d g = {
 let float_result : :integer -> :string -> core.Expr -> :map -> :string -> Gen -> Gen;
 let float_result x d rest env sp g = {
     let env1 = env.[float_key x => d];
-    if stays_unboxed x rest { expr rest env1 sp g }
+    // Answered to a join point, a double needs no box either: the join decides.
+    if stays_unboxed x rest || (Gen.join g != "" && answers_only x rest) { expr rest env1 sp g }
     else {
         let [o, g1] = boxed_float d g;
         expr rest env1.[x => o] sp g1
     }
+};
+
+/// Whether `e` reads `x` only by answering it, after binds that do not read it.
+let answers_only : :integer -> core.Expr -> :bool;
+let answers_only x e = match e {
+    core.Expr.ret(core.Atom.var(y)) => y == x,
+    core.Expr.bind(_, r, rest) => not (list.contains x (core.rhs_vars r)) && answers_only x rest,
+    _ => false,
 };
 
 /// Whether `x` is read in `e` only by arithmetic that takes a double.
@@ -651,6 +1069,10 @@ let stays_unboxed x e = {
         core.Expr.choose(a, yes, no) => absent (core.atom_vars a) && stays_unboxed x yes && stays_unboxed x no,
         core.Expr.seq(y, _, core.Expr.enter(core.Atom.var(z)), rest) if z == x => stays_unboxed x rest && stays_unboxed y rest,
         core.Expr.seq(_, live, inner, _) => absent live && stays_unboxed x inner,
+        // Forcing another parameter: the way that waits keeps `x` in a frame, boxed then
+        // (`store_live`), and the way that does not is the one that matters.
+        core.Expr.entry_force(core.Atom.var(v), y, _, _, body) =>
+            if v == x { stays_unboxed x body && stays_unboxed y body } else { stays_unboxed x body },
         _ => not (map.has x (core.free e)),
     }
 };
@@ -730,7 +1152,7 @@ let frame_for x live rest env sp g = {
     };
     let [below, g3] = reserve sp size g2;
     let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr @i_k", to_string n, " to i64)"]) g3;
-    [below, "@k" + to_string n, list.fold (fn st [i, v] -> store_at below (8 * (i + 1)) env.[v] st) g4 (list.enumerate live)]
+    [below, "@k" + to_string n, store_live below live env g4]
 };
 
 let inline_budget = 64;
@@ -843,8 +1265,13 @@ let function f g = {
         let [owner, h5] = load_at "%p" 120 h4;
         [below, store_at "%a" 8 owner h5]
     };
-    let g6 = expr (core.Function.body f) env2 sp1 g5;
-    let g7 = finish symbol (emit (str.concat_all ["; ", core.Function.name f]) g6);
+    let mask = (Gen.workers g).[symbol else []];
+    let g5a = if how == :function && not (list.is_empty mask) { to_worker symbol mask g5 } else { g5 };
+    let g6 = expr (core.Function.body f) env2 sp1 g5a;
+    let g6a = finish symbol (emit (str.concat_all ["; ", core.Function.name f]) g6);
+    let g7 = if how == :function && not (list.is_empty mask) { worker f mask g6a }
+        else if how == :thunk && map.has symbol (Gen.once_syms g) { thunk_once f g6a }
+        else { g6a };
     let infos = match how {
         :thunk => [info_text (info_symbol symbol) symbol 0 (if list.is_empty captures { 1 } else { list.length captures }) 0],
         :caf => [info_text (info_symbol symbol) symbol 0 1 0],
@@ -880,6 +1307,8 @@ let fixed_infos g = {
      info_text "@i_pap" (rt "code_value!") 4 0 0,
      info_text "@i_cons" (rt "code_value!") 5 2 0,
      info_text "@i_float" (rt "code_value!") 6 1 0,
+     // What a word that is no object is read as, by a test that must not branch (`is_float_word`).
+     "@flt_zero = internal constant <{ i64, i64 }> zeroinitializer, align 8\n",
      info_text "@i_string" (rt "code_value!") 7 0 0,
      info_text "@i_array" (rt "code_value!") 8 0 0,
      info_text "@i_record" (rt "code_value!") 9 0 0,
@@ -1043,7 +1472,10 @@ let assemble user st unit_ lib_names entry = {
         (list.fold (fn m name -> m.["@m_" + name => (dialect.Unit.symbols unit_).[name]])
             %{"@raise!" => (dialect.Unit.symbols unit_).["raise!"]} (map.keys core.machine_natives))
         (map.keys (core.St.needed_lib st));
-    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{};
+    let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
+        %{} (core.St.functions st);
+    let [once_vars, once_syms] = once_thunks (core.St.functions st);
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] workers once_vars once_syms;
     let g = list.fold (fn g1 f -> function f g1) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
     let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));

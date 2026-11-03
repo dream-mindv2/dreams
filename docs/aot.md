@@ -211,3 +211,37 @@ natives are in, so nothing is refused now but what loads bytecode at run time.
 
 **Many threads.** `aot-parallel.md` is the plan and its log: M:N green processes, a heap per process
 rather than a stop-the-world collector, no language-level async. A heap per process and workers on every core are built; the log there says what is left.
+
+**2026-11-03: join points, floats across calls, thunks entered once.** Three of the "not done" above,
+in `aot/machine.dr`, each A/B'd against the commit before:
+
+- **Join points.** A `seq` whose inner expression cannot leave the function -- only binds, choices,
+  raises and answers, which is what a small inlined function often is -- no longer pushes a frame
+  and comes back through it. It is compiled in line, each answer a branch to one block whose phi
+  takes the value, a double if every branch has one. `num.to_float` in a loop was a frame, an
+  indirect jump and a box each time.
+- **Workers.** A function whose first three parameters include floats -- used as an operand of
+  float arithmetic with another float -- gets a worker, `@..w`, taking those as doubles. A call with
+  doubles in hand goes to the worker; the function proper asks at its entry whether its arguments
+  are floats and goes on in the worker if so, which is how a closure call or a retry gets there. The
+  collector never sees a double: only registers carry them, the worker's safepoint boxes them and
+  runs the function proper again, and a frame boxes what it keeps (`store_live`).
+- **Thunks entered once.** A thunk whose variable is used once on any path, and that use forces it
+  or hands it to a parameter used so in turn (a greatest fixed point over the program), is made with
+  a second entry that does not push the update frame or write the hole. Before, updates were up to
+  5% of a run (`tree`, `strs`).
+
+| ms, in-program | fib | sum | collatz | pi | strbuild | mapfilter | bytescan |
+|---|---|---|---|---|---|---|---|
+| before | 18 | 39 | 42 | 38 | 72 | 2 | 16 |
+| now | 14 | 25 | 30 | 19 | 67 | 2 | 16 |
+
+`pi` now beats the VM's JIT (28). A self-recursive loop carrying two floats went from 171 ms to 97,
+against the VM's 147. Of the programs in `benchmark/native`: `tree` 74 to 65, `sorts`, `recs` and
+`strs` 2-3% faster, `maps` the same.
+
+Not built, and why: **returning records in registers** and **stack allocation of what does not
+escape**. No program measured here returns a record that is not then stored in a list or a tree,
+which needs it on the heap anyway, and what does not escape is mostly floats, which stay in
+registers already. Stack allocation would also break the rule `move_stack!` relies on, that nothing
+holds an address on a stack.
