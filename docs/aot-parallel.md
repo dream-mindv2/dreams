@@ -440,3 +440,16 @@ at 45 MB from the fourth round on, and the run's peak memory is 179 MB on one wo
 `DREAM_CENSUS_TRACE=1` says each round. `dream/tests/programs/census.dr` crosses a round and then
 uses what must survive it: a pid kept throughout, a pid that only travelled in a message, a monitor
 set up after, a CAF.
+
+**2026-11-03: two loose ends.**
+
+- **`procs`** spent 113 ms of its time starting 50,000 processes, nearly all of it the kernel's:
+  each process's first stack was 32 KB from `malloc`, and the page at its top was a fault of its
+  own, 67,000 of them. A first stack is 2 KB now, and a small stack keeps half of itself below the
+  guard for what is pushed between two entries (the largest frame in the programs here is 48 bytes).
+  Starting them takes 66 ms on one worker, and the whole run is 126-151 ms on 24, from 220: faster
+  than it was on one thread before any of this (145).
+- **OpenSSL** is looked for as the VM looks for a library on the system: `$DREAM_OPENSSL_LIB`, then
+  `$DREAM_LIBRARY_PATH`, the installation's `lib`, the loader, and Nix's profiles. On NixOS, where no
+  loader knows of it, a native program using TLS found nothing unless told the file; the error now
+  says where it looked.
