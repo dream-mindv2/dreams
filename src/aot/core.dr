@@ -1114,6 +1114,7 @@ let host_member_list = [
     ["std.vm.sleep_until!", "sleep_until_m!"],
     ["std.vm.kill!", "kill_value!"],
     ["std.vm.share!", "share!"],
+    ["std.vm.intern_atom!", "vm_intern_atom!"],
     ["std.vm.regex_run", "regex_run!"],
     ["std.ffi.function", "ffi_function!"],
     ["std.ffi.pure_function", "ffi_pure_function!"],
@@ -1492,6 +1493,10 @@ let builtin_value cx id s = {
         _ => match name {
             "raise!" => wrapper_of_library cx "raise_any!" s,
             "_list_cons" => wrapper_of_library cx "cons_of" s,
+            "_match_is_cons" => wrapper_of_library cx "is_cons_of" s,
+            "_list_is_empty" => wrapper_of_library cx "is_empty_of" s,
+            "_match_head" => wrapper_of_library cx "head_of" s,
+            "_match_tail" => wrapper_of_library cx "tail_of" s,
             _ => [Atom.word unit_word, refuse_in cx.[:name] (str.concat_all ["the builtin `", name, "` as a value is not compiled yet"]) s],
         },
     }

@@ -1520,7 +1520,7 @@ let assemble user st unit_ lib_names entry arch = {
     let display_table = str.concat_all ["@i_atom_display = internal constant [", to_string (list.length atom_list), " x ptr] [",
         str.join_str ", " (list.map (fn [_, i] -> if map.has i records { "ptr @shown" + to_string i } else { "ptr @atom" + to_string i }) atom_list), "]\n"];
     // What no one process owns (the shared region's ends, in rt/main.dr).
-    let world = "@i_world = internal global [64 x i64] zeroinitializer, align 8\n";
+    let world = "@i_world = internal global [80 x i64] zeroinitializer, align 8\n";
     // Every CAF, for the census of the shared region to start from.
     let cafs = list.map (fn f -> "ptr @caf_" + str.slice 1 (len (core.Function.symbol f) - 1) (core.Function.symbol f))
         (list.filter (fn f -> core.Function.how f == :caf) (core.St.functions st));
