@@ -6,6 +6,10 @@
 # that is the list of what to build next.
 #
 #   image=... DREAM=... AOT_FLAGS=--release dreams/tests/aot_programs.sh [PATTERN]
+#
+# For another machine, the flags name it and the runner runs what is built, an emulator:
+#
+#   AOT_FLAGS="--target aarch64" AOT_RUNNER="qemu-aarch64 -L SYSROOT" dreams/tests/aot_programs.sh
 
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +18,7 @@ export dream="$(realpath "${DREAM:-$root/build-dream/bin/dream}")"
 export image="$(realpath "${image:-$root/build/dreams.dream}")"
 export root
 export AOT_FLAGS="${AOT_FLAGS:-}"
+export AOT_RUNNER="${AOT_RUNNER:-}"
 export dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
 pattern="${1:-}"
@@ -30,7 +35,7 @@ one() {
   fi
   # What it printed is what is held to account: a program may mean to fail, and its
   # expected output then says so.
-  (ulimit -v 16000000; timeout -s KILL 30 "$dir/$name") >"$dir/$name.out" 2>&1 </dev/null
+  (ulimit -v 16000000; timeout -s KILL 60 ${AOT_RUNNER:-} "$dir/$name") >"$dir/$name.out" 2>&1 </dev/null
   if diff -q "$dir/$name.out" "${src%.dr}.expected" >/dev/null; then
     echo pass > "$dir/$name.verdict"
   else

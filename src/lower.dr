@@ -2222,6 +2222,14 @@ let dispatch arms suffixes held chain l = {
     }
 };
 
+/// Whether a pattern matches whatever it is given: `_`, a name, or either named again.
+let rec always_matches p = match p {
+    [:wildcard, _] => true,
+    [:bind, _, _] => true,
+    [:as_p, inner, _, _, _] => always_matches inner,
+    _ => false,
+};
+
 let rec lower_arms arms held span l =
     match arms {
         // Nothing matched. Exhaustiveness is checked only where the checker
@@ -2254,7 +2262,7 @@ let rec lower_arms arms held span l =
                 match ast.arm_guard arm {
                     () => {
                         let body = lower_expr (ast.arm_body arm) (list.head bound);
-                        [list.head body, list.append (list.nth 1 bound) [list.nth 1 body]]
+                        [list.head body, list.append (list.nth 1 bound) [list.nth 1 body], ()]
                     },
                     g => {
                         let cond = lower_expr g (list.head bound);
@@ -2270,7 +2278,7 @@ let rec lower_arms arms held span l =
                         [inherit (list.nth 1 made)
                                  [list.nth 1 cond, list.nth 1 body, list.nth 1 fallback]
                                  (list.head made),
-                         list.append (list.nth 1 bound) [list.nth 1 made]]
+                         list.append (list.nth 1 bound) [list.nth 1 made], fallback]
                     },
                 };
 
@@ -2283,8 +2291,18 @@ let rec lower_arms arms held span l =
             // A guarded arm has folded the rest of them into its guard's false
             // branch, but that does not cover a pattern that fails before the
             // guard is ever asked: the rest must also be reachable from the
-            // pattern test's false path, guard or no guard.
-            let otherwise = lower_arms rest held span blocked;
+            // pattern test's false path, guard or no guard. A pattern that cannot
+            // fail -- `k if k == ..` -- has no such path, and lowering the rest a
+            // second time there made a chain of guarded arms exponential: eighteen
+            // overflowed the compiler's stack. Its false branch is the failure,
+            // never taken, and the rest's starts are the ones under the guard.
+            let otherwise = match list.nth 2 taken {
+                () => lower_arms rest held span blocked,
+                fallback => if always_matches (ast.arm_pattern arm) {
+                    let failed = lower_arms [] held span blocked;
+                    [list.head failed, list.nth 1 failed, list.nth 2 fallback]
+                } else { lower_arms rest held span blocked },
+            };
             let made = emit (ir.node :if test (list.nth 1 block) (list.nth 1 otherwise))
                             (list.head otherwise);
             [set_flag test ir.f_strict

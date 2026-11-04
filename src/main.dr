@@ -1129,6 +1129,15 @@ let runtime_file! o name = {
     match found { [first, .._] => first, [] => () }
 };
 
+/// The machine `--target` names for `--aot`, by the architecture it gives, or `()` for this one.
+let aot_target : :any -> :any;
+let aot_target targets = {
+    let given = match targets { () => [], ts => ts };
+    if list.any (fn t -> str.contains_str "aarch64" t || str.contains_str "arm64" t) given { "aarch64-linux" }
+    else if list.any (fn t -> str.contains_str "x86_64" t) given { "x86_64-linux" }
+    else { () }
+};
+
 /// A native executable, from an image: the one named, or the one this builds first.
 /// The images are made as any build makes one, beside where the executable is going,
 /// and are not kept. See dreams/docs/aot.md.
@@ -1152,7 +1161,7 @@ let native_build! o src = {
         let rt_image = image_of! runtime rt (out + ".rt.image");
         if lib_image == () || rt_image == () { 1 }
         else {
-            match aot.build! bytes out lib_image rt_image {
+            match aot.build! bytes out lib_image rt_image (aot_target (opt o :targets)) {
                 Result.ok(size) => {
                     console.error! ("compiled -> " + out + " (" + to_string size + " bytes, native)");
                     0

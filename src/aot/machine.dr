@@ -1371,8 +1371,8 @@ let first_atoms = ["integer", "float", "char", "bool", "unit", "string", "atom",
 
 /// A whole program as IR: `user`'s entry, with what it reaches of the library and the
 /// runtime, or everything that stopped it.
-let to_ir : image.Image -> image.Image -> image.Image -> Result :string [:string];
-let to_ir user lib rt = {
+let to_ir : image.Image -> image.Image -> image.Image -> :integer -> Result :string [:string];
+let to_ir user lib rt arch = {
     let entry = image.Image.entry user;
     let atoms = list.fold (fn m [i, name] -> m.[name => i]) %{} (list.enumerate first_atoms);
     let lib_names = dialect.by_name lib;
@@ -1391,9 +1391,9 @@ let to_ir user lib rt = {
     }) start (map.values library_roots);
     let st = core.program %{"u" => user, "l" => lib} [["u", entry, :function]] lib_names native_arity lib_arity wanted;
     let natives = map.keys (core.St.natives st);
-    let unit_ = dialect.unit_of rt (list.append runtime_roots natives);
+    let unit_ = dialect.unit_of rt (list.append runtime_roots natives) arch;
     match list.append (list.reverse (core.St.refused st)) (dialect.Unit.refused unit_) {
-        [] => Result.ok (assemble user st unit_ lib_names entry),
+        [] => Result.ok (assemble user st unit_ lib_names entry arch),
         why => Result.error (list.unique why),
     }
 };
@@ -1450,21 +1450,32 @@ let tls_text = str.concat_all [
 
 /// Where a callback from C lands, by a stub `rt/main.dr` writes: save what C passed where the
 /// runtime can read it, and hand back the answer in both registers an answer may be looked for.
-let callback_text : :string -> :string;
-let callback_text enter = str.concat_all [
-    str.concat_all (list.map (fn l -> str.concat_all ["module asm \"", l, "\"\n"]) [
+/// On aarch64 the stub leaves the record in x16, eight integer registers are saved and then the
+/// eight doubles, and `dream_flush_code` makes code just written visible to the instruction stream,
+/// which x86-64 does by itself and so has as a function that returns.
+let callback_text : :string -> :integer -> :string;
+let callback_text enter arch = str.concat_all [
+    str.concat_all (list.map (fn l -> str.concat_all ["module asm \"", l, "\"\n"]) (if arch == 1 { [
+        ".text", ".globl i_cb_common", "i_cb_common:", "  stp x29, x30, [sp, #-16]!", "  mov x29, sp",
+        "  sub sp, sp, #128", "  stp x0, x1, [sp, #0]", "  stp x2, x3, [sp, #16]", "  stp x4, x5, [sp, #32]",
+        "  stp x6, x7, [sp, #48]", "  stp d0, d1, [sp, #64]", "  stp d2, d3, [sp, #80]", "  stp d4, d5, [sp, #96]",
+        "  stp d6, d7, [sp, #112]", "  mov x0, x16", "  mov x1, sp", "  bl dream_cb_entry", "  fmov d0, x0",
+        "  add sp, sp, #128", "  ldp x29, x30, [sp], #16", "  ret",
+        ".globl dream_flush_code", "dream_flush_code:", "  dc cvau, x0", "  dsb ish", "  ic ivau, x0",
+        "  dsb ish", "  isb", "  mov x0, #0", "  ret"] } else { [
         ".text", ".globl i_cb_common", "i_cb_common:", "  subq $120, %rsp",
         "  movq %rdi, 0(%rsp)", "  movq %rsi, 8(%rsp)", "  movq %rdx, 16(%rsp)", "  movq %rcx, 24(%rsp)",
         "  movq %r8, 32(%rsp)", "  movq %r9, 40(%rsp)", "  movsd %xmm0, 48(%rsp)", "  movsd %xmm1, 56(%rsp)",
         "  movsd %xmm2, 64(%rsp)", "  movsd %xmm3, 72(%rsp)", "  movsd %xmm4, 80(%rsp)", "  movsd %xmm5, 88(%rsp)",
         "  movsd %xmm6, 96(%rsp)", "  movsd %xmm7, 104(%rsp)", "  movq %r10, %rdi", "  movq %rsp, %rsi",
-        "  call dream_cb_entry", "  movq %rax, %xmm0", "  addq $120, %rsp", "  ret"]),
+        "  call dream_cb_entry", "  movq %rax, %xmm0", "  addq $120, %rsp", "  ret",
+        ".globl dream_flush_code", "dream_flush_code:", "  xorl %eax, %eax", "  ret"] })),
     "declare void @i_cb_common()\n",
     "define dso_local i64 @dream_cb_entry(i64 %r, i64 %regs) {\n  %v = call tailcc i64 ", enter,
     "(i64 %r, i64 %regs)\n  ret i64 %v\n}\n"];
 
-let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :string;
-let assemble user st unit_ lib_names entry = {
+let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :string;
+let assemble user st unit_ lib_names entry arch = {
     // The atoms the dialect asked for by name are numbered with the rest.
     let st_with = list.fold (fn s1 name -> list.nth 1 (core.intern_atom name s1)) st (dialect.Unit.atoms unit_);
     let atom_words = list.map (fn name ->
@@ -1525,11 +1536,11 @@ let assemble user st unit_ lib_names entry = {
         "  %sp = sub i64 %top, 8\n  %r = call tailcc i64 @u", to_string entry, "(",
         args_text (list.concat [["%p", "%sp", "0"], args, pad]), ")\n  ret i32 0\n}\n"];
     str.concat_all (list.concat [
-        ["target triple = \"x86_64-unknown-linux-gnu\"\n", dialect.start_text, "declare void @__libc_start_main()\n",
+        [str.concat_all ["target triple = \"", dialect.triple_of arch, "\"\n"], dialect.start_text arch, "declare void @__libc_start_main()\n",
          "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n",
          "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n",
          "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n"],
-        dialect.declarations (dialect.Unit.imports unit_),
+        dialect.declarations (dialect.Unit.imports unit_) arch,
         atom_words,
         fixed_infos g,
         strings,
@@ -1539,7 +1550,7 @@ let assemble user st unit_ lib_names entry = {
         [payload_table],
         floats,
         closures,
-        [atom_count, atom_table, types_table, display_table, world, cafs_table, tick_text, worker_text (dialect.Unit.symbols unit_).["worker_loop!"] (dialect.Unit.symbols unit_).["pool_loop!"], tls_text, cold_text (dialect.Unit.symbols unit_), callback_text (dialect.Unit.symbols unit_).["cb_enter!"]],
+        [atom_count, atom_table, types_table, display_table, world, cafs_table, tick_text, worker_text (dialect.Unit.symbols unit_).["worker_loop!"] (dialect.Unit.symbols unit_).["pool_loop!"], tls_text, cold_text (dialect.Unit.symbols unit_), callback_text (dialect.Unit.symbols unit_).["cb_enter!"] arch],
         Gen.data g,
         [dialect.Unit.text unit_],
         list.reverse (Gen.code g),

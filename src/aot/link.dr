@@ -21,7 +21,9 @@
 // since a lazy binding would need the resolver stub and buys nothing for a
 // program that uses a few dozen functions.
 //
-// Only x86-64 ELF for now; another machine is refused by name, not misread.
+// x86-64 and aarch64 ELF; another machine is refused by name, not misread. The object says which
+// it is, and the two differ in their relocations, in what an import's stub is, and in the page
+// size a kernel may have, which on aarch64 can be 64 KB.
 
 import std.array;
 import std.list;
@@ -51,6 +53,29 @@ let shn_abs = 65521;
 let payload_symbol = "i_payload";
 
 let em_x86_64 = 62;
+let em_aarch64 = 183;
+
+// aarch64's relocations: most patch a field of an instruction, so are written into the word that is
+// there rather than over it.
+let ra_abs64 = 257;
+let ra_prel64 = 260;
+let ra_prel32 = 261;
+let ra_adr_prel_lo21 = 274;
+let ra_adr_prel_pg_hi21 = 275;
+let ra_adr_prel_pg_hi21_nc = 276;
+let ra_add_abs_lo12_nc = 277;
+let ra_ldst8_abs_lo12_nc = 278;
+let ra_tstbr14 = 279;
+let ra_condbr19 = 280;
+let ra_jump26 = 282;
+let ra_call26 = 283;
+let ra_ldst16_abs_lo12_nc = 284;
+let ra_ldst32_abs_lo12_nc = 285;
+let ra_ldst64_abs_lo12_nc = 286;
+let ra_ldst128_abs_lo12_nc = 299;
+let ra_adr_got_page = 311;
+let ra_ld64_got_lo12_nc = 312;
+let ra_glob_dat = 1025;
 let r_64 = 1;
 let r_pc32 = 2;
 let r_gotpcrel = 9;
@@ -197,12 +222,43 @@ let patched bytes patches = {
 let link : Options -> :string -> Result :string :string;
 let link o obj =
     if str.slice 0 4 obj != str.of_bytes [127, 69, 76, 70] { Result.error "not an ELF object" }
-    else if u16_at obj 18 != em_x86_64 { Result.error "only x86-64 can be linked yet" }
+    else if u16_at obj 18 != em_x86_64 && u16_at obj 18 != em_aarch64 { Result.error "only x86-64 and aarch64 can be linked" }
     else { laid_out o obj };
+
+/// A 4 KB page's start, for `adrp`.
+let page_of : :integer -> :integer;
+let page_of a = a - a % 4096;
+
+/// `word` with `value`'s low `bits` bits put at bit `at`, as an instruction's field.
+let with_field : :integer -> :integer -> :integer -> :integer -> :integer;
+let with_field word value at bits = {
+    let span = list.fold (fn a _ -> a * 2) 1 (list.range 0 bits);
+    let shift = list.fold (fn a _ -> a * 2) 1 (list.range 0 at);
+    let v = ((value % span) + span) % span;
+    let cleared = word - ((word / shift) % span) * shift;
+    cleared + v * shift
+};
+
+/// `adrp`'s two fields, for a distance in pages.
+let with_adrp : :integer -> :integer -> :integer;
+let with_adrp word pages = {
+    let imm = ((pages % 2097152) + 2097152) % 2097152;
+    with_field (with_field word (imm % 4) 29 2) (imm / 4) 5 19
+};
+
+/// An import's stub on aarch64: `adrp x16, slot; ldr x17, [x16, slot's low bits]; br x17; nop`.
+let aarch64_stub : :integer -> :integer -> :string;
+let aarch64_stub at slot = {
+    let adrp = with_adrp 2415919120 ((page_of slot - page_of at) / 4096);
+    let ldr = with_field 4181721617 ((slot % 4096) / 8) 10 12;
+    le 4 adrp + le 4 ldr + le 4 3592356384 + le 4 3573751839
+};
 
 priv let laid_out : Options -> :string -> Result :string :string;
 priv let laid_out o obj = {
     let ss = sections obj;
+    // A segment starts on a page of the largest size its kernel may have.
+    let seg_page = if u16_at obj 18 == em_aarch64 { 65536 } else { page };
     let syms = array.of_list (symbols ss);
     let kept = list.filter allocated ss;
     let ro = list.filter (fn s -> not (writable s) && not (executable s)) kept;
@@ -226,7 +282,8 @@ priv let laid_out o obj = {
     // A slot for each symbol the object defines but reaches through one: LLVM asks
     // for that for any symbol not marked as staying in this file. The address is
     // known here, so the slot is written rather than left to the loader.
-    let via_slot = fn r -> list.contains (Reloc.kind r) [r_gotpcrel, r_gotpcrelx, r_rex_gotpcrelx];
+    let via_slot = fn r -> list.contains (Reloc.kind r) (if u16_at obj 18 == em_aarch64 { [ra_adr_got_page, ra_ld64_got_lo12_nc] }
+        else { [r_gotpcrel, r_gotpcrelx, r_rex_gotpcrelx] });
     let held = list.unique (list.filter (fn i -> Symbol.shndx syms.[i] != 0 || is_payload i)
         (list.flat_map (fn s -> list.map (fn r -> Reloc.symbol r) (list.filter via_slot (relocs_of s))) relas));
     let slots = count + list.length held;
@@ -248,12 +305,12 @@ priv let laid_out o obj = {
     let payload_at = align_up 16 ro_sections_end;
     let ro_end = payload_at + len (Options.payload o);
 
-    let rx_start = align_up page ro_end;
+    let rx_start = align_up seg_page ro_end;
     let [addr1, rx_end] = place rx rx_start addr0;
     let at_stubs = align_up stub_size rx_end;
     let rx_stop = at_stubs + stub_size * count;
 
-    let rw_start = align_up page rx_stop;
+    let rw_start = align_up seg_page rx_stop;
     let dynamic_entries = list.length (Options.needed o) + 9;
     let dynamic_size = 16 * dynamic_entries;
     let at_slots = rw_start + dynamic_size;
@@ -278,7 +335,45 @@ priv let laid_out o obj = {
     // Each relocation as a patch to its section, or the name of the one that
     // this does not know how to write. An unknown kind must stop the link: a word
     // left unrelocated is a crash at a distance.
-    let patch_of = fn target r -> {
+    let arm = u16_at obj 18 == em_aarch64;
+    // In two halves, words and branches and then the fields of an address's low bits, as one
+    // match of that many guarded arms was more than the compiler before 0.2.9 could lower
+    // (`always_matches` in lower.dr).
+    let arm_low12 = fn r o insn s p -> {
+        let lo12 = s % 4096;
+        let slot = fn u -> slot_for (Reloc.symbol r) + Reloc.addend r;
+        match Reloc.kind r {
+            k if k == ra_add_abs_lo12_nc || k == ra_ldst8_abs_lo12_nc => [o, 4, with_field insn lo12 10 12],
+            k if k == ra_ldst16_abs_lo12_nc => [o, 4, with_field insn (lo12 / 2) 10 12],
+            k if k == ra_ldst32_abs_lo12_nc => [o, 4, with_field insn (lo12 / 4) 10 12],
+            k if k == ra_ldst64_abs_lo12_nc => [o, 4, with_field insn (lo12 / 8) 10 12],
+            k if k == ra_ldst128_abs_lo12_nc => [o, 4, with_field insn (lo12 / 16) 10 12],
+            k if k == ra_adr_got_page => [o, 4, with_adrp insn ((page_of (slot ()) - page_of p) / 4096)],
+            k if k == ra_ld64_got_lo12_nc => [o, 4, with_field insn ((slot () % 4096) / 8) 10 12],
+            k => [:unknown, k],
+        }
+    };
+    let arm_patch = fn target r -> {
+        let o = Reloc.offset r;
+        let p = addresses.[target] + o;
+        let s = symbol_address (Reloc.symbol r) + Reloc.addend r;
+        let insn = u32_at (Section.bytes ss.[target]) o;
+        match Reloc.kind r {
+            k if k == ra_abs64 => [o, 8, s],
+            k if k == ra_prel64 => [o, 8, s - p],
+            k if k == ra_prel32 => [o, 4, s - p],
+            k if k == ra_adr_prel_pg_hi21 || k == ra_adr_prel_pg_hi21_nc => [o, 4, with_adrp insn ((page_of s - page_of p) / 4096)],
+            k if k == ra_adr_prel_lo21 => {
+                let d = s - p;
+                [o, 4, with_field (with_field insn (d % 4) 29 2) (d / 4) 5 19]
+            },
+            k if k == ra_call26 || k == ra_jump26 => [o, 4, with_field insn ((s - p) / 4) 0 26],
+            k if k == ra_condbr19 => [o, 4, with_field insn ((s - p) / 4) 5 19],
+            k if k == ra_tstbr14 => [o, 4, with_field insn ((s - p) / 4) 5 14],
+            _ => arm_low12 r o insn s p,
+        }
+    };
+    let patch_of = fn target r -> if arm { arm_patch target r } else {
         let p = addresses.[target] + Reloc.offset r;
         let s = symbol_address (Reloc.symbol r) + Reloc.addend r;
         match Reloc.kind r {
@@ -310,7 +405,8 @@ priv let laid_out o obj = {
 
             let stubs = list.map (fn n -> {
                 let at = stub_of n;
-                str.of_bytes [255, 37] + le 4 (slot_of n - (at + stub_jump_size)) + zeros (stub_size - stub_jump_size)
+                if arm { aarch64_stub at (slot_of n) }
+                else { str.of_bytes [255, 37] + le 4 (slot_of n - (at + stub_jump_size)) + zeros (stub_size - stub_jump_size) }
             }) imports;
             let dynsym = zeros dynsym_size + str.concat_all (list.map (fn n ->
                 le 4 name_at.[n] + le 1 16 + le 1 0 + le 2 0 + le 8 0 + le 8 0) imports);
@@ -318,7 +414,7 @@ priv let laid_out o obj = {
             // here, and every library's own search should not stop to look.
             let hash = le 4 1 + le 4 (count + 1) + le 4 0 + zeros (4 * (count + 1));
             let rela = str.concat_all (list.map_indexed (fn i n ->
-                le 8 (slot_of n) + le 4 r_glob_dat + le 4 (i + 1) + le 8 0) imports);
+                le 8 (slot_of n) + le 4 (if arm { ra_glob_dat } else { r_glob_dat }) + le 4 (i + 1) + le 8 0) imports);
             let tag = fn t v -> le 8 t + le 8 v;
             let dynamic = str.concat_all (list.append
                 (list.map (fn n -> tag 1 name_at.[n]) (Options.needed o))
@@ -331,9 +427,9 @@ priv let laid_out o obj = {
                 + le 8 filesz + le 8 memsz + le 8 alignment;
             let phdrs = str.concat_all [
                 phdr 3 4 (base + at_interp) (len interp) (len interp) 1,
-                phdr 1 4 base (ro_end - base) (ro_end - base) page,
-                phdr 1 5 rx_start (rx_stop - rx_start) (rx_stop - rx_start) page,
-                phdr 1 6 rw_start (data_end - rw_start) (bss_end - rw_start) page,
+                phdr 1 4 base (ro_end - base) (ro_end - base) seg_page,
+                phdr 1 5 rx_start (rx_stop - rx_start) (rx_stop - rx_start) seg_page,
+                phdr 1 6 rw_start (data_end - rw_start) (bss_end - rw_start) seg_page,
                 phdr 2 6 rw_start dynamic_size dynamic_size 8,
                 // No executable stack: an object with no note would otherwise ask for one.
                 le 4 1685382481 + le 4 6 + zeros 48,
@@ -342,7 +438,7 @@ priv let laid_out o obj = {
                 Option.none => Result.error "the object defines no _start",
                 Option.some(start) => {
                     let entry = addresses.[Symbol.shndx start] + Symbol.value start;
-                    let ehdr = str.of_bytes [127, 69, 76, 70, 2, 1, 1, 0] + zeros 8 + le 2 2 + le 2 em_x86_64 + le 4 1
+                    let ehdr = str.of_bytes [127, 69, 76, 70, 2, 1, 1, 0] + zeros 8 + le 2 2 + le 2 (u16_at obj 18) + le 4 1
                         + le 8 entry + le 8 ehdr_size + le 8 0 + le 4 0 + le 2 ehdr_size
                         + le 2 phdr_size + le 2 phdr_count + le 2 64 + le 2 0 + le 2 0;
                     let seq = fn at pieces -> list.fold (fn [out, here] [where, text] ->

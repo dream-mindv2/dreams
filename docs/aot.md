@@ -245,3 +245,26 @@ escape**. No program measured here returns a record that is not then stored in a
 which needs it on the heap anyway, and what does not escape is mostly floats, which stay in
 registers already. Stack allocation would also break the rule `move_stack!` relies on, that nothing
 holds an address on a stack.
+
+**2026-11-03: Linux aarch64.** `dreams --aot --target aarch64` (or on an aarch64 machine, nothing at
+all) writes an aarch64 executable. What differs is small and named (`aot/target.dr`):
+
+- the triple, `_start` (glibc's own `start.S`), `yield` for `pause`, and the callback's entry and
+  stub: eight integer registers rather than six, the record in x16, and the instruction cache
+  flushed after a stub is written (`dream_flush_code`), which x86-64 does not need;
+- in the runtime, by `prim.arch ()`, a constant LLVM folds: `struct stat`'s mode at 16 rather than
+  24, and `struct epoll_event` sixteen bytes rather than a packed twelve;
+- an acquire fence where an indirection is followed (`code_ind!`), since a shared thunk's value is
+  read after its info and aarch64, unlike x86-64, may reorder two loads;
+- in the writer, aarch64's relocations, which patch fields of instructions, an import's stub of
+  `adrp`, `ldr` and `br`, and 64 KB pages for a kernel that has them.
+
+A VM writes for another machine only when built with `-DDREAM_AOT_CROSS=ON`, which links both
+targets' code generators; a release VM writes for its own. `dreams/tests/aot_cross.sh` runs every
+recorded program, the FFI test against the C sample library cross-compiled, and both TLS suites,
+built for aarch64 on x86-64 and run under qemu: all pass. qemu on x86-64 keeps x86-64's memory order,
+so the fences are exercised only on aarch64 itself.
+
+Found on the way, in the compiler: a `match` of guarded arms lowered everything after a guarded arm
+twice, once for its guard failing and once for its pattern, so eighteen of them overflowed the stack.
+A pattern that cannot fail (`k if k == ..`) has no second path now (`always_matches` in lower.dr).

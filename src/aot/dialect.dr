@@ -42,10 +42,12 @@ group State {
     imports : :map,
     atoms : :map,
     refused : [:string],
+    /// The machine generated for, as `prim.arch ()` answers it: 0 x86-64, 1 aarch64.
+    arch : :integer,
 }
 
 let empty_state : State;
-let empty_state = State.make 0 [] "entry" %{} %{} %{} %{} [];
+let empty_state = State.make 0 [] "entry" %{} %{} %{} %{} [] 0;
 
 let line : :string -> State -> State;
 let line text s = State.set_lines (list.cons text (State.lines s)) s;
@@ -300,7 +302,10 @@ let primitive cx name args s = match name {
                 ["0", line (str.concat_all ["  store atomic i64 ", v, ", ptr ", p, " release, align 8"]) s2]
             },
             ["fence!", [_]] => ["0", line "  fence seq_cst" s1],
-            ["pause!", [_]] => ["0", line "  call void @llvm.x86.sse2.pause()" s1],
+            ["pause!", [_]] => ["0", line (if State.arch s1 == 1 { "  call void @llvm.aarch64.hint(i32 1)" } else { "  call void @llvm.x86.sse2.pause()" }) s1],
+            // Which machine this is being generated for, as a constant LLVM folds: a runtime
+            // written once branches on it where a C struct or machine code differs.
+            ["arch", [_]] => [to_string (State.arch s1), s1],
             // A worker: an OS thread that runs the scheduler with a context of its own. Its body
             // is in the machine's text, as it starts with C's calling convention.
             ["start_worker!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_worker(i64 ", ctx, ")"]) s1,
@@ -634,14 +639,25 @@ let string_text img i = {
                     to_string (len text), ", [", n, " x i8] c\"", escaped text, "\\00\" }>\n"]
 };
 
-/// Program entry, for x86-64: what the C runtime's own start file would do, since
-/// there is none here. Written as module assembly because the stack it has to
-/// read is exactly what a function's prologue would disturb.
-let start_text : :string;
-let start_text = str.concat_all (list.map (fn l -> str.concat_all ["module asm \"", l, "\"\n"]) [
-    ".globl _start", "_start:", "  xorl %ebp, %ebp", "  movq %rdx, %r9", "  popq %rsi",
-    "  movq %rsp, %rdx", "  andq $-16, %rsp", "  pushq %rax", "  pushq %rsp", "  xorl %r8d, %r8d",
-    "  xorl %ecx, %ecx", "  movq $main, %rdi", "  call __libc_start_main", "  hlt"]);
+/// Program entry: what the C runtime's own start file would do, since there is none
+/// here. Written as module assembly because the stack it has to read is exactly what a
+/// function's prologue would disturb. `__libc_start_main (main, argc, argv, init, fini,
+/// rtld_fini, stack_end)` on both machines; aarch64's is glibc's own `start.S`.
+let start_text : :integer -> :string;
+let start_text arch = str.concat_all (list.map (fn l -> str.concat_all ["module asm \"", l, "\"\n"]) (
+    if arch == 1 {
+        [".globl _start", "_start:", "  mov x29, #0", "  mov x30, #0", "  mov x5, x0", "  ldr x1, [sp]",
+         "  add x2, sp, #8", "  mov x6, sp", "  adrp x0, main", "  add x0, x0, :lo12:main", "  mov x3, #0",
+         "  mov x4, #0", "  bl __libc_start_main", "  brk #1000"]
+    } else {
+        [".globl _start", "_start:", "  xorl %ebp, %ebp", "  movq %rdx, %r9", "  popq %rsi",
+         "  movq %rsp, %rdx", "  andq $-16, %rsp", "  pushq %rax", "  pushq %rsp", "  xorl %r8d, %r8d",
+         "  xorl %ecx, %ecx", "  movq $main, %rdi", "  call __libc_start_main", "  hlt"]
+    }));
+
+/// The triple LLVM is told, by `prim.arch ()`'s number.
+let triple_of : :integer -> :string;
+let triple_of arch = if arch == 1 { "aarch64-unknown-linux-gnu" } else { "x86_64-unknown-linux-gnu" };
 
 /// Every function reachable from `work`, generated once each. A worklist because the
 /// image also carries what nothing here calls, the prelude first of all.
@@ -670,12 +686,12 @@ let by_name img = list.fold (fn m i -> {
     else { m }
 }) %{} (list.range 0 (image.count img "GLBL"));
 
-let unit_of : image.Image -> [:string] -> Unit;
-let unit_of img roots = {
+let unit_of : image.Image -> [:string] -> :integer -> Unit;
+let unit_of img roots arch = {
     let named = by_name img;
     let known = list.filter (fn r -> map.has r named) roots;
     let missing = list.filter (fn r -> not (map.has r named)) roots;
-    let [texts, s] = reachable img (list.map (fn r -> named.[r]) known) %{} [] empty_state;
+    let [texts, s] = reachable img (list.map (fn r -> named.[r]) known) %{} [] (State.set_arch arch empty_state);
     let strings = list.map (string_text img) (map.keys (State.strings s));
     let symbols = list.fold (fn m r -> m.[r => function_name named.[r]]) %{} known;
     Unit.make (str.concat_all (list.append strings (list.reverse texts))) (State.imports s) symbols
@@ -686,20 +702,20 @@ let unit_of img roots = {
 
 /// A dialect program by itself: `img` as LLVM IR, or everything in it the dialect
 /// has no meaning for.
-let to_ir : image.Image -> Result :string [:string];
-let to_ir img = {
+let to_ir : image.Image -> :integer -> Result :string [:string];
+let to_ir img arch = {
     let entry = image.Image.entry img;
     if entry == image.no_node { Result.error ["the program has no main!"] }
     else {
-        let [texts, s] = reachable img [entry] %{} [] empty_state;
+        let [texts, s] = reachable img [entry] %{} [] (State.set_arch arch empty_state);
         match State.refused s {
             [] => {
                 let arity = image.Func.arity (image.func img entry);
                 let units = list.replicate arity "0";
                 Result.ok (str.concat_all (list.concat [
-                    ["target triple = \"x86_64-unknown-linux-gnu\"\n", start_text,
+                    [str.concat_all ["target triple = \"", triple_of arch, "\"\n"], start_text arch,
                      "declare void @__libc_start_main()\n"],
-                    declarations (State.imports s),
+                    declarations (State.imports s) arch,
                     list.map (string_text img) (map.keys (State.strings s)),
                     list.reverse texts,
                     [str.concat_all ["define dso_local i32 @main() {\n  %r = call tailcc i64 ",
@@ -713,9 +729,9 @@ let to_ir img = {
 };
 
 /// A C function's declaration, for each of the ones a unit called.
-let declarations : :map -> [:string];
-let declarations imports = list.append
-    ["declare double @llvm.fabs.f64(double)\n", "declare void @llvm.x86.sse2.pause()\n"]
+let declarations : :map -> :integer -> [:string];
+let declarations imports arch = list.append
+    ["declare double @llvm.fabs.f64(double)\n", if arch == 1 { "declare void @llvm.aarch64.hint(i32)\n" } else { "declare void @llvm.x86.sse2.pause()\n" }]
     (list.map (fn [symbol, shape] -> match shape {
         :variadic => "declare i32 @snprintf(ptr, i64, ptr, ...)\n",
         :strtod => "declare double @strtod(ptr, ptr)\n",

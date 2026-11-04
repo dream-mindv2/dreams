@@ -1,0 +1,42 @@
+// The machine a native executable is for. Everything below the image's meaning that differs
+// between machines is answered here or asked of this: the triple LLVM is told, the ELF machine the
+// writer stamps, the dynamic loader the executable names, and the architecture, which the runtime
+// can ask (`prim.arch ()`) where a C struct is laid out differently or code is written at run time.
+//
+// The target is the host's unless `--target` says otherwise; building for another machine needs a
+// VM whose LLVM has that machine (`DREAM_AOT_CROSS` in dream/CMakeLists.txt), and running what it
+// makes needs that machine, or an emulator: dreams/tests/aot_cross.sh runs aarch64 under qemu.
+
+import std.list;
+import std.os;
+
+group Target {
+    name : :string,
+    triple : :string,
+    arch : :atom,
+    /// `e_machine`: 62 is x86-64, 183 aarch64.
+    machine : :integer,
+    /// Where the dynamic loader is on this machine, for `PT_INTERP`.
+    loader : :string,
+}
+
+let x86_64_linux : Target;
+let x86_64_linux = Target.make "x86_64-linux" "x86_64-unknown-linux-gnu" :x86_64 62 "/lib64/ld-linux-x86-64.so.2";
+
+let aarch64_linux : Target;
+let aarch64_linux = Target.make "aarch64-linux" "aarch64-unknown-linux-gnu" :aarch64 183 "/lib/ld-linux-aarch64.so.1";
+
+let all : [Target];
+let all = [x86_64_linux, aarch64_linux];
+
+/// A target by its name, as `--target` takes it.
+let named : :string -> Option Target;
+let named name = list.find (fn t -> Target.name t == name) all;
+
+/// What `prim.arch ()` answers for a target: a number the runtime compares with.
+let arch_number : Target -> :integer;
+let arch_number t = match Target.arch t { :aarch64 => 1, _ => 0 };
+
+/// The machine this runs on.
+let host : :unit -> Target;
+let host u = match os.arch () { :aarch64 => aarch64_linux, _ => x86_64_linux };

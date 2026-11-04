@@ -19,6 +19,7 @@ import dreams.aot.dialect;
 import dreams.aot.image;
 import dreams.aot.link;
 import dreams.aot.machine;
+import dreams.aot.target;
 
 /// The host module a dialect program imports; a build has to be told it exists.
 let primitives = "rt.prim";
@@ -54,17 +55,17 @@ let loader! () = match file.read! "/proc/self/exe" {
 };
 
 /// `ir` made an executable at `out`: its size, or what stopped it.
-let written! : :string -> :string -> :string -> Result :integer [:string];
-let written! ir out payload = {
+let written! : :string -> :string -> :string -> :string -> Result :integer [:string];
+let written! ir out payload interp = {
     // The IR, for a debugger: built with clang it has the symbols this writer omits.
     match os.env! "DREAMS_AOT_KEEP_IR" { () => (), path => file.write! path ir };
-    object_and_link! ir out payload
+    object_and_link! ir out payload interp
 };
 
-let object_and_link! : :string -> :string -> :string -> Result :integer [:string];
-let object_and_link! ir out payload = match vm.llvm_object! ir opt_level {
+let object_and_link! : :string -> :string -> :string -> :string -> Result :integer [:string];
+let object_and_link! ir out payload interp = match vm.llvm_object! ir opt_level {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
-    Result.ok(object) => match link.link (link.Options.make (loader! ()) ["libm.so.6", "libc.so.6"] payload) object {
+    Result.ok(object) => match link.link (link.Options.make interp ["libm.so.6", "libc.so.6"] payload) object {
         Result.error(why) => Result.error [why],
         Result.ok(exe) => {
             file.write! out exe;
@@ -79,23 +80,40 @@ let object_and_link! ir out payload = match vm.llvm_object! ir opt_level {
 let is_dialect : image.Image -> :bool;
 let is_dialect img = list.any (fn i -> image.import_path img i == primitives) (list.range 0 (image.count img "IMPT"));
 
+/// The machine to build for: the one `--target` names, or this one. For this one the loader is
+/// the one this VM was started by, which is known to exist here; for another, its usual path.
+let chosen! : :any -> Result [target.Target, :string] [:string];
+let chosen! name = match name {
+    () => Result.ok [target.host (), loader! ()],
+    n => match target.named n {
+        Option.none => Result.error [str.concat_all ["no target `", n, "`: x86_64-linux or aarch64-linux"]],
+        Option.some(t) => Result.ok [t, if target.Target.arch t == target.Target.arch (target.host ()) { loader! () } else { target.Target.loader t }],
+    },
+};
+
 /// Write `bytes`, an image, to `out` as an executable, given the two images that are
 /// the runtime: how to get those is the caller's, since it means building a program.
-let build! : :string -> :string -> :any -> :any -> Result :integer [:string];
-let build! bytes out lib_bytes rt_bytes = match image.read bytes {
-    Result.error(why) => Result.error [why],
-    Result.ok(img) => if is_dialect img {
-        match dialect.to_ir img {
-            Result.error(why) => Result.error why,
-            Result.ok(ir) => written! ir out "",
-        }
-    } else {
-        match [image.read lib_bytes, image.read rt_bytes] {
-            [Result.ok(lib), Result.ok(rt)] => match machine.to_ir img lib rt {
-                Result.error(why) => Result.error why,
-                Result.ok(ir) => written! ir out (image.payload_bytes img),
+let build! : :string -> :string -> :any -> :any -> :any -> Result :integer [:string];
+let build! bytes out lib_bytes rt_bytes target_name = match chosen! target_name {
+    Result.error(why) => Result.error why,
+    Result.ok([t, interp]) => {
+        let arch = target.arch_number t;
+        match image.read bytes {
+            Result.error(why) => Result.error [why],
+            Result.ok(img) => if is_dialect img {
+                match dialect.to_ir img arch {
+                    Result.error(why) => Result.error why,
+                    Result.ok(ir) => written! ir out "" interp,
+                }
+            } else {
+                match [image.read lib_bytes, image.read rt_bytes] {
+                    [Result.ok(lib), Result.ok(rt)] => match machine.to_ir img lib rt arch {
+                        Result.error(why) => Result.error why,
+                        Result.ok(ir) => written! ir out (image.payload_bytes img) interp,
+                    },
+                    _ => Result.error ["the runtime's images are not images"],
+                }
             },
-            _ => Result.error ["the runtime's images are not images"],
         }
     },
 };
