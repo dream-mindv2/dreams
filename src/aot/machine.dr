@@ -1536,7 +1536,7 @@ let assemble user st unit_ lib_names entry arch = {
         "  %sp = sub i64 %top, 8\n  %r = call tailcc i64 @u", to_string entry, "(",
         args_text (list.concat [["%p", "%sp", "0"], args, pad]), ")\n  ret i32 0\n}\n"];
     str.concat_all (list.concat [
-        [str.concat_all ["target triple = \"", dialect.triple_of arch, "\"\n"], dialect.start_text arch, "declare void @__libc_start_main()\n",
+        [str.concat_all ["target triple = \"", dialect.triple_of arch, "\"\n"], dialect.start_text arch,
          "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n",
          "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n",
          "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n"],
