@@ -880,6 +880,7 @@ let rec expression e = match e {
     [:thunk, x, sp] => expression x && is_span sp,
     [:try, b, n, h, sp] => expression b && string n && expression h && is_span sp,
     [:lambda, ps, b, sp] => sequence parameter ps && expression b && is_span sp,
+    [:impure_lambda, ps, b, sp] => sequence parameter ps && expression b && is_span sp,
     [:comp, impure, x, sp] => type_of impure == :bool && expression x && is_span sp,
     [:expand, x, sp] => expression x && is_span sp,
     [:list, xs, sp] => sequence expression xs && is_span sp,

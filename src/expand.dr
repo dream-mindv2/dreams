@@ -579,7 +579,7 @@ let evaluate_round! base s session0 jobs = {
                      (trunk.at i references),
         }) st0 sites;
 
-        fold (fn [st, session, answers] i -> {
+        fold (fn! [st, session, answers] i -> {
             let at = list.nth 1 (trunk.at i call_at);
             match objection i {
                 why if why != () =>
@@ -636,7 +636,7 @@ let evaluate_round! base s session0 jobs = {
         }) [noted, session0, []] sites
     };
 
-    let done = list.fold (fn [st, session, acc] plan -> {
+    let done = list.fold (fn! [st, session, acc] plan -> {
         let got = run! st session plan;
         strict! got
         [list.head got, list.nth 1 got,
@@ -953,7 +953,7 @@ let sequential! l =
         let items = if list.is_empty (modules.expand_sites (loader s) (modules.module_source m)) {
                         []
                     } else { modules.module_items m };
-        fold (fn acc i -> {
+        fold (fn! acc i -> {
             let item = list.nth i items;
             if not (has_expansion (macro_let item)) { acc }
             else {

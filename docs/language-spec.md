@@ -123,7 +123,7 @@ letter are the runtime's primitives (`_list_cons`), which belong to `std`
 ### Keywords
 
 ```
-let  let?  priv  rec  if  else  import  as  catch  true  false  not  try!  defer!
+let  let?  priv  rec  if  else  fn  fn!  import  as  catch  true  false  not  try!  defer!
 fn  virtual  derive  comp  comp!  when  mod  match  macro  expand  type  union
 ```
 
@@ -327,9 +327,11 @@ orders values of any kind, including lists, which is what `list.sort` uses.
 
 ### Functions and thunks
 
-A function is a value. A closure captures the variables it uses. A thunk
-written `$( e )` is a function of no arguments, and `type_of` reports it as
-`:pure_fn`. `spawn!` runs a thunk in a new process, and `std.test` holds a
+A function is a value. A closure captures the variables it uses. A lambda,
+`fn x -> e`, is pure, as a function whose name has no `!` is; one that performs
+effects is written `fn! x -> e`, and `type_of` reports it as `:impure_fn`. A
+thunk written `$( e )` is a function of no arguments, and `type_of` reports it
+as `:pure_fn`. `spawn!` runs a thunk in a new process, and `std.test` holds a
 test case in one.
 
 ### Builtins and primitives
@@ -577,10 +579,10 @@ effect in a suspended position does not happen until something forces it.
 
 ```dream
 // Each spawn! is suspended in the list, and runs only when join! reaches it.
-let ps = list.map (fn n -> spawn! $( work n )) jobs;
+let ps = list.map (fn! n -> spawn! $( work n )) jobs;
 
 // Every process has started before the first join!.
-let ps = strict! (list.map (fn n -> spawn! $( work n )) jobs);
+let ps = strict! (list.map (fn! n -> spawn! $( work n )) jobs);
 ```
 
 `strict!` is impure by name, because forcing is when effects happen. Forcing
@@ -637,6 +639,11 @@ let greet name = console.print! name;
 greet.dr:2:18: error: cannot use the impure function `console.print!` inside the pure function `greet`
     = mark the function impure by ending its name with `!`, e.g. `let f! x = ..`
 ```
+
+A lambda is held to the same rule: `fn x -> console.print! x` is an error
+wherever it is written, and `fn! x -> console.print! x` is the lambda that may
+print. Making an `fn!` is not itself an effect, so a pure function may make one
+and hand it on; calling it is.
 
 What counts as impure is spelled with a `!`: printing and IO, `spawn!`,
 `send!`, `recv!`, `join!`, `self!`, `raise!`, `try!`, `strict!`, and every

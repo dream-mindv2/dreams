@@ -161,6 +161,11 @@ let try_e : Expr -> :string -> Expr -> Span -> Expr;
 let try_e body binder handler span = [:try, body, binder, handler, span];
 let lambda_e : [Param] -> Expr -> Span -> Expr;
 let lambda_e params body span      = [:lambda, params, body, span];
+/// `fn! a -> e`: a lambda that may perform effects, as a `!` function may. Its own tag,
+/// because which of the two it is is all that differs, and a walker that does not know
+/// the second is wrong rather than quietly pure.
+let impure_lambda_e : [Param] -> Expr -> Span -> Expr;
+let impure_lambda_e params body span = [:impure_lambda, params, body, span];
 
 /// `comp e` is evaluated by the compiler; `comp! e` by running it on a VM.
 let comp_e : :bool -> Expr -> Span -> Expr;
@@ -632,6 +637,7 @@ let rec show e =
         [:question, x, _]   => "(? " + show x + ")",
         [:try, b, binder, h, _] => "(try " + show b + " " + binder + " " + show h + ")",
         [:lambda, ps, b, _] => "(fn " + show_params ps + " " + show b + ")",
+        [:impure_lambda, ps, b, _] => "(fn! " + show_params ps + " " + show b + ")",
         [:comp, impure, x, _] => "(" + (if impure { "comp!" } else { "comp" }) + " " + show x + ")",
         [:expand, x, _] => "(expand " + show x + ")",
         [:macro, n, ps, b, _] => "(macro " + n + " " + show_params ps + " " + show b + ")",

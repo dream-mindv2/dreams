@@ -1637,7 +1637,8 @@ let note_effect c span what r =
             // answers, and reading a field is pure.
             () => report_note c span
                       ("cannot use " + what + " inside the pure function `" + display_of r + "`")
-                      "mark the function impure by ending its name with `!`, e.g. `let f! x = ..`" r,
+                      (if display_of r == "<lambda>" { "write the lambda `fn!` to let it perform effects, e.g. `fn! x -> ..`" }
+                       else { "mark the function impure by ending its name with `!`, e.g. `let f! x = ..`" }) r,
             f => report c span ("cannot use " + what + " in the default of `" + f
                                 + "`: a default is what reading the field answers, and that is pure") r,
         }
@@ -2104,10 +2105,20 @@ let rec check_expr c e r =
             reserve_slot (list.nth 1 bound) walked
         },
 
-        // A lambda is not a declaration, so it cannot declare itself impure: it
-        // inherits whether effects are allowed from where it is written.
+        // A lambda is pure, as a function whose name has no `!` is: one that
+        // performs an effect is written `fn!`, which says so as a `!` in a name
+        // does, and is impure itself (`type_of` says `:impure_fn`, and compiled
+        // code never runs one where a park would run it again). A lambda used to
+        // inherit whether effects were allowed from where it was written, so an
+        // impure one looked pure to everything that held it.
         [:lambda, ps, body, span] => {
-            let started = begin_func "<lambda>" (list.length ps) false (impure_ok r) false false span (ctx_source c) r;
+            let started = begin_func "<lambda>" (list.length ps) false false false false span (ctx_source c) r;
+            let fi = list.nth 1 started;
+            let bound = bind_params c ps (list.head started);
+            record (ctx_mi c) (ctx_source c) span (Meaning.closure fi) (end_func fi (check_expr c body bound))
+        },
+        [:impure_lambda, ps, body, span] => {
+            let started = begin_func "<lambda>" (list.length ps) true true false false span (ctx_source c) r;
             let fi = list.nth 1 started;
             let bound = bind_params c ps (list.head started);
             record (ctx_mi c) (ctx_source c) span (Meaning.closure fi) (end_func fi (check_expr c body bound))
@@ -3225,7 +3236,7 @@ let resolve_parts_from! l d cache selections previous keep = {
     // Heaviest first: started in the modules' order, the largest module's walk
     // waited behind lighter ones, and it is the phase's critical path.
     let fresh = progress.join_heaviest_first! "resolving" slice_weight
-                    (fn slice -> walk_elsewhere! cache shared_l base keys slice) walking;
+                    (fn! slice -> walk_elsewhere! cache shared_l base keys slice) walking;
     stubbed_to (merge_parts declared seeded declared_base (in_order kept fresh)) stubbed
 };
 
@@ -3966,7 +3977,7 @@ let stage_block c stmts r = {
 /// impure one is a *statement*, forced in the order the block gives, and
 /// moving it moves the effect. `dreams` built a payload that way --
 ///
-///     let copied = list.fold_strict (fn ok p -> ok && copy_payload! handle ..) ..;
+///     let copied = list.fold_strict (fn! ok p -> ok && copy_payload! handle ..) ..;
 ///     io.close! handle
 ///
 /// -- and staging `copied` put every write after the close, which the runtime
@@ -4628,8 +4639,15 @@ when test {
         test.case "a lambda inside a pure function is still pure"
             $( test.true! (str.contains_str "inside the pure function `<lambda>`"
                    (first (checked! "let go! = 1;\nlet f = fn x -> go!;"))) ),
-        test.case "a lambda inside an impure function may perform effects"
-            $( test.eq! [] (checked! "let go! = 1;\nlet f! = fn x -> go!;") ),
+        test.case "a lambda inside an impure function is still pure"
+            $( test.true! (str.contains_str "inside the pure function `<lambda>`"
+                   (first (checked! "let go! = 1;\nlet f! = fn x -> go!;"))) ),
+        test.case "`fn!` may perform effects"
+            $( test.eq! [] (checked! "let go! = 1;\nlet f! = fn! x -> go!;") ),
+        test.case "`fn!` may be made in a pure function"
+            $( test.eq! [] (checked! "let go! = 1;\nlet f = fn! x -> go!;") ),
+        test.case "the note for a lambda says `fn!`"
+            $( test.true! (str.contains_str "`fn!`" (note_of (checked! "let go! = 1;\nlet f = fn x -> go!;"))) ),
         test.case "a thunk may be impure wherever it is written"
             $( test.eq! [] (checked! "let go! = 1;\nlet f = $( go! );") ),
         test.case "a local impure function may be declared inside a pure one"

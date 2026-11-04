@@ -913,6 +913,7 @@ let rec infer k h e ds = match e {
         [join bt ht, ds2]
     },
     [:lambda, ps, body, sp] => lambda k h ps body :any sp ds,
+    [:impure_lambda, ps, body, sp] => lambda k h ps body :any sp ds,
     [:comp, _, x, sp] => {
         let [t, ds1] = infer k h x ds;
         match comp_datum k h sp {
@@ -1000,6 +1001,7 @@ let rec check k h e expected why ds =
     else {
         match e {
             [:lambda, ps, body, sp] => list.nth 1 (lambda k h ps body expected sp ds),
+            [:impure_lambda, ps, body, sp] => list.nth 1 (lambda k h ps body expected sp ds),
             [:if, c, t, el, sp] => {
                 let ds1 = check k h c :bool "the condition of an `if`" ds;
                 let ds2 = check k (narrowing k h c true) t expected why ds1;
@@ -1336,7 +1338,7 @@ let not_a_function t = match t {
     _ => false,
 };
 
-let is_lambda e = match e { [:lambda, _, _, _] => true, _ => false };
+let is_lambda e = match e { [:lambda, _, _, _] => true, [:impure_lambda, _, _, _] => true, _ => false };
 
 let infer_apply k h f args sp ds = {
     match overload_form k h (ast.apply_e f args sp) {
@@ -1528,7 +1530,7 @@ let rec solved_inputs subst t n =
         }
     };
 
-let lambda_arity a = match a { [:lambda, ps, _, _] => list.length ps, _ => 0 };
+let lambda_arity a = match a { [:lambda, ps, _, _] => list.length ps, [:impure_lambda, ps, _, _] => list.length ps, _ => 0 };
 
 /// Whether a deferred argument suits a candidate, once what it answers has
 /// been solved into `wanted`. A lambda is asked only about its answer: its
@@ -1547,6 +1549,7 @@ let answers_fit k a lt wanted =
 
 let infer_lambda_at k h a p ds = match a {
     [:lambda, ps, body, sp] => lambda k h ps body p sp ds,
+    [:impure_lambda, ps, body, sp] => lambda k h ps body p sp ds,
     _ => infer k h a ds,
 };
 

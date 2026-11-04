@@ -452,7 +452,8 @@ let rec parse_ident c word sp rest =
         "true" => ok (ast.bool_e true sp) rest,
         "false" => ok (ast.bool_e false sp) rest,
         "if" => parse_if c sp rest,
-        "fn" => parse_lambda c sp rest,
+        "fn" => parse_lambda c sp rest false,
+        "fn!" => parse_lambda c sp rest true,
         "try!" => parse_try c sp rest,
         "defer!" => match parse_expr c rest {
             [:error, m, s] => err m s,
@@ -596,9 +597,10 @@ let rec parse_else c sp cond then_e ts =
         }
     };
 
-/// `fn a b -> e`. The body runs as far as the grammar allows, so a lambda
-/// passed as a non-final argument has to be parenthesised.
-let rec parse_lambda c sp ts =
+/// `fn a b -> e`, or `fn! a b -> e` for one that may perform effects. The body runs as
+/// far as the grammar allows, so a lambda passed as a non-final argument has to be
+/// parenthesised.
+let rec parse_lambda c sp ts impure =
     match lambda_params [] ts {
         [:error, m, s] => err m s,
         [:ok, params, rest] =>
@@ -607,7 +609,7 @@ let rec parse_lambda c sp ts =
                 match parse_expr c rest {
                     [:error, m, s] => err m s,
                     [:ok, body, rest2] =>
-                        ok (ast.lambda_e params body (ast.span_to sp (ast.span body))) rest2,
+                        ok ((if impure { ast.impure_lambda_e } else { ast.lambda_e }) params body (ast.span_to sp (ast.span body))) rest2,
                 }
             },
     };
@@ -1011,6 +1013,7 @@ let rec questions e =
         match e {
             [:block, stmts, sp] => [:block, questions_block stmts sp, sp],
             [:lambda, ps, body, sp] => [:lambda, ps, questions_body body, sp],
+            [:impure_lambda, ps, body, sp] => [:impure_lambda, ps, questions_body body, sp],
             [:thunk, body, sp] => [:thunk, questions_body body, sp],
             [:match, sc, arms, sp] =>
                 [:match, questions sc,

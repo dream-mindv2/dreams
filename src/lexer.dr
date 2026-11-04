@@ -627,15 +627,15 @@ let lex_errors sources = list.map (fn s -> verdict s) sources;
 /// - the first is what *starts* the processes. Without it every `spawn!` is
 ///   itself a thunk, and they would run one at a time as each `join!` forced
 ///   its element -- the exact opposite of what the code looks like.
-/// - the second is what makes this return *values*. `list.map (fn p -> join! p)`
+/// - the second is what makes this return *values*. `list.map (fn! p -> join! p)`
 ///   is a lazy list whose cells are still `join!`s, so without it the waiting
 ///   happens wherever the caller eventually forces a cell, which may be much
 ///   later and somewhere that has no idea it is waiting on a process. An
 ///   impure function should hand back an answer, not an effect still waiting
 ///   to happen.
 let lex_errors! sources = {
-    let running = strict! (list.map (fn s -> spawn! $( strict! (verdict s) )) sources);
-    strict! (list.map (fn p -> join! p) running)
+    let running = strict! (list.map (fn! s -> spawn! $( strict! (verdict s) )) sources);
+    strict! (list.map (fn! p -> join! p) running)
 };
 
 // --- tests -------------------------------------------------------------------

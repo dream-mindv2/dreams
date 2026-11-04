@@ -174,7 +174,7 @@ and `zip`.
 - **An impure `let` is a statement, not a binding.** A pure `let` is lazy: it is
   not evaluated where it is written, so writing it elsewhere changes nothing. An
   impure one is forced in the order the block gives. `dreams` writes a payload
-  as `let copied = list.fold_strict (fn ok p -> ok && copy_payload! handle ..)
+  as `let copied = list.fold_strict (fn! ok p -> ok && copy_payload! handle ..)
   ..; io.close! handle`, and moving that binding put every write *after* the
   close -- which the runtime answered with `:io_closed`, in the one e2e test
   that builds a payload. Purity is spelling in this language, so the guard is

@@ -550,6 +550,10 @@ let rec mentioned_in deep e =
             if deep {
                 list.append (map (fn p -> param_name_of p) ps) (mentioned_in deep body)
             } else { [] },
+        [:impure_lambda, ps, body, _] =>
+            if deep {
+                list.append (map (fn p -> param_name_of p) ps) (mentioned_in deep body)
+            } else { [] },
         [:comp, _, x, _] => if deep { mentioned_in deep x } else { [] },
         [:list, xs, _]  => mentioned_all deep xs,
         [:array, xs, _] => mentioned_all deep xs,

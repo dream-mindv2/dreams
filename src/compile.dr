@@ -390,7 +390,7 @@ let checked_in_parts! how cache ks r keep = {
     // reads back, and a piece of one would be a stranger to it.
     let said = list.concat (progress.join_heaviest_first! (match how { :first => "checking", :select => "choosing", _ => "inferring" })
         (fn w -> lower.slice_weight (list.nth 1 w))
-        (fn w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache }) (list.nth 2 w) (list.head w) (list.nth 1 w))
+        (fn! w -> check_elsewhere! how (match list.nth 2 w { () => (), _ => cache }) (list.nth 2 w) (list.head w) (list.nth 1 w))
         work);
     map (fn one -> list.nth 1 one) (list.sort_on (fn one -> list.head one) said)
 };

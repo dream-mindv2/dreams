@@ -197,8 +197,8 @@ the session is compiled whole, so that is where the compiler was reading.
 ";
 
 let show_session! s = {
-    list.map (fn line -> console.print! line) (imports s) |> strict!
-    list.map (fn line -> console.print! line) (defs s) |> strict!
+    list.map (fn! line -> console.print! line) (imports s) |> strict!
+    list.map (fn! line -> console.print! line) (defs s) |> strict!
     if list.is_empty (defs s) { console.print! "// (nothing defined yet)" } else { () }
 };
 

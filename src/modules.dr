@@ -553,7 +553,7 @@ let canonical_name! l file fallback = {
 /// the root's load works them out once and the loader carries them; a loader
 /// that does not carry them works them out where it is asked.
 let package_roots! l = match Loader.package_roots l {
-    () => map (fn pkg -> [path.segments (path.absolute! (package.src pkg)), package.name pkg])
+    () => map (fn! pkg -> [path.segments (path.absolute! (package.src pkg)), package.name pkg])
                    (package.packages (packages l)),
     roots => roots,
 };
@@ -666,6 +666,7 @@ let expand_items owner cfg items = {
 let rec strict_everything node : :any =
     match node {
         [:lambda, ps, b, sp] => [:lambda, strict_params ps, strict_everything b, sp],
+        [:impure_lambda, ps, b, sp] => [:impure_lambda, strict_params ps, strict_everything b, sp],
         [:let, n, ps, b, r, sp] =>
             [:let, n, (if wrapper_shaped b { ps } else { strict_params ps }), strict_everything b, r, sp],
         _ => if type_of node == :list { list.map strict_everything node } else { node },
@@ -924,7 +925,7 @@ let rec load_package! l dotted at from_source =
             else {
                 let seen = mark_visited dotted
                     (Loader.set_namespaces (list.append (namespaces l) [dotted]) l);
-                [fold (fn acc m -> {
+                [fold (fn! acc m -> {
                     let full = dotted + "." + m;
                     // A module of the package that is already being loaded is
                     // the one doing the importing: `mind/std/src/all.dr` says
@@ -971,7 +972,7 @@ let rec hoist_mod! l parent source m =
                 // are: by the time this is recorded it is an ordinary module.
                 let kept = expand_items full (config_in l full) items;
                 // Consed and reversed once, as `load_items!` does its own.
-                let nested = fold (fn acc item ->
+                let nested = fold (fn! acc item ->
                     match item {
                         [:mod, _, _, _] => {
                             let done = hoist_mod! (list.head acc) full source item;
@@ -982,7 +983,7 @@ let rec hoist_mod! l parent source m =
                 let inner_items = list.reverse (list.nth 1 nested);
 
                 // A submodule may import, so follow those before it is recorded.
-                let followed = fold (fn acc d -> {
+                let followed = fold (fn! acc d -> {
                     let dep = list.head d;
                     // Its own submodule, put there by the hoist above, or a
                     // sibling reached by walking outwards: either way already
@@ -1175,7 +1176,7 @@ let load_items! l source parsed display name file text = {
             // declarations allocated 493 MB here, four times what half as many
             // did -- see "The item list was appended to" in
             // docs/notes/compiler-scaling.md.
-            let hoisted = fold (fn acc item ->
+            let hoisted = fold (fn! acc item ->
                 match item {
                     [:mod, _, _, _] => {
                         let done = hoist_mod! (list.head acc) name source item;
@@ -1187,7 +1188,7 @@ let load_items! l source parsed display name file text = {
 
             // Follow this module's own imports before recording it, so the
             // module list comes out with dependencies first.
-            let followed = list.fold (fn acc d -> {
+            let followed = list.fold (fn! acc d -> {
                 let dep = list.head d;
                 // `import io.{ .. }` inside a module declaring `mod io { .. }`
                 // means *that* submodule, already loaded, so there is nothing
