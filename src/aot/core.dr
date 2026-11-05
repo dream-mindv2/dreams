@@ -1509,6 +1509,19 @@ let host_value cx n s = {
     let path = image.import_path cx.[:img] (image.Global.target g);
     let member = image.string cx.[:img] (image.Node.b n);
     match native_named cx path member {
+        // Named as a value -- dre's table of the VM's members holds it -- it is what a call of
+        // it is (`applied`), a function of the module over this program's own table, and not
+        // the runtime's answer of nothing.
+        Option.some(_) if path == "std.vm" && member == "host_members" => {
+            let [table, s1] = intern_string (host_table cx) s;
+            let [params, s2] = fresh_many 1 s1;
+            let [id, s3] = fresh s2;
+            let symbol = "@wm" + to_string id;
+            let body = Expr.call "@lib_host_members_in" [Atom.address table, Atom.var (list.head params)];
+            let f = Function.make symbol symbol :function true params [] body member [];
+            [static_closure symbol, s3 |> St.set_needed_lib ((St.needed_lib s3).["host_members_in" => true])
+                                       |> St.set_functions (list.cons f (St.functions s3))]
+        },
         Option.some(fn_name) => wrapper_of_native cx fn_name s,
         Option.none => {
             // Not there at all: an error when it is reached, by a function that raises it.
