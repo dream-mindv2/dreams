@@ -1108,6 +1108,8 @@ let host_member_list = [
     ["std.vm.monitor!", "monitor!"],
     ["std.vm.demonitor!", "demonitor!"],
     ["std.vm.unique!", "unique_value!"],
+    ["std.vm.per_process", "per_process!"],
+    ["std.vm.raised_at", "raised_at!"],
     ["std.vm.now_ns!", "now_ns_value!"],
     ["std.vm.wall_ms!", "wall_ms!"],
     ["std.vm.await_message!", "await_message_m!"],
@@ -1616,12 +1618,13 @@ let native_builtins = %{
 let native_lazy : :map;
 let native_lazy = %{
     "array_new!" => [1], "error_new!" => [1], "array_store!" => [2], "new_cons!" => [0, 1], "spawn!" => [0],
-    "trunk_push!" => [0], "trunk_cons!" => [0], "trunk_set!" => [1],
+    "trunk_push!" => [0], "trunk_cons!" => [0], "trunk_set!" => [1], "per_process!" => [1],
 };
 
 /// Natives that answer what they found without forcing it.
 let answers_unforced : :map;
-let answers_unforced = %{"match_at!" => true, "list_head!" => true, "list_tail!" => true, "trunk_read!" => true, "error_payload!" => true};
+let answers_unforced = %{"match_at!" => true, "list_head!" => true, "list_tail!" => true, "trunk_read!" => true, "error_payload!" => true,
+                         "per_process!" => true};
 
 let library_call : :any -> :string -> [:integer] -> Env -> St -> [Expr, St];
 let library_call cx name args env s =
