@@ -1410,6 +1410,11 @@ let fixed_infos g = {
      info_text "@i_record_s" (rt "code_value!") 9 0 0,
      info_text "@i_map_s" (rt "code_value!") 10 0 0,
      info_text "@i_map_leaf_s" (rt "code_value!") 11 4 0,
+     // And for one also fit to share: every closure in it has its captures evaluated.
+     info_text "@i_cons_x" (rt "code_value!") 5 2 0,
+     info_text "@i_array_x" (rt "code_value!") 8 0 0,
+     info_text "@i_record_x" (rt "code_value!") 9 0 0,
+     info_text "@i_map_x" (rt "code_value!") 10 0 0,
      info_text "@i_big" (rt "code_value!") 12 0 0,
      info_text "@i_error" (rt "code_value!") 13 3 0,
      info_text "@i_raised" (rt "code_raised!") 0 1 0,
@@ -1426,6 +1431,9 @@ let fixed_infos g = {
      info_text "@i_start" (rt "frame_start!") 0 2 0,
      info_text "@i_process" (rt "code_value!") 14 1 0,
      info_text "@i_trunk" (rt "code_value!") 15 3 0,
+     // A trunk known to be evaluated all the way down; a trunk is never changed, only remade.
+     info_text "@i_trunk_s" (rt "code_value!") 15 3 0,
+     info_text "@i_trunk_x" (rt "code_value!") 15 3 0,
      info_text "@i_tensor" (rt "code_value!") 16 0 0,
      info_text "@i_module" (rt "code_value!") 17 2 0,
      info_text "@i_m_join" (rt "join_m!") 0 0 0,
