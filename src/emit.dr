@@ -185,8 +185,16 @@ let node_bytes n =
 /// (`vm.node_section`, `vm.index_section`), the same bytes `node_bytes` and
 /// `index` write -- the tests below hold them to it -- in one call a section
 /// rather than a call and a `_str_le` a field.
-let node_section nodes = vm.node_section [nodes, ir.op_codes];
-let kids_section kids = vm.index_section kids;
+///
+/// Built native, there is no VM to write them, and they are written here.
+when not native {
+    let node_section nodes = vm.node_section [nodes, ir.op_codes];
+    let kids_section kids = vm.index_section kids;
+}
+when native {
+    let node_section nodes = concat_map (fn n -> node_bytes n) nodes;
+    let kids_section kids = concat_map (fn k -> index k) kids;
+}
 
 let func_bytes f =
     str.concat_all [

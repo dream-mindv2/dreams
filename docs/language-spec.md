@@ -1638,7 +1638,8 @@ A **flag** is defined or not, and a **setting** has a value (and also counts
 as defined). The compiler sets `os` (`"linux"`, `"macos"`, `"windows"`) and
 `family` (`"unix"`, `"windows"`). Everything else comes from the command
 line: `-D name`, `-D name=value`, `--test` (defines `test`), `--release`
-(`release`), `--debug-cfg` (`debug`). `dreams --print-cfg` prints what is
+(`release`), `--debug-cfg` (`debug`), `--aot` (`native`: the program is
+being built to run on the native runtime, not the VM). `dreams --print-cfg` prints what is
 set.
 
 A package's **options** are settings scoped to that package. `-D

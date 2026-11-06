@@ -32,11 +32,11 @@
 
 import std.list;
 import std.str;
-import std.vm;
 
 import dreams.ast;
 import dreams.diag;
 import dreams.emit;
+import dreams.images;
 import dreams.ir;
 import dreams.lower;
 import dreams.typecheck;
@@ -188,7 +188,7 @@ let settle! low contracts =
     if list.is_empty contracts { [] }
     else {
         let [bytes, _] = batch_image low contracts;
-        let answers = try! { vm.eval_image! bytes } catch e { Unrun.make e };
+        let answers = try! { images.eval! bytes } catch e { Unrun.make e };
         match answers {
             Unrun(why) => {
                 let first = list.head contracts;

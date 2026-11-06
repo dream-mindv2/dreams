@@ -42,22 +42,50 @@ group Gen {
     /// and the thunks that have such an entry (`once`).
     once_vars : :map,
     once_syms : :map,
+    /// The count a function's own names are made from (`instr`, `label_of`), begun again for
+    /// each function: `next` is the program's, and names its symbols.
+    local : :integer,
+    /// Each function body written so far, by its text, and the symbol it was written under.
+    bodies : %{:string => :string},
 }
 
 let args_text : [:string] -> :string;
 let args_text vals = str.join_str ", " (list.map (fn v -> "i64 " + v) vals);
 
+// A line is made when it is emitted, and the counter moved when it is taken. Left to be made
+// later, each line was a suspension of its pieces and of everything they were made from, and
+// each `next` a suspension of the generator before it: the lines of a whole program, and
+// every state the generator had been in, were live at once until the text was joined. dre's
+// IR, 27 MB, held 980 MB; the compiler's ran past 12 GB.
 let emit : :string -> Gen -> Gen;
-let emit text g = Gen.set_lines (list.cons text (Gen.lines g)) g;
+let emit !text !g = lines_onto (list.cons text (Gen.lines g)) g;
+
+let lines_onto : [:string] -> Gen -> Gen;
+let lines_onto !lines g = Gen.set_lines lines g;
 
 let instr : :string -> Gen -> [:string, Gen];
-let instr text g = {
-    let name = "%v" + to_string (Gen.next g);
-    [name, emit (str.concat_all ["  ", name, " = ", text]) (Gen.set_next (Gen.next g + 1) g)]
-};
+let instr text !g = named_instr (numbered "%v" (Gen.local g)) text g;
+
+let named_instr : :string -> :string -> Gen -> [:string, Gen];
+let named_instr !name text g = made name (emit (str.concat_all ["  ", name, " = ", text]) (moved g));
 
 let label_of : :string -> Gen -> [:string, Gen];
-let label_of stem g = [stem + to_string (Gen.next g), Gen.set_next (Gen.next g + 1) g];
+let label_of stem !g = made (numbered stem (Gen.local g)) (moved g);
+
+/// `stem` and `n`.
+let numbered : :string -> :integer -> :string;
+let numbered !stem !n = stem + to_string n;
+
+/// A name and the generator after it, both made.
+let made : :string -> Gen -> [:string, Gen];
+let made !name !g = [name, g];
+
+/// `g` with its function's counter moved on, the count made now.
+let moved : Gen -> Gen;
+let moved !g = local_at (Gen.local g + 1) g;
+
+let local_at : :integer -> Gen -> Gen;
+let local_at !n g = Gen.set_local n g;
 
 let start : :string -> Gen -> Gen;
 let start name g = Gen.set_label name (emit (name + ":") g);
@@ -574,7 +602,7 @@ let expr e env sp g = match e {
         let info = "@i_k" + to_string n;
         let size = 1 + list.length live;
         let g1 = Gen.set_next (n + 1) g;
-        let g2 = g1 |> Gen.set_data (list.cons (info_with info symbol 0 size 0 "null" "null" 0 (Gen.place g1)) (Gen.data g1))
+        let g2 = g1 |> datum_onto (info_with info symbol 0 size 0 "null" "null" 0 (Gen.place g1))
                     |> Gen.set_pending (list.cons [symbol, live, x, rest] (Gen.pending g1));
         let [below, g3] = reserve sp size g2;
         let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr ", info, " to i64)"]) g3;
@@ -587,7 +615,7 @@ let expr e env sp g = match e {
         let info = "@i_k" + to_string n;
         let size = 1 + list.length live;
         let g1 = Gen.set_next (n + 1) g;
-        let g2 = g1 |> Gen.set_data (list.cons (info_with info (rt_symbol g "frame_catch_return!") (if cleanup { 23 } else { 20 }) size 0 symbol "null" 0 (Gen.place g1)) (Gen.data g1))
+        let g2 = g1 |> datum_onto (info_with info (rt_symbol g "frame_catch_return!") (if cleanup { 23 } else { 20 }) size 0 symbol "null" 0 (Gen.place g1))
                     |> Gen.set_pending (list.cons [symbol, live, x, handler] (Gen.pending g1));
         let [below, g3] = reserve sp size g2;
         let g4 = store_at below 0 (str.concat_all ["ptrtoint (ptr ", info, " to i64)"]) g3;
@@ -780,7 +808,7 @@ let thunk_once f g = {
     let g3 = expr (core.Function.body f) env "%sp0" g2;
     let size = if list.is_empty captures { 1 } else { list.length captures };
     let g4 = finish osym (emit (str.concat_all ["; ", core.Function.name f, " (entered once)"]) g3);
-    drain (Gen.set_data (list.cons (info_text (info_symbol osym) osym 0 size 0) (Gen.data g4)) g4)
+    drain (datum_onto (info_text (info_symbol osym) osym 0 size 0) g4)
 };
 
 // --- workers: floats across calls -------------------------------------------------------------
@@ -1175,12 +1203,30 @@ let header symbol = str.concat_all ["define internal tailcc i64 ", symbol, "(i64
 
 /// Close the function being generated, and start none.
 let finish : :string -> Gen -> Gen;
+//
+// A function's names are its own (`local`), so two functions that do the same thing are the
+// same text but for their symbol, and the second is written as an alias of the first. Most
+// are continuations, and most of those are a handful of shapes -- a native called on what was
+// forced, its answer handed on -- written again at every place one is forced: in `dreams`,
+// 458,000 functions were 190,000 bodies.
 let finish symbol g = {
     let body = str.concat_all (list.flat_map (fn l -> [l, "\n"]) (list.reverse (Gen.lines g)));
-    g |> Gen.set_code (list.cons (str.concat_all [header symbol, body, "}\n"]) (Gen.code g))
-      |> Gen.set_lines []
-      |> Gen.set_label "entry"
+    let written = match map.lookup body (Gen.bodies g) {
+        Option.some(first) => code_onto (str.concat_all [symbol, " = internal alias i64 (i64, i64, i64, i64, i64, i64), ptr ", first, "\n"]) g,
+        Option.none => bodies_at ((Gen.bodies g).[body => symbol]) (code_onto (str.concat_all [header symbol, body, "}\n"]) g),
+    };
+    written |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_local 0
 };
+
+let bodies_at : %{:string => :string} -> Gen -> Gen;
+let bodies_at !bodies g = Gen.set_bodies bodies g;
+
+/// `g` with a function's text kept, made now: left to be made, it kept the function's lines.
+let code_onto : :string -> Gen -> Gen;
+let code_onto !text !g = codes_onto (list.cons text (Gen.code g)) g;
+
+let codes_onto : [:string] -> Gen -> Gen;
+let codes_onto !code g = Gen.set_code code g;
 
 /// What comes after each `seq`, each a function that takes its frame apart. Doing one
 /// may queue more, so this goes until there are none.
@@ -1241,7 +1287,7 @@ let function f g = {
     let extra = if arity > 3 { arity - 3 } else { 0 };
     let [place_text, place_sym] = place_of f plain;
     let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_place place_sym
-              |> (fn x -> Gen.set_data (list.append place_text (Gen.data x)) x);
+              |> (fn x -> data_onto (list.append place_text (Gen.data x)) x);
     let g1 = safepoint symbol extra g0;
     let registers = ["%b", "%c", "%d"];
     let env0 = list.fold (fn m [i, v] -> if i < 3 { m.[v => registers.[i]] } else { m }) %{} (list.enumerate params);
@@ -1287,8 +1333,17 @@ let function f g = {
         [str.concat_all ["@caf_", plain, " = internal global <{ ptr, ptr, i64, i64 }> <{ ptr @i_shared, ptr @caft_", plain, ", i64 0, i64 0 }>, align 8\n"],
          str.concat_all ["@caft_", plain, " = internal constant <{ ptr, i64 }> <{ ptr ", info_symbol symbol, ", i64 1 }>, align 8\n"]]
     } else { [] };
-    drain (Gen.set_data (list.concat [cafs, infos, Gen.data g7]) g7)
+    drain (data_onto (list.concat [cafs, infos, Gen.data g7]) g7)
 };
+
+/// `g` with its data, made now: left to be made, the data of each function held the
+/// generator it was made from, and through it every one before.
+let data_onto : [:string] -> Gen -> Gen;
+let data_onto !data g = Gen.set_data data g;
+
+/// `g` with one more datum, made now, for the same reason.
+let datum_onto : :string -> Gen -> Gen;
+let datum_onto !text !g = data_onto (list.cons text (Gen.data g)) g;
 
 /// A string as a static object, laid out as the runtime's `new_string!` makes one.
 let string_object : :string -> :string -> :string;
@@ -1488,7 +1543,7 @@ let assemble user st unit_ lib_names entry arch = {
     let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
         %{} (core.St.functions st);
     let [once_vars, once_syms] = once_thunks (core.St.functions st);
-    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] workers once_vars once_syms;
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] workers once_vars once_syms 0 %{};
     let g = list.fold (fn g1 f -> function f g1) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
     let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));

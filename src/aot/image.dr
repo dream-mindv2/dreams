@@ -92,6 +92,24 @@ let global img i = {
     Global.make (u32_at b o) (u32_at b (o + 4)) (u32_at b (o + 8))
 };
 
+/// The function `module.name` is, by the module's table of its globals (`MODS`), as the VM
+/// finds one for `vm.call_image!`: `Option.none` if the image has no such function.
+let function_in_module : Image -> :string -> :string -> Option :integer;
+let function_in_module img module_name name = {
+    let b = Image.bytes img;
+    let found = list.find_map (fn mi -> {
+        let o = at img "MODS" + 24 * mi;
+        if string img (u32_at b o) != module_name { Option.none } else {
+            let start = u32_at b (o + 8);
+            list.find_map (fn gi -> {
+                let g = global img gi;
+                if Global.kind g == 0 && string img (Global.name g) == name { Option.some (Global.target g) } else { Option.none }
+            }) (list.range start (start + u32_at b (o + 12)))
+        }
+    }) (list.range 0 (count img "MODS"));
+    found
+};
+
 let string : Image -> :integer -> :string;
 let string img i = {
     let b = Image.bytes img;

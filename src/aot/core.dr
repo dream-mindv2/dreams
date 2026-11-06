@@ -15,6 +15,7 @@
 //
 // Translation refuses what is not built yet, by name, rather than guess.
 
+import std.io;
 import std.list;
 import std.map;
 import std.str;
@@ -1016,6 +1017,12 @@ let applied cx callee args env s = {
                     let [table, s1] = intern_string (host_table cx) s;
                     lazies cx args env (St.set_needed_lib ((St.needed_lib s1).["host_members_in" => true]) s1)
                         (fn atoms _ s2 -> [Expr.call "@lib_host_members_in" (list.cons (Atom.address table) atoms), s2])
+                } else if module_ == "std.vm" && member == "image_digest" {
+                    // What the VM answers running this image -- the SHA-256 of its bytes -- is
+                    // known now, and is the program's name for itself: `dreams` keys its cache
+                    // with it, so a build native and one on the VM read each other's units.
+                    let [digest, s1] = intern_string (image_digest_of cx.[:img]) s;
+                    [Expr.ret (Atom.address digest), s1]
                 } else { native_call cx module_ member args env s }
             } else { unknown () }
         },
@@ -1310,7 +1317,7 @@ let native_call cx module_ member args env s = match native_named cx module_ mem
 let vm_only : :map;
 let vm_only = list.fold (fn m k -> m.[k => true]) %{} [
     "std.vm.eval_image!", "std.vm.open_image!", "std.vm.call_image!", "std.vm.close_image!", "std.vm.image_function",
-    "std.vm.pure_image_function", "std.vm.locate_image!", "std.vm.image_digest", "std.vm.share_arenas", "std.vm.node_section", "std.vm.index_section",
+    "std.vm.pure_image_function", "std.vm.locate_image!", "std.vm.share_arenas", "std.vm.node_section", "std.vm.index_section",
 ];
 
 let missing_member : :any -> :string -> :string -> St -> [Expr, St];
@@ -1325,6 +1332,10 @@ let missing_member cx module_ member s = {
         [Expr.bind x (Rhs.native "no_such_member!" [Atom.address path, Atom.address name]) (Expr.ret (Atom.var x)), s3]
     }
 };
+
+/// The digest `vm.image_digest` answers for `img` on the VM.
+let image_digest_of : image.Image -> :string;
+let image_digest_of img = io.digest (image.Image.bytes img);
 
 /// `vm.host_members`'s table: `module.member arity` a line.
 let host_table : :any -> :string;

@@ -29,6 +29,7 @@ import dreams.ast;
 import dreams.builtins;
 import dreams.diag;
 import dreams.emit;
+import dreams.images;
 import dreams.fuse;
 import dreams.ir;
 import dreams.opt;
@@ -3281,7 +3282,7 @@ let comp_failed src span why l =
 /// `settle_comp!` for a lowering made in parts: see `settle_parts_comps!`.
 let settle_part_comp! bytes one l = {
     let [_, fi, src, span] = one;
-    let value = try! { vm.eval_image! bytes } catch e { Raised.make e };
+    let value = try! { images.eval! bytes } catch e { Raised.make e };
     match value {
         Raised(why) => comp_failed src span why l,
         v => {
@@ -3430,7 +3431,7 @@ let rec const_seq op items l = {
 /// with only the entry changed -- see `emit.with_entry`.
 let settle_comp! bytes_of one l = {
     let [node, fi, src, span] = one;
-    let value = try! { vm.eval_image! (bytes_of fi) } catch e { Raised.make e };
+    let value = try! { images.eval! (bytes_of fi) } catch e { Raised.make e };
     match value {
         Raised(why) => comp_failed src span why l,
         v => {

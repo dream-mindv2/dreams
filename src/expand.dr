@@ -9,6 +9,7 @@ import std.vm;
 import dreams.ast;
 import dreams.diag;
 import dreams.emit;
+import dreams.images;
 import dreams.ir;
 import dreams.lower;
 import dreams.modules;
@@ -487,7 +488,7 @@ let evaluate_round! base s session0 jobs = {
             let resolving = phase! st :resolve resolved;
             let building = phase! (list.head resolving) :image arena;
             let ready = phase! (list.head building) :emit bytes;
-            let handle = vm.open_image! bytes;
+            let handle = images.open! bytes;
             [counts (list.head ready) [[:images, 1], [:image_bytes, str.byte_length bytes]],
              handle]
         },
@@ -591,7 +592,7 @@ let evaluate_round! base s session0 jobs = {
                     let handle = list.nth 1 opened;
                     let started = reading! ();
                     let outcome = try! {
-                        let value = vm.call_image! handle
+                        let value = images.call! handle
                             (modules.module_name (modules.module_at staged target_mi))
                             target_name (call_args (list.head (trunk.at i call_at)));
                         strict! value
@@ -619,7 +620,7 @@ let evaluate_round! base s session0 jobs = {
                             strict! got
                             let spent = match list.nth 1 got {
                                 () => (),
-                                other => vm.close_image! other,
+                                other => images.close! other,
                             };
                             strict! spent
                             [list.head got, handle, list.cons (list.nth 2 got) answers]
@@ -794,7 +795,7 @@ let expand_item! base s mi i item = {
     let result = rounds! base s () mi item 0;
     strict! result
     let [state, session, expanded] = result;
-    let spent = match session { () => (), handle => vm.close_image! handle };
+    let spent = match session { () => (), handle => images.close! handle };
     strict! spent
     let current = modules.module_at (loader state) mi;
     put_loader (replace_module (loader state) mi
@@ -1040,7 +1041,7 @@ let expand_work! l work = {
         let state = list.head batched;
         // One image served every round of the whole program; this is where it
         // stops being needed.
-        let spent = match list.nth 1 batched { () => (), handle => vm.close_image! handle };
+        let spent = match list.nth 1 batched { () => (), handle => images.close! handle };
         strict! spent
         // Nothing complained, so one snapshot answered for the whole program
         // and the batch is the answer. Otherwise a declaration wanted

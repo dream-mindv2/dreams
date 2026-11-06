@@ -716,12 +716,18 @@ let optimize_parts img parts invented_from = optimize_parts_filled img parts inv
 /// The walk is the VM's (`vm.share_arenas`), and is `optimize_parts_by_hand`
 /// step for step: this is a whole-program walk a warm build cannot keep
 /// between builds, and in Dream it was a map insert and a `to_string` per node.
+/// Built native, there is no VM to walk them, and the walk is the one by hand.
 let optimize_parts_filled : ir.Image -> :array -> :integer -> :map -> ir.Image;
-let optimize_parts_filled img parts invented_from filled = {
-    let [nodes, kids, funcs] = vm.share_arenas [(ir.Image.funcs img), parts, invented_from, filled,
-                                                edge_map, run_map, part_base];
-    img |> ir.Image.set_nodes nodes |> ir.Image.set_kids kids |> ir.Image.set_funcs funcs
-};
+when not native {
+    let optimize_parts_filled img parts invented_from filled = {
+        let [nodes, kids, funcs] = vm.share_arenas [(ir.Image.funcs img), parts, invented_from, filled,
+                                                    edge_map, run_map, part_base];
+        img |> ir.Image.set_nodes nodes |> ir.Image.set_kids kids |> ir.Image.set_funcs funcs
+    };
+}
+when native {
+    let optimize_parts_filled img parts invented_from filled = optimize_parts_by_hand img parts invented_from filled;
+}
 
 /// The walk `vm.share_arenas` makes, as the definition of it: the tests below
 /// hold the two to each other.

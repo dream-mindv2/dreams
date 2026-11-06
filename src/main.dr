@@ -948,7 +948,9 @@ let rec parse_args args o =
         ["--sc-roundtrip", ..rest] => parse_args rest (with_opt :supercompile :roundtrip o),
         ["--supercompile", ..rest] => parse_args rest (with_opt :supercompile :drive o),
         ["--debug-info", ..rest] => parse_args rest (with_opt :debug_info true o),
-        ["--aot", ..rest] => parse_args rest (with_opt :aot true o),
+        // Built native, a program may say what to do where the native runtime has no twin of
+        // a VM native: `when native { .. }` (dreams/docs/language-spec.md, `when`).
+        ["--aot", ..rest] => parse_args rest (append_opt :defines "native" (with_opt :aot true o)),
         ["--no-supercompile", ..rest] => parse_args rest (with_opt :supercompile :none o),
         ["--sc-stats", ..rest] => parse_args rest (with_opt :sc_stats true o),
         ["--remap-path-prefix"] => with_opt :error "--remap-path-prefix needs FROM=TO" o,

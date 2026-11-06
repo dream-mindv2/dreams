@@ -1,0 +1,24 @@
+// How the compiler runs an image it has built -- a `comp`'s, a batch of contracts, a package's
+// macros. On the VM, with the VM's own natives (`vm.eval_image!` and the sessions,
+// dream/docs/builtins.md). Built native (`dreams --aot`, which defines `native`), there is no
+// VM to ask, and the image is run by dre, the VM written in Dream, which the build is handed
+// as a package (`-L dre=DIR`). A handle is whatever the one in use makes of an open image: an
+// integer on the VM, the loaded program under dre. Nothing here looks inside one.
+
+when not native {
+    import std.vm;
+
+    let eval! bytes = vm.eval_image! bytes;
+    let open! bytes = vm.open_image! bytes;
+    let call! handle module_name name args = vm.call_image! handle module_name name args;
+    let close! handle = vm.close_image! handle;
+}
+
+when native {
+    import dre.images as dre_images;
+
+    let eval! bytes = dre_images.eval! bytes;
+    let open! bytes = dre_images.open! bytes;
+    let call! handle module_name name args = dre_images.call! handle module_name name args;
+    let close! handle = dre_images.close! handle;
+}
