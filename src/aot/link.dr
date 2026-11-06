@@ -89,7 +89,8 @@ let r_glob_dat = 6;
 /// What the program needs of the machine it will run on, and the object's own
 /// bytes say the rest. `interp` is the dynamic loader's path, which is the one
 /// thing about a Linux that cannot be read from anywhere but the machine.
-group Options { interp : :string, needed : [:string], payload : :string }
+/// `symbols`: write the functions' names after everything else, for `perf` and a debugger.
+group Options { interp : :string, needed : [:string], payload : :string, symbols : :bool }
 
 group Section {
     index : :integer,
@@ -103,7 +104,8 @@ group Section {
     bytes : :string,
 }
 
-group Symbol { name : :string, shndx : :integer, value : :integer }
+/// `global`: bound outside its object, so another object's undefined use of the name is it.
+group Symbol { name : :string, shndx : :integer, value : :integer, global : :bool }
 
 group Reloc { offset : :integer, kind : :integer, symbol : :integer, addend : :integer }
 
@@ -152,7 +154,7 @@ let symbols ss = match list.filter (fn s -> Section.kind s == sht_symtab) ss {
         let b = Section.bytes table;
         list.map (fn i -> {
             let o = i * 24;
-            Symbol.make (cstr_at names (u32_at b o)) (u16_at b (o + 6)) (u64_at b (o + 8))
+            Symbol.make (cstr_at names (u32_at b o)) (u16_at b (o + 6)) (u64_at b (o + 8)) (u8_at b (o + 4) / 16 != 0)
         }) (list.range 0 (Section.size table / 24))
     },
 };
@@ -220,10 +222,65 @@ let patched bytes patches = {
 
 /// Write `obj` as an executable, or say why it cannot be one.
 let link : Options -> :string -> Result :string :string;
-let link o obj =
-    if str.slice 0 4 obj != str.of_bytes [127, 69, 76, 70] { Result.error "not an ELF object" }
-    else if u16_at obj 18 != em_x86_64 && u16_at obj 18 != em_aarch64 { Result.error "only x86-64 and aarch64 can be linked" }
-    else { laid_out o obj };
+let link o obj = link_all o [obj];
+
+/// The objects as one executable: what LLVM wrote for each part of a program it compiled at
+/// once (`vm.llvm_objects!`), each naming what the others define.
+let link_all : Options -> [:string] -> Result :string :string;
+let link_all o objs = match list.find (fn obj -> str.slice 0 4 obj != str.of_bytes [127, 69, 76, 70]) objs {
+    Option.some(_) => Result.error "not an ELF object",
+    Option.none => {
+        let machine = u16_at (list.head objs) 18;
+        if machine != em_x86_64 && machine != em_aarch64 { Result.error "only x86-64 and aarch64 can be linked" }
+        else if list.any (fn obj -> u16_at obj 18 != machine) objs { Result.error "the objects are for different machines" }
+        else { laid_out o (merged machine objs) }
+    },
+};
+
+// --- several objects as one ---------------------------------------------------------------
+//
+// The objects are read as one: each's sections numbered after the ones before, its symbols after
+// theirs, and its relocations moved with both. A relocation naming a symbol its object does not
+// define, which another defines as global, names that one; what none defines is an import, as
+// it was. The layout below then never knows there was more than one.
+
+/// The objects read as one: their sections, numbered from 0 across them all, their symbols, and
+/// each relocation section's relocations by its number.
+group Merged { machine : :integer, sections : [Section], symbols : :array, relocs : :map }
+
+let shn_loreserve = 65280;
+
+let merged : :integer -> [:string] -> Merged;
+let merged machine objs = {
+    let read = list.map (fn obj -> { let ss = sections obj; [ss, symbols ss] }) objs;
+    let offsets = fn sizes -> list.reverse (list.head (list.fold (fn [acc, at] n -> [list.cons at acc, at + n]) [[], 0] sizes));
+    let section_base = offsets (list.map (fn r -> list.length r.[0]) read);
+    let symbol_base = offsets (list.map (fn r -> list.length r.[1]) read);
+    let moved = fn base n -> if n == 0 || n >= shn_loreserve { n } else { base + n };
+    let all_symbols = array.of_list (list.concat (list.map (fn [r, sb] ->
+        list.map (fn sym -> Symbol.set_shndx (moved sb (Symbol.shndx sym)) sym) r.[1]) (list.zip read section_base)));
+    // Each defined global's number, by its name.
+    let defined = list.fold (fn m i -> {
+        let sym = all_symbols.[i];
+        if Symbol.global sym && Symbol.shndx sym != 0 && Symbol.name sym != "" { m.[Symbol.name sym => i] } else { m }
+    }) %{} (list.range 0 (len all_symbols));
+    let resolved = fn i -> {
+        let sym = all_symbols.[i];
+        if Symbol.shndx sym == 0 { defined.[Symbol.name sym else i] } else { i }
+    };
+    let parts = list.map (fn [[r, sb], yb] -> {
+        let ss = list.map (fn sec -> sec
+            |> Section.set_index (sb + Section.index sec)
+            |> Section.set_link (if Section.kind sec == sht_rela || Section.kind sec == sht_symtab { sb + Section.link sec } else { Section.link sec })
+            |> Section.set_info (if Section.kind sec == sht_rela { sb + Section.info sec } else { Section.info sec })) r.[0];
+        let relocs = list.fold (fn m sec -> if Section.kind sec != sht_rela { m } else {
+            m.[sb + Section.index sec => list.map (fn rel -> Reloc.set_symbol (resolved (yb + Reloc.symbol rel)) rel) (relocs_of sec)]
+        }) %{} r.[0];
+        [ss, relocs]
+    }) (list.zip (list.zip read section_base) symbol_base);
+    Merged.make machine (list.concat (list.map list.head parts))
+        all_symbols (list.fold (fn m part -> list.fold (fn mm kv -> mm.[kv.[0] => kv.[1]]) m (map.pairs part.[1])) %{} parts)
+};
 
 /// A 4 KB page's start, for `adrp`.
 let page_of : :integer -> :integer;
@@ -254,12 +311,14 @@ let aarch64_stub at slot = {
     le 4 adrp + le 4 ldr + le 4 3592356384 + le 4 3573751839
 };
 
-priv let laid_out : Options -> :string -> Result :string :string;
-priv let laid_out o obj = {
-    let ss = sections obj;
+priv let laid_out : Options -> Merged -> Result :string :string;
+priv let laid_out o m = {
+    let ss = Merged.sections m;
+    let machine = Merged.machine m;
+    let relocs_of = fn s -> (Merged.relocs m).[Section.index s else []];
     // A segment starts on a page of the largest size its kernel may have.
-    let seg_page = if u16_at obj 18 == em_aarch64 { 65536 } else { page };
-    let syms = array.of_list (symbols ss);
+    let seg_page = if machine == em_aarch64 { 65536 } else { page };
+    let syms = Merged.symbols m;
     let kept = list.filter allocated ss;
     let ro = list.filter (fn s -> not (writable s) && not (executable s)) kept;
     let rx = list.filter executable kept;
@@ -282,7 +341,7 @@ priv let laid_out o obj = {
     // A slot for each symbol the object defines but reaches through one: LLVM asks
     // for that for any symbol not marked as staying in this file. The address is
     // known here, so the slot is written rather than left to the loader.
-    let via_slot = fn r -> list.contains (Reloc.kind r) (if u16_at obj 18 == em_aarch64 { [ra_adr_got_page, ra_ld64_got_lo12_nc] }
+    let via_slot = fn r -> list.contains (Reloc.kind r) (if machine == em_aarch64 { [ra_adr_got_page, ra_ld64_got_lo12_nc] }
         else { [r_gotpcrel, r_gotpcrelx, r_rex_gotpcrelx] });
     let held = list.unique (list.filter (fn i -> Symbol.shndx syms.[i] != 0 || is_payload i)
         (list.flat_map (fn s -> list.map (fn r -> Reloc.symbol r) (list.filter via_slot (relocs_of s))) relas));
@@ -335,7 +394,7 @@ priv let laid_out o obj = {
     // Each relocation as a patch to its section, or the name of the one that
     // this does not know how to write. An unknown kind must stop the link: a word
     // left unrelocated is a crash at a distance.
-    let arm = u16_at obj 18 == em_aarch64;
+    let arm = machine == em_aarch64;
     // In two halves, words and branches and then the fields of an address's low bits, as one
     // match of that many guarded arms was more than the compiler before 0.2.9 could lower
     // (`always_matches` in lower.dr).
@@ -434,20 +493,18 @@ priv let laid_out o obj = {
                 // No executable stack: an object with no note would otherwise ask for one.
                 le 4 1685382481 + le 4 6 + zeros 48,
             ];
-            match list.find (fn s -> Symbol.name s == "_start") (array.to_list syms) {
+            match list.find (fn s -> Symbol.name s == "_start" && Symbol.shndx s != 0) (array.to_list syms) {
                 Option.none => Result.error "the object defines no _start",
                 Option.some(start) => {
                     let entry = addresses.[Symbol.shndx start] + Symbol.value start;
-                    let ehdr = str.of_bytes [127, 69, 76, 70, 2, 1, 1, 0] + zeros 8 + le 2 2 + le 2 (u16_at obj 18) + le 4 1
-                        + le 8 entry + le 8 ehdr_size + le 8 0 + le 4 0 + le 2 ehdr_size
-                        + le 2 phdr_size + le 2 phdr_count + le 2 64 + le 2 0 + le 2 0;
                     let seq = fn at pieces -> list.fold (fn [out, here] [where, text] ->
                         [list.cons text (list.cons (zeros (where - here)) out), where + len text]) [[], at] pieces;
-                    let [front, front_end] = seq 0 [
-                        [0, ehdr], [ehdr_size, phdrs], [at_interp, interp], [at_hash, hash],
-                        [at_dynsym, dynsym], [at_dynstr, strtab], [at_rela, rela]];
-                    let parts = list.concat [
-                        list.reverse front,
+                    // Everything after the header, which says where the symbols are, so is made last.
+                    let front_rest = list.reverse (list.head (seq ehdr_size [
+                        [ehdr_size, phdrs], [at_interp, interp], [at_hash, hash],
+                        [at_dynsym, dynsym], [at_dynstr, strtab], [at_rela, rela]]));
+                    let loaded = list.concat [
+                        front_rest,
                         list.reverse ro_pieces,
                         [zeros (payload_at - ro_sections_end), Options.payload o],
                         [zeros (rx_start - ro_end)],
@@ -458,9 +515,54 @@ priv let laid_out o obj = {
                         list.map (fn i -> le 8 (symbol_address i)) held,
                         list.reverse rw_pieces,
                     ];
-                    Result.ok (str.concat_all parts)
+                    let loaded_end = ehdr_size + list.fold (fn n t -> n + len t) 0 loaded;
+                    let functions = if Options.symbols o {
+                        Option.values (list.map (fn i -> {
+                            let sym = syms.[i];
+                            let n = Symbol.shndx sym;
+                            if Symbol.name sym != "" && n > 0 && n < list.length ss && executable ss.[n] {
+                                Option.some [Symbol.name sym, symbol_address i]
+                            } else { Option.none }
+                        }) (list.range 0 (len syms)))
+                    } else { [] };
+                    let [names_table, tail_, shoff, shnum] = symbol_table functions loaded_end rx_start (rx_stop - rx_start);
+                    let ehdr = str.of_bytes [127, 69, 76, 70, 2, 1, 1, 0] + zeros 8 + le 2 2 + le 2 machine + le 4 1
+                        + le 8 entry + le 8 ehdr_size + le 8 shoff + le 4 0 + le 2 ehdr_size
+                        + le 2 phdr_size + le 2 phdr_count + le 2 64 + le 2 shnum + le 2 (if shnum == 0 { 0 } else { shnum - 1 });
+                    Result.ok (str.concat_all (list.concat [[ehdr], loaded, [names_table, tail_]]))
                 },
             }
         },
     }
+};
+
+/// The functions' names, after what is loaded: `.text` over the code, `.symtab` and `.strtab`
+/// naming each function at its address, and `.shstrtab` -- nothing a loader reads, and what
+/// `perf` and `gdb` read to say where a program spends its time or stopped. `[padding and
+/// tables, section headers, where the headers start, how many]`, or nothing, when there are no
+/// names to write.
+let symbol_table : [[:any]] -> :integer -> :integer -> :integer -> [:any];
+let symbol_table functions at code_at code_size = if list.is_empty functions { ["", "", 0, 0] } else {
+    let [strtab, name_at] = list.fold (fn [text, m] [name, _] -> [list.cons "\0" (list.cons name text), m.[name => list.fold (fn n t -> n + len t) 0 text]])
+        [["\0"], %{}] functions;
+    let strtab_text = str.concat_all (list.reverse strtab);
+    // Local functions, in `.text`, at their addresses: what LLVM made them, internal all.
+    let symtab = zeros 24 + str.concat_all (list.map (fn [name, address] ->
+        le 4 name_at.[name] + le 1 2 + le 1 0 + le 2 1 + le 8 address + le 8 0) functions);
+    let shstrtab = "\0.text\0.symtab\0.strtab\0.shstrtab\0";
+    let at_symtab = align_up 8 at;
+    let at_strtab = at_symtab + len symtab;
+    let at_shstrtab = at_strtab + len strtab_text;
+    let shoff = align_up 8 (at_shstrtab + len shstrtab);
+    let header = fn name kind flags address offset size link info alignment entsize ->
+        le 4 name + le 4 kind + le 8 flags + le 8 address + le 8 offset + le 8 size
+        + le 4 link + le 4 info + le 8 alignment + le 8 entsize;
+    let headers = str.concat_all [
+        zeros 64,
+        header 1 1 (shf_alloc + shf_exec) code_at (code_at - base) code_size 0 0 16 0,
+        header 7 sht_symtab 0 0 at_symtab (len symtab) 3 (list.length functions + 1) 8 24,
+        header 15 3 0 0 at_strtab (len strtab_text) 0 0 1 0,
+        header 23 3 0 0 at_shstrtab (len shstrtab) 0 0 1 0,
+    ];
+    [str.concat_all [zeros (at_symtab - at), symtab, strtab_text, shstrtab, zeros (shoff - at_shstrtab - len shstrtab)], headers, shoff, 5]
 };

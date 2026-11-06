@@ -47,6 +47,9 @@ group Gen {
     local : :integer,
     /// Each function body written so far, by its text, and the symbol it was written under.
     bodies : %{:string => :string},
+    /// The pointer made of a word in this block, by the word (`pointer_at`): forgotten at the
+    /// next block, where it might not have been made.
+    ptrs : %{:string => :string},
 }
 
 let args_text : [:string] -> :string;
@@ -88,7 +91,7 @@ let local_at : :integer -> Gen -> Gen;
 let local_at !n g = Gen.set_local n g;
 
 let start : :string -> Gen -> Gen;
-let start name g = Gen.set_label name (emit (name + ":") g);
+let start name g = Gen.set_label name (emit (name + ":") g) |> Gen.set_ptrs %{};
 
 /// The symbol of a function of the runtime.
 let rt_symbol : Gen -> :string -> :string;
@@ -103,16 +106,48 @@ let atom_text env a = match a {
 
 let load_at : :string -> :integer -> Gen -> [:string, Gen];
 let load_at base offset g = {
-    let [address, g1] = instr (str.concat_all ["add i64 ", base, ", ", to_string offset]) g;
-    let [pointer, g2] = instr (str.concat_all ["inttoptr i64 ", address, " to ptr"]) g1;
-    instr ("load i64, ptr " + pointer) g2
+    let [pointer, g1] = pointer_at base offset g;
+    instr ("load i64, ptr " + pointer) g1
 };
 
 let store_at : :string -> :integer -> :string -> Gen -> Gen;
 let store_at base offset v g = {
-    let [address, g1] = instr (str.concat_all ["add i64 ", base, ", ", to_string offset]) g;
-    let [pointer, g2] = instr (str.concat_all ["inttoptr i64 ", address, " to ptr"]) g1;
-    emit (str.concat_all ["  store i64 ", v, ", ptr ", pointer]) g2
+    let [pointer, g1] = pointer_at base offset g;
+    emit (str.concat_all ["  store i64 ", v, ", ptr ", pointer]) g1
+};
+
+// Most of what is read and written is a word off one of a function's own registers -- the
+// context, the stack, the object in hand -- and each was an add, an `inttoptr` and the access,
+// half the text of a program. The three are pointers once, at the entry (`header`), which comes
+// before every block, and a word off one is a `getelementptr` and the access, or the access
+// alone at offset 0.
+
+/// The pointers a function's header makes of its registers, by the register.
+let entry_pointers : %{:string => :string};
+let entry_pointers = %{"%p" => "%pp", "%sp0" => "%spp", "%a" => "%ap"};
+
+let ptrs_at : %{:string => :string} -> Gen -> Gen;
+let ptrs_at !ptrs g = Gen.set_ptrs ptrs g;
+
+/// `%sp0` moved past `bytes` of arguments, or `%sp0` itself.
+let sp_past : :integer -> Gen -> [:string, Gen];
+let sp_past bytes g = if bytes == 0 { ["%sp0", g] } else { instr (str.concat_all ["add i64 %sp0, ", to_string bytes]) g };
+
+/// A pointer to the word `offset` bytes past `base`.
+let pointer_at : :string -> :integer -> Gen -> [:string, Gen];
+let pointer_at base offset g = {
+    let [start, g1] = match map.lookup base entry_pointers {
+        Option.some(made) => [made, g],
+        Option.none => match map.lookup base (Gen.ptrs g) {
+            Option.some(made) => [made, g],
+            Option.none => {
+                let [made, h] = instr (str.concat_all ["inttoptr i64 ", base, " to ptr"]) g;
+                [made, ptrs_at ((Gen.ptrs h).[base => made]) h]
+            },
+        },
+    };
+    if offset == 0 { [start, g1] }
+    else { instr (str.concat_all ["getelementptr i8, ptr ", start, ", i64 ", to_string offset]) g1 }
 };
 
 let jump : :string -> [:string] -> Gen -> Gen;
@@ -998,7 +1033,7 @@ let worker f mask g = {
         let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
         [m.[v => loaded], st1]
     }) [env0, g2] (list.enumerate captures);
-    let [sp, g4] = instr (str.concat_all ["add i64 %sp0, ", to_string (8 * extra)]) g3;
+    let [sp, g4] = sp_past (8 * extra) g3;
     let g5 = expr (core.Function.body f) env1 sp g4;
     drain (finish wsym (emit (str.concat_all ["; ", core.Function.name f, " (worker)"]) g5))
 };
@@ -1007,8 +1042,7 @@ let worker f mask g = {
 /// is what runs again after, with words, which comes back here at its entry.
 let worker_safepoint : :string -> [:integer] -> :integer -> Gen -> Gen;
 let worker_safepoint symbol mask extra g = {
-    let [guard_at, g0a] = instr "add i64 %p, 16" g;
-    let [guard_ptr, g0b] = instr (str.concat_all ["inttoptr i64 ", guard_at, " to ptr"]) g0a;
+    let [guard_ptr, g0b] = pointer_at "%p" 16 g;
     let [guard, g1] = instr ("load volatile i64, ptr " + guard_ptr) g0b;
     let [asked, g2] = instr (str.concat_all ["icmp ult i64 %sp0, ", guard]) g1;
     let [collect, g3] = label_of "collect" g2;
@@ -1199,7 +1233,8 @@ let core_within e !budget = if budget < 0 { budget } else {
 };
 
 let header : :string -> :string;
-let header symbol = str.concat_all ["define internal tailcc i64 ", symbol, "(i64 %p, i64 %sp0, i64 %a, i64 %b, i64 %c, i64 %d) {\nentry:\n"];
+let header symbol = str.concat_all ["define internal tailcc i64 ", symbol, "(i64 %p, i64 %sp0, i64 %a, i64 %b, i64 %c, i64 %d) {\nentry:\n",
+    "  %pp = inttoptr i64 %p to ptr\n  %spp = inttoptr i64 %sp0 to ptr\n  %ap = inttoptr i64 %a to ptr\n"];
 
 /// Close the function being generated, and start none.
 let finish : :string -> Gen -> Gen;
@@ -1215,7 +1250,7 @@ let finish symbol g = {
         Option.some(first) => code_onto (str.concat_all [symbol, " = internal alias i64 (i64, i64, i64, i64, i64, i64), ptr ", first, "\n"]) g,
         Option.none => bodies_at ((Gen.bodies g).[body => symbol]) (code_onto (str.concat_all [header symbol, body, "}\n"]) g),
     };
-    written |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_local 0
+    written |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_local 0 |> Gen.set_ptrs %{}
 };
 
 let bodies_at : %{:string => :string} -> Gen -> Gen;
@@ -1251,8 +1286,7 @@ let safepoint : :string -> :integer -> Gen -> Gen;
 let safepoint symbol extra g = {
     // Volatile: another thread sets this, and a function that calls itself and allocates nothing
     // becomes a loop, out of which LLVM would otherwise lift the load and never see it change.
-    let [guard_at, g0a] = instr "add i64 %p, 16" g;
-    let [guard_ptr, g0b] = instr (str.concat_all ["inttoptr i64 ", guard_at, " to ptr"]) g0a;
+    let [guard_ptr, g0b] = pointer_at "%p" 16 g;
     let [guard, g1] = instr ("load volatile i64, ptr " + guard_ptr) g0b;
     let [asked, g2] = instr (str.concat_all ["icmp ult i64 %sp0, ", guard]) g1;
     let [collect, g3] = label_of "collect" g2;
@@ -1300,7 +1334,7 @@ let function f g = {
         let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
         [m.[v => loaded], st1]
     }) [env1, g2] (list.enumerate captures);
-    let [sp, g4] = instr (str.concat_all ["add i64 %sp0, ", to_string (8 * extra)]) g3;
+    let [sp, g4] = sp_past (8 * extra) g3;
     let [sp1, g5] = if how == :function { [sp, g4] } else {
         // A thunk: its own frame says where the answer goes, and it is marked so that
         // reaching it again is reported rather than run.
@@ -1543,7 +1577,7 @@ let assemble user st unit_ lib_names entry arch = {
     let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
         %{} (core.St.functions st);
     let [once_vars, once_syms] = once_thunks (core.St.functions st);
-    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] workers once_vars once_syms 0 %{};
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] workers once_vars once_syms 0 %{} %{};
     let g = list.fold (fn g1 f -> function f g1) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
     let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));

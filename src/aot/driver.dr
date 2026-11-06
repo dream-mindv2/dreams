@@ -11,6 +11,7 @@
 import std.file;
 import std.io;
 import std.list;
+import std.num;
 import std.os;
 import std.str;
 import std.vm;
@@ -62,10 +63,23 @@ let written! ir out payload interp = {
     object_and_link! ir out payload interp
 };
 
+/// How many parts LLVM is to compile `ir` in, at once: one for each 16 MB, up to 32. A small
+/// program is one, as it always was; a compiler's 700 MB was one, on one core, for twenty minutes.
+let parts_for : :string -> :integer;
+let parts_for ir = num.min 32 (1 + len ir / 16777216);
+
+/// `parts_for`, or as many as `DREAMS_AOT_PARTS` says: a small program in several parts is how
+/// splitting and linking them again is tested.
+let parts_asked! : :string -> :integer;
+let parts_asked! ir = match os.env! "DREAMS_AOT_PARTS" {
+    () => parts_for ir,
+    n => match num.parse_int n { Option.some(k) if k >= 1 => k, _ => parts_for ir },
+};
+
 let object_and_link! : :string -> :string -> :string -> :string -> Result :integer [:string];
-let object_and_link! ir out payload interp = match vm.llvm_object! ir opt_level {
+let object_and_link! ir out payload interp = match vm.llvm_objects! ir opt_level (parts_asked! ir) {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
-    Result.ok(object) => match link.link (link.Options.make interp ["libm.so.6", "libc.so.6"] payload) object {
+    Result.ok(objects) => match link.link_all (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ())) objects {
         Result.error(why) => Result.error [why],
         Result.ok(exe) => {
             file.write! out exe;
