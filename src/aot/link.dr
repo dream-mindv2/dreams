@@ -282,6 +282,16 @@ let merged machine objs = {
         all_symbols (list.fold (fn m part -> list.fold (fn mm kv -> mm.[kv.[0] => kv.[1]]) m (map.pairs part.[1])) %{} parts)
 };
 
+/// A table of NUL-ended names after a first NUL, and each name's offset in it. The pieces and
+/// the offset are carried, made as they go: each name added to the text so far was a copy of it
+/// all and a suspension deeper, and the names of a part linked by itself overflowed the stack.
+let string_table : [:string] -> [:any];
+let string_table names = {
+    let [pieces, offsets, _] = list.fold (fn [acc, m, at] n -> [list.cons "\0" (list.cons n acc), m.[n => at], at + str.byte_length n + 1])
+        [["\0"], %{}, 1] names;
+    [str.concat_all (list.reverse pieces), offsets]
+};
+
 /// A 4 KB page's start, for `adrp`.
 let page_of : :integer -> :integer;
 let page_of a = a - a % 4096;
@@ -349,8 +359,7 @@ priv let laid_out o m = {
     let held_index = list.fold (fn m [i, n] -> m.[n => count + i]) %{} (list.enumerate held);
 
     // The dynamic string table: a NUL, the libraries, the imports.
-    let [strtab, name_at] = list.fold (fn [text, m] n ->
-        [str.concat_all [text, n, "\0"], m.[n => len text]]) ["\0", %{}] (list.append (Options.needed o) imports);
+    let [strtab, name_at] = string_table (list.append (Options.needed o) imports);
 
     let interp : :string = str.concat_all [Options.interp o, "\0"];
     let at_interp = ehdr_size + phdr_size * phdr_count;
@@ -543,8 +552,10 @@ priv let laid_out o m = {
 /// names to write.
 let symbol_table : [[:any]] -> :integer -> :integer -> :integer -> [:any];
 let symbol_table functions at code_at code_size = if list.is_empty functions { ["", "", 0, 0] } else {
-    let [strtab, name_at] = list.fold (fn [text, m] [name, _] -> [list.cons "\0" (list.cons name text), m.[name => list.fold (fn n t -> n + len t) 0 text]])
-        [["\0"], %{}] functions;
+    // Each name's offset carried along: summing what came before for each was 10^11 additions
+    // for the half-million functions of `dreams`.
+    let [strtab, name_at, _] = list.fold (fn [text, m, at] [name, _] -> [list.cons "\0" (list.cons name text), m.[name => at], at + len name + 1])
+        [["\0"], %{}, 1] functions;
     let strtab_text = str.concat_all (list.reverse strtab);
     // Local functions, in `.text`, at their addresses: what LLVM made them, internal all.
     let symtab = zeros 24 + str.concat_all (list.map (fn [name, address] ->

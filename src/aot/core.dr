@@ -812,9 +812,35 @@ let arithmetic cx op n env s k =
 let comparing : :any -> :integer -> image.Node -> Env -> St -> :any -> [Expr, St];
 let comparing cx op n env s k =
     value cx (image.Node.a n) env s (fn a env1 s1 ->
-        value cx (image.Node.b n) env1 s1 (fn b env2 s2 ->
-            bound_maybe (Rhs.compare comparison_ops.[op] a b) k env2 s2
-                (is_flat_literal cx (image.Node.a n) || is_flat_literal cx (image.Node.b n))));
+        value cx (image.Node.b n) env1 s1 (fn b env2 s2 -> match [op == 26 || op == 27, immediate_side cx n a b] {
+            // `kind == :name`: an atom, a character, a boolean or unit is a word, and nothing else
+            // is equal to it, so the test is of the word, with no slow path. A chain of them was
+            // a function of 28,000 lines in `dreams`, each test with a call for the case that
+            // never comes.
+            [true, Option.some([other, word])] => if op == 26 { bound (Rhs.same other word) k env2 s2 true } else {
+                let [x, s3] = fresh s2;
+                let [y, s4] = fresh s3;
+                let [rest, s5] = k (Atom.var y) (mark_forced (Atom.var y) env2) s4;
+                [Expr.bind x (Rhs.same other word) (Expr.bind y (Rhs.same (Atom.var x) false_word) rest), s5]
+            },
+            _ => bound_maybe (Rhs.compare comparison_ops.[op] a b) k env2 s2
+                (is_flat_literal cx (image.Node.a n) || is_flat_literal cx (image.Node.b n)),
+        }));
+
+/// When one side of `n` is a literal that is an immediate word -- a character, a boolean, an
+/// atom, unit -- the other side's atom and that word.
+let immediate_side : :any -> image.Node -> Atom -> Atom -> Option [:any];
+let immediate_side cx n a b = {
+    let word_of = fn i atom -> match [list.contains (image.Node.op (image.node cx.[:img] i)) [4, 5, 6, 7], atom] {
+        [true, Atom.word(w)] => Option.some w,
+        _ => Option.none,
+    };
+    match [word_of (image.Node.b n) b, word_of (image.Node.a n) a] {
+        [Option.some(w), _] => Option.some [a, w],
+        [_, Option.some(w)] => Option.some [b, w],
+        _ => Option.none,
+    }
+};
 
 let tested : :any -> :any -> :integer -> Env -> St -> :any -> [Expr, St];
 let tested cx test subject env s k =

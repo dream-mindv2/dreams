@@ -68,6 +68,17 @@ let written! ir out payload interp = {
 let parts_for : :string -> :integer;
 let parts_for ir = num.min 32 (1 + len ir / 16777216);
 
+/// `objects`, each written to `DREAMS_AOT_KEEP_OBJECTS/part-N.o` first when that is set, for the
+/// linker to be timed by itself.
+let after_keeping! : [:string] -> [:string];
+let after_keeping! objects = {
+    match os.env! "DREAMS_AOT_KEEP_OBJECTS" {
+        () => (),
+        dir => list.each! (fn! [i, o] -> file.write! (dir + "/part-" + to_string i + ".o") o) (list.enumerate objects),
+    };
+    objects
+};
+
 /// `parts_for`, or as many as `DREAMS_AOT_PARTS` says: a small program in several parts is how
 /// splitting and linking them again is tested.
 let parts_asked! : :string -> :integer;
@@ -79,7 +90,7 @@ let parts_asked! ir = match os.env! "DREAMS_AOT_PARTS" {
 let object_and_link! : :string -> :string -> :string -> :string -> Result :integer [:string];
 let object_and_link! ir out payload interp = match vm.llvm_objects! ir opt_level (parts_asked! ir) {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
-    Result.ok(objects) => match link.link_all (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ())) objects {
+    Result.ok(objects) => match link.link_all (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ())) (after_keeping! objects) {
         Result.error(why) => Result.error [why],
         Result.ok(exe) => {
             file.write! out exe;

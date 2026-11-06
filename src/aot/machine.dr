@@ -1403,6 +1403,13 @@ let fixed_infos g = {
      info_text "@i_record" (rt "code_value!") 9 0 0,
      info_text "@i_map" (rt "code_value!") 10 0 0,
      info_text "@i_map_leaf" (rt "code_value!") 11 4 0,
+     // The same five, for one known to be evaluated all the way down (`all_evaluated!` in
+     // rt/main.dr), which a deep force need not walk again.
+     info_text "@i_cons_s" (rt "code_value!") 5 2 0,
+     info_text "@i_array_s" (rt "code_value!") 8 0 0,
+     info_text "@i_record_s" (rt "code_value!") 9 0 0,
+     info_text "@i_map_s" (rt "code_value!") 10 0 0,
+     info_text "@i_map_leaf_s" (rt "code_value!") 11 4 0,
      info_text "@i_big" (rt "code_value!") 12 0 0,
      info_text "@i_error" (rt "code_value!") 13 3 0,
      info_text "@i_raised" (rt "code_raised!") 0 1 0,
