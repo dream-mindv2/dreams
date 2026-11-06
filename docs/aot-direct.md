@@ -84,6 +84,15 @@ that "close to C++" is a number.
    unchanged, which is the test that the switch is right before anything depends on it.
 3. **The collector, conservatively.** Pinned chunks in the per-process collector, the stack and the
    saved registers as roots. Run under the CPS code too, where it can only keep more than needed.
+   *Done (stage 2):* `dispatch!` runs a process on its own stack (`dream_run_on`, beside `_start`
+   in `machine.stacks_text`), and `schedule!` switches back before anything else. A process made
+   runnable as it parks is still on its stack until it switches off, so a worker taking it first
+   waits for `pcb_on_stack` to clear; without that, `census` crashed one run in two at 24 cores.
+   Under the CPS code nothing on the stack is needed after a park, so a process is run again from
+   the top. The first thing direct style needs of this is the opposite: a park keeps where the
+   stack stood, and the process is resumed there, so that a direct-style caller below CPS code
+   that parked is still there when it returns. A frame on the runtime's stack whose code returns
+   from the native call is the bridge between the two while both exist.
 4. **The code generator.** `machine.dr` writes direct style from the same core program
    (`core.dr` is untouched): forces and calls as calls, thunks as functions that return, `try!` and
    `raise!` through the runtime. Behind `--aot-direct` until the suite passes, then the default.

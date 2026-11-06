@@ -309,6 +309,11 @@ let primitive cx name args s = match name {
             // A worker: an OS thread that runs the scheduler with a context of its own. Its body
             // is in the machine's text, as it starts with C's calling convention.
             ["start_worker!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_worker(i64 ", ctx, ")"]) s1,
+            // A process run on its own stack, from the scheduler's, which is saved at `save`:
+            // `dream_run_on`, in the machine's text (`machine.stacks_text`), returns when the
+            // process gives the worker back by `return_to!` with what was saved.
+            ["run_on!", [sp, ctx, pcb, save]] => ["0", line (str.concat_all ["  call void @dream_run_on(i64 ", sp, ", i64 ", ctx, ", i64 ", pcb, ", i64 ", save, ")"]) s1],
+            ["return_to!", [sp]] => ["0", line (str.concat_all ["  call void @dream_return_to(i64 ", sp, ")"]) s1],
             // A thread of the blocking pool, which runs C calls a worker must not wait in.
             ["start_pool!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_pool(i64 ", ctx, ")"]) s1,
             // A C `int` answer's top half is not promised to mean anything.
