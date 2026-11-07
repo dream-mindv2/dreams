@@ -313,6 +313,16 @@ let primitive cx name args s = match name {
             // `dream_run_on`, in the machine's text (`machine.stacks_text`), returns when the
             // process gives the worker back by `return_to!` with what was saved.
             ["run_on!", [sp, ctx, pcb, save]] => ["0", line (str.concat_all ["  call void @dream_run_on(i64 ", sp, ", i64 ", ctx, ", i64 ", pcb, ", i64 ", save, ")"]) s1],
+            // The machine's stack pointer, with every callee-saved register spilled onto the stack
+            // above it first: the clobbers make the function that asks save them in its prologue,
+            // so whatever a caller kept in one is on the stack where the collector reads it
+            // conservatively (dreams/docs/aot-direct.md, "The collector finds roots on a stack").
+            // On aarch64 the frame pointer, x29, is left out: it is reserved there, and holds no value.
+            ["stack_here!", [_]] => instr (if State.arch s1 == 1 {
+                "call i64 asm sideeffect \"mov $0, sp\", \"=r,~{x19},~{x20},~{x21},~{x22},~{x23},~{x24},~{x25},~{x26},~{x27},~{x28},~{memory}\"()"
+            } else {
+                "call i64 asm sideeffect \"movq %rsp, $0\", \"=r,~{rbx},~{rbp},~{r12},~{r13},~{r14},~{r15},~{memory}\"()"
+            }) s1,
             ["return_to!", [sp]] => ["0", line (str.concat_all ["  call void @dream_return_to(i64 ", sp, ")"]) s1],
             // A thread of the blocking pool, which runs C calls a worker must not wait in.
             ["start_pool!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_pool(i64 ", ctx, ")"]) s1,

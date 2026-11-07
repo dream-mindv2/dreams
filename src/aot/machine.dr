@@ -1343,7 +1343,7 @@ let function f g = {
         let h3 = store_at below 8 "%a" h2;
         let h4 = store_at "%a" 0 "ptrtoint (ptr @i_hole to i64)" h3;
         let [owner, h5] = load_at "%p" 120 h4;
-        [below, store_at "%a" 8 owner h5]
+        [below, filled "%a" (list.length captures - 1) (store_at "%a" 8 owner h5)]
     };
     let mask = (Gen.workers g).[symbol else []];
     let g5a = if how == :function && not (list.is_empty mask) { to_worker symbol mask g5 } else { g5 };
@@ -1387,6 +1387,19 @@ let string_object symbol text = {
                     to_string (len text), ", [", n, " x i8] c\"", dialect.escaped text, "\\00\" }>, align 8\n"]
 };
 
+/// The words of an object past its first two made a filler, once the object has become a hole
+/// of two words: a chunk stays readable object by object from its start, which is how a chunk
+/// pinned by a word on the stack is walked (`scan_pinned!` in rt/main.dr). A word is `@i_fill`,
+/// two are two of them, and more are a string of what is left over.
+let filled : :string -> :integer -> Gen -> Gen;
+let filled at words g = match words {
+    1 => store_at at 16 "ptrtoint (ptr @i_fill to i64)" g,
+    2 => store_at at 24 "ptrtoint (ptr @i_fill to i64)" (store_at at 16 "ptrtoint (ptr @i_fill to i64)" g),
+    n => if n < 1 { g } else {
+        store_at at 24 (to_string ((n - 3) * 8)) (store_at at 16 "ptrtoint (ptr @i_string to i64)" g)
+    },
+};
+
 /// What every program has: the infos the runtime names, and its entry to C's `main`.
 let fixed_infos : Gen -> [:string];
 let fixed_infos g = {
@@ -1399,6 +1412,8 @@ let fixed_infos g = {
      // What a word that is no object is read as, by a test that must not branch (`is_float_word`).
      "@flt_zero = internal constant <{ i64, i64 }> zeroinitializer, align 8\n",
      info_text "@i_string" (rt "code_value!") 7 0 0,
+     // A word of a filler (`filled`): of a kind with no values, and one word long.
+     info_text "@i_fill" (rt "code_value!") 6 0 0,
      info_text "@i_array" (rt "code_value!") 8 0 0,
      info_text "@i_record" (rt "code_value!") 9 0 0,
      info_text "@i_map" (rt "code_value!") 10 0 0,
@@ -1607,6 +1622,23 @@ let callback_text enter arch = str.concat_all [
     "define dso_local i64 @dream_cb_entry(i64 %r, i64 %regs) {\n  %v = call tailcc i64 ", enter,
     "(i64 %r, i64 %regs)\n  ret i64 %v\n}\n"];
 
+/// How much address space each process's native stack is reserved with (`@i_native_stack`, read
+/// by `native_stack_top!` in rt/main.dr), decided here from what the program can reach. Code that
+/// jumps keeps nothing of its own on that stack: only the runtime's calls run there, and the
+/// deepest any program in the suite went was under four kilobytes. What can go deeper is C the
+/// runtime calls for the program -- a foreign function and its callbacks, OpenSSL, OpenCL, the
+/// resolver -- and a program reaching any of it keeps a thread's eight megabytes. The rest get
+/// sixty-four kilobytes, so that eighty thousand processes reserve five gigabytes, not six
+/// hundred. Once Dream code runs on the stack in direct style, this is where a bound computed
+/// from each function's frame over what a process can call takes over
+/// (dreams/docs/aot-direct.md, "Risks").
+let native_stack_of : [:string] -> :integer;
+let native_stack_of natives = if list.any deep_c natives { 8388608 } else { 65536 };
+
+/// Whether a native of the runtime calls C that may use a thread's stack.
+let deep_c : :string -> :bool;
+let deep_c name = list.any (fn prefix -> str.starts_with prefix name) ["ffi_", "tls_", "t_gpu", "net_connect"];
+
 let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :string;
 let assemble user st unit_ lib_names entry arch = {
     // The atoms the dialect asked for by name are numbered with the rest.
@@ -1653,7 +1685,13 @@ let assemble user st unit_ lib_names entry arch = {
     let display_table = str.concat_all ["@i_atom_display = internal constant [", to_string (list.length atom_list), " x ptr] [",
         str.join_str ", " (list.map (fn [_, i] -> if map.has i records { "ptr @shown" + to_string i } else { "ptr @atom" + to_string i }) atom_list), "]\n"];
     // What no one process owns (the shared region's ends, in rt/main.dr).
-    let world = "@i_world = internal global [80 x i64] zeroinitializer, align 8\n";
+    let world = str.concat_all ["@i_world = internal global [80 x i64] zeroinitializer, align 8\n",
+        "@i_native_stack = internal constant i64 ", to_string (native_stack_of (map.keys (core.St.natives st))), "\n",
+        // 1 when the code keeps values of its own on the native stack, which the collector then
+        // reads for pins (`pin_native!`). Code that jumps keeps none there: reading the stack
+        // anyway found the runtime's own stale words, which pinned whole allocation chunks and
+        // cost a native compile 8%.
+        "@i_native_frames = internal constant i64 0\n"];
     // Every CAF, for the census of the shared region to start from.
     let cafs = list.map (fn f -> "ptr @caf_" + str.slice 1 (len (core.Function.symbol f) - 1) (core.Function.symbol f))
         (list.filter (fn f -> core.Function.how f == :caf) (core.St.functions st));

@@ -93,6 +93,31 @@ that "close to C++" is a number.
    stack stood, and the process is resumed there, so that a direct-style caller below CPS code
    that parked is still there when it returns. A frame on the runtime's stack whose code returns
    from the native call is the bridge between the two while both exist.
+   *Done (stage 3):* `collect!` reads the process's native stack from where it stands, with the
+   callee-saved registers spilled onto it first (`prim.stack_here!`, an inline `asm` whose
+   clobbers make the function save them), and every word that falls inside a chunk pins it
+   (`pin_range!`, `scan_pinned!`). A parked process's stack is read from `pcb_nsp`, 0 while
+   parking leaves nothing there. Walking a pinned chunk object by object asked for a heap that
+   can be read that way, which it could not: a chunk now has a segment's header, `[next, size,
+   end, 0]`, with `end` written when allocation moves on; a thunk that becomes a two-word hole
+   fills the rest of itself (`machine.filled`, `@i_fill`), as a string cut to what `read`
+   returned and a bignum trimmed where it is do (`string_cut!`, `big_trimmed!`); and a buffer
+   for C is a string's body (`scratch!`), not words with no header. `DREAM_GC_PIN_TEST=1` also
+   reads the CPS stack this way, which pins on every program the suite runs, and the suite
+   passes under it. Under CPS code the native stack is read only in that mode
+   (`@i_native_frames` is 0): read always, the runtime's own stale words pinned whole allocation
+   chunks of up to 8 MB, every object in them a root, and a native compile of `mind` went 8%
+   slower for nothing. That is the first measure of the risk below, and says pins want blocks
+   smaller than allocation chunks before direct style turns this on. What is left under CPS code
+   is the fillers' stores, within noise on the benchmarks.
+
+   The native stack's size is the compiler's to choose (`machine.native_stack_of`): measured
+   across the suite, the runtime never went deeper than 3.3 KB on it, so a program gets 64 KB
+   unless it can reach C that goes deeper -- a foreign function, TLS, the GPU, the resolver --
+   and 8 MB then. A process that parks with nothing on its stack gives it back to the worker's
+   pool, taken again with no system call; fifty thousand processes in `recv!` had held fifty
+   thousand stacks, and `procs` went from 900 ms back to 160. In direct style the size becomes a
+   bound computed from each function's frame over what a process can call, where one exists.
 4. **The code generator.** `machine.dr` writes direct style from the same core program
    (`core.dr` is untouched): forces and calls as calls, thunks as functions that return, `try!` and
    `raise!` through the runtime. Behind `--aot-direct` until the suite passes, then the default.
