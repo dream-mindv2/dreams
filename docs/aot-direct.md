@@ -187,6 +187,43 @@ that "close to C++" is a number.
    registers where a function's signature or its strictness allows; and tables written as data
    rather than as functions that build them.
 
+   The first of these, for records of floats (2026-11-07), taking `recs` from 77 ms to 45:
+
+   - **`xs.[0]` on a cell in hand is its head** (`core.getting`). It is how `list.map` and
+     `list.forced` read an element, and it went through the library's general walk of a list
+     (`list_at`), which was a fifth of `recs` on its own and is a few percent of `sorts`.
+   - **A record of floats holds their bits.** Kind 18 (`kind_record_f` in rt/main.dr) is a record
+     whose fields are raw doubles: the same header -- count, then id -- so that `type_of`, a
+     `match` on the record and everything that reads the id see a record, and a collector that
+     copies it and does not scan it, as a float. A record is made so when every field is
+     evaluated and every one is a float: generated code tests that as it makes one
+     (`machine.raw_floats`, inline, so that a float boxed a few instructions before is seen to
+     be one) and `record_of!` does the same at run time. Whatever reads a field as a value --
+     `match_at!`, `.[i]`, `record_fields!`, a `set` -- boxes it again (`record_word!`), and a
+     `set` of anything but a float makes the record ordinary again first. Nothing outside the
+     runtime and the code generator knows: the wire, `show`, equality and comparison all go
+     through `record_fields!`.
+   - **A strict constructor is the record made where it is called** (`core.strict_constructor`):
+     `P.make a b c d` on a record whose fields are all strict -- a field typed as a scalar is --
+     evaluates its arguments and makes the record in line, rather than calling a function that
+     forces them again.
+   - **A tree of doubles is done in doubles.** An eager tree (`Rhs.eager`) whose leaves are all
+     floats, or fields of a record of them, is done first with nothing but double arithmetic --
+     no integer twin computed beside it, no select between the two, no overflow test --
+     and only a tree with an integer in it, or a leaf that is not a float when it runs, takes
+     the general way (`machine.all_doubles`). Types are gradual, so this is a guard and not a
+     promise, the same as the JIT's use of a signature.
+   - **A tree forced at once is forced only where it could not be done** (`machine.eagerly_then`).
+     The suspension made on the slow path was entered after the join, so the number made on the
+     fast one was tested for being evaluated too.
+   - **The context is read as memory nothing else can see** (`machine.ctx_of`). As
+     `asm sideeffect` it was a write of all memory as far as LLVM knew, and a store just made was
+     loaded again on the other side of it.
+
+   What `recs` spends now is the list around the records -- `list.map`'s suspension of each
+   element and of the rest, which `list.forced` then walks -- about as much as the arithmetic.
+   A strict map, a loop over an array or a trunk that writes as it goes, is what C++'s 5 ms is.
+
 ## Risks
 
 - **Conservative pinning keeps too much.** A long-lived pointer on the stack into the nursery's

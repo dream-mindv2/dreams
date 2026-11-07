@@ -73,6 +73,9 @@ union Rhs {
     /// Whether it is an immediate of this kind.
     has_tag(a : Atom, tag : :integer),
     is_list(a : Atom),
+    /// A record just made of `count` evaluated fields, remade in place as their bits when every
+    /// one is a float (kind 18, `record_raw!` in rt/main.dr); answers the record.
+    raw_floats(record : Atom, count : :integer),
 }
 
 union Expr {
@@ -203,6 +206,7 @@ let rhs_vars r = match r {
     Rhs.is_int(a) => atom_vars a,
     Rhs.has_tag(a, _) => atom_vars a,
     Rhs.is_list(a) => atom_vars a,
+    Rhs.raw_floats(a, _) => atom_vars a,
 };
 
 /// The variables `e` reads and does not bind, as a set. A `seq` holds its own, so
@@ -558,6 +562,10 @@ let forced_atom env a = match a {
     Atom.address(_) => false,
 };
 
+/// Whether an atom is a word written into the code: a literal, which is no float.
+let is_word_atom : Atom -> :bool;
+let is_word_atom a = match a { Atom.word(_) => true, _ => false };
+
 let mark_forced : Atom -> Env -> Env;
 let mark_forced a env = match a {
     Atom.var(i) => Env.set_forced ((Env.forced env).[i => true]) env,
@@ -762,8 +770,22 @@ let getting cx n env s = {
             let other = Expr.bind found (Rhs.peek "peek!" [c, key])
                 (Expr.bind absent (Rhs.same (Atom.var found) "0")
                     (Expr.choose (Atom.var absent) no_answer (Expr.enter (Atom.var found))));
-            [Expr.bind is_list (Rhs.is_list c) (Expr.choose (Atom.var is_list) walk other), s8]
+            // `xs.[0]` is how the library reads a head (`list.map`, `list.forced`), so on a
+            // cons in hand it is the head, read here rather than by the library's walk.
+            let [walk_head, s9] = if is_zero cx (image.Node.b n) {
+                let [is_cons, t1] = fresh s8;
+                let [head, t2] = fresh t1;
+                [Expr.bind is_cons (Rhs.has_kind c 5)
+                    (Expr.choose (Atom.var is_cons) (Expr.bind head (Rhs.field c 0) (Expr.enter (Atom.var head))) walk), t2]
+            } else { [walk, s8] };
+            [Expr.bind is_list (Rhs.is_list c) (Expr.choose (Atom.var is_list) walk_head other), s9]
         }))
+};
+
+let is_zero : :any -> :integer -> :bool;
+let is_zero cx i = {
+    let n = image.node cx.[:img] i;
+    image.Node.op n == 1 && image.integer cx.[:img] (image.Node.a n) == 0
 };
 
 /// `c.[k => v]`, the value stored as it stands.
@@ -1085,7 +1107,12 @@ let applied_then cx callee args env s done = {
             let g = image.global cx.[:img] (image.Node.a n);
             let f = image.Global.target g;
             if image.Global.kind g == 0 && image.Func.arity (image.func cx.[:img] f) == list.length args {
-                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env (queue cx f s) (fn atoms env2 s2 -> done (Expr.call (symbol_of cx.[:unit] f) atoms) env2 s2)
+                match strict_constructor cx f {
+                    Option.some(record) => values_of cx args env s (fn atoms env1 s1 ->
+                        record_made cx record atoms env1 s1 (fn r env2 s2 -> done (Expr.ret r) env2 s2)),
+                    Option.none =>
+                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env (queue cx f s) (fn atoms env2 s2 -> done (Expr.call (symbol_of cx.[:unit] f) atoms) env2 s2),
+                }
             } else { unknown () }
         },
         12 => {
@@ -1817,21 +1844,60 @@ let lazily cx i env s k = {
             lazies cx kids env s (fn atoms env1 s1 ->
                 bound (Rhs.alloc "array" (list.cons (Atom.word (fixnum_word (list.length atoms))) atoms)) k env1 s1 true)
         },
-        81 => {
-            let kids = image.kids cx.[:img] a (image.Node.b n);
-            let id_name = image.atom cx.[:img] (image.Node.c n % 2147483648);
-            let [id, s0] = intern_atom id_name s;
-            let parts = str.split "." id_name;
-            let variant = image.Node.c n >= 2147483648;
-            let shown = if variant { list.drop (list.length parts - 2) parts } else { list.drop (list.length parts - 1) parts };
-            let [type_atom, s00] = intern_atom (list.head shown) s0;
-            let s1 = St.set_records ((St.records s00).[id => [type_atom, str.join_str "." shown]]) s00;
-            lazies cx kids env s1 (fn atoms env1 s2 ->
-                bound (Rhs.alloc "record" (list.append [Atom.word (fixnum_word (list.length atoms)),
-                                                        Atom.word (immediate_word 3 id)] atoms)) k env1 s2 true)
-        },
+        81 => lazies cx (image.kids cx.[:img] a (image.Node.b n)) env s (fn atoms env1 s1 -> record_made cx n atoms env1 s1 k),
         _ => suspended cx i env s k,
     }
+};
+
+/// Record node `n` made of `atoms`, its fields in hand.
+let record_made : :any -> image.Node -> [Atom] -> Env -> St -> :any -> [Expr, St];
+let record_made cx n atoms env s k = {
+    let id_name = image.atom cx.[:img] (image.Node.c n % 2147483648);
+    let [id, s0] = intern_atom id_name s;
+    let parts = str.split "." id_name;
+    let variant = image.Node.c n >= 2147483648;
+    let shown = if variant { list.drop (list.length parts - 2) parts } else { list.drop (list.length parts - 1) parts };
+    let [type_atom, s00] = intern_atom (list.head shown) s0;
+    let s1 = St.set_records ((St.records s00).[id => [type_atom, str.join_str "." shown]]) s00;
+    let made = Rhs.alloc "record" (list.append [Atom.word (fixnum_word (list.length atoms)), Atom.word (immediate_word 3 id)] atoms);
+    // Every field evaluated -- a field typed as a scalar is strict, so a record of `:float`s
+    // is made so -- and they may all be floats: then it is made as their bits (`record_raw!`),
+    // which a field read in arithmetic takes as it lies.
+    if atoms != [] && list.all (forced_atom env) atoms && not (list.any is_word_atom atoms) {
+        bound made (fn r env2 s2 -> bound (Rhs.raw_floats r (list.length atoms)) k env2 s2 true) env s1 true
+    } else { bound made k env s1 true }
+};
+
+/// The record node function `f` is, when its body is nothing but its parameters forced and
+/// then made into a record in order: a constructor whose fields are all strict, `P.make` of
+/// a record of floats. A call of it is the record made where it is called.
+let strict_constructor : :any -> :integer -> Option image.Node;
+let strict_constructor cx f = {
+    let img = cx.[:img];
+    let func = image.func img f;
+    let arity = image.Func.arity func;
+    let body = image.node img (image.Func.body func);
+    let is_param = fn k i -> { let m = image.node img k; image.Node.op m == 8 && image.Node.a m == i };
+    if arity == 0 || image.Node.op body != 15 || image.Node.b body != arity + 1 { Option.none }
+    else {
+        let kids = image.kids img (image.Node.a body) (image.Node.b body);
+        let last = image.node img (list.last kids);
+        let fields = image.kids img (image.Node.a last) (image.Node.b last);
+        if image.Node.op last == 81 && list.length fields == arity
+           && list.all (fn [i, k] -> is_param k i) (list.enumerate (list.take arity kids))
+           && list.all (fn [i, k] -> is_param k i) (list.enumerate fields) { Option.some last }
+        else { Option.none }
+    }
+};
+
+/// Each of `args` evaluated, in order, as entering a function whose parameters are all strict.
+let values_of : :any -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let values_of cx args env s k = {
+    let rec go rest acc env1 s1 = match rest {
+        [] => k (list.reverse acc) env1 s1,
+        [x, ..more] => value cx x env1 s1 (fn a env2 s2 -> go more (list.cons a acc) env2 s2),
+    };
+    go args [] env s
 };
 
 /// A slot read before anything is in it, which is how `let rec` is written: a word
