@@ -229,12 +229,29 @@ let link o obj = link_all o [obj];
 let link_all : Options -> [:string] -> Result :string :string;
 let link_all o objs = match list.find (fn obj -> str.slice 0 4 obj != str.of_bytes [127, 69, 76, 70]) objs {
     Option.some(_) => Result.error "not an ELF object",
-    Option.none => {
-        let machine = u16_at (list.head objs) 18;
-        if machine != em_x86_64 && machine != em_aarch64 { Result.error "only x86-64 and aarch64 can be linked" }
-        else if list.any (fn obj -> u16_at obj 18 != machine) objs { Result.error "the objects are for different machines" }
-        else { laid_out o (merged machine objs) }
-    },
+    Option.none => link_parsed o no_part (list.map parse objs),
+};
+
+/// The objects, read already (`parse`), as one executable, after `kept`: objects merged once,
+/// before them (`merged_part`), which a build is handed again and again -- the runtime's and the
+/// library's.
+let link_parsed : Options -> MergedPart -> [[:any]] -> Result :string :string;
+let link_parsed o kept read = {
+    let machine = if MergedPart.machine kept != 0 { MergedPart.machine kept } else { list.head (list.head read) };
+    if machine != em_x86_64 && machine != em_aarch64 { Result.error "only x86-64 and aarch64 can be linked" }
+    else if list.any (fn r -> list.head r != machine) read { Result.error "the objects are for different machines" }
+    else { laid_out o (combined kept (merged_part machine (MergedPart.sections_count kept) (MergedPart.symbols_count kept) read)) }
+};
+
+/// An object read: `[machine, sections, symbols, relocations]`, the relocations of each relocation
+/// section by its own number, all of it read now, so that it can be kept and read back (`wire`).
+let parse : :string -> [:any];
+let parse obj = {
+    let ss = sections obj;
+    let relocs = list.fold (fn m sec -> if Section.kind sec != sht_rela { m } else {
+        m.[Section.index sec => list.forced (relocs_of sec)]
+    }) %{} ss;
+    [u16_at obj 18, list.forced ss, list.forced (symbols ss), relocs]
 };
 
 // --- several objects as one ---------------------------------------------------------------
@@ -243,43 +260,103 @@ let link_all o objs = match list.find (fn obj -> str.slice 0 4 obj != str.of_byt
 // theirs, and its relocations moved with both. A relocation naming a symbol its object does not
 // define, which another defines as global, names that one; what none defines is an import, as
 // it was. The layout below then never knows there was more than one.
+//
+// A native program is mostly the runtime and the library, each a section for every function,
+// a hundred thousand of them, the same objects in every build: so those are merged once and
+// kept (`merged_part`, driver.dr), numbered first, and a build merges only its own objects after
+// them, a name it does not define being looked for there. What is laid out is what is live, read
+// by number from arrays, so that nothing is done for every section of the library.
 
-/// The objects read as one: their sections, numbered from 0 across them all, their symbols, and
-/// each relocation section's relocations by its number.
-group Merged { machine : :integer, sections : [Section], symbols : :array, relocs : :map }
+/// Objects merged by themselves: their sections and symbols numbered from `base` and `ybase`,
+/// each relocation section's relocations by its number, with symbol numbers moved but a name
+/// left undefined still the undefined symbol; the globals defined, by name; the relocation
+/// sections of each section; and the sections that are kept whatever is reached (`live_sections`).
+group MergedPart {
+    machine : :integer,
+    sections : :array,
+    symbols : :array,
+    relocs : :map,
+    defined : :map,
+    relas_of : :map,
+    roots : [:integer],
+    sections_count : :integer,
+    symbols_count : :integer,
+}
+
+/// Nothing merged before.
+let no_part : MergedPart;
+let no_part = MergedPart.make 0 (array.of_list []) (array.of_list []) %{} %{} %{} [] 0 0;
 
 let shn_loreserve = 65280;
 
-let merged : :integer -> [:string] -> Merged;
-let merged machine objs = {
-    let read = list.map (fn obj -> { let ss = sections obj; [ss, symbols ss] }) objs;
-    let offsets = fn sizes -> list.reverse (list.head (list.fold (fn [acc, at] n -> [list.cons at acc, at + n]) [[], 0] sizes));
-    let section_base = offsets (list.map (fn r -> list.length r.[0]) read);
-    let symbol_base = offsets (list.map (fn r -> list.length r.[1]) read);
-    let moved = fn base n -> if n == 0 || n >= shn_loreserve { n } else { base + n };
-    let all_symbols = array.of_list (list.concat (list.map (fn [r, sb] ->
-        list.map (fn sym -> Symbol.set_shndx (moved sb (Symbol.shndx sym)) sym) r.[1]) (list.zip read section_base)));
-    // Each defined global's number, by its name.
-    let defined = list.fold (fn m i -> {
-        let sym = all_symbols.[i];
-        if Symbol.global sym && Symbol.shndx sym != 0 && Symbol.name sym != "" { m.[Symbol.name sym => i] } else { m }
-    }) %{} (list.range 0 (len all_symbols));
-    let resolved = fn i -> {
-        let sym = all_symbols.[i];
-        if Symbol.shndx sym == 0 { defined.[Symbol.name sym else i] } else { i }
+/// What a reserved section number of an object -- `SHN_ABS`, `SHN_COMMON` -- is once merged: moved
+/// past every real one. The objects of a native program have more sections between them than
+/// a section number of one object can say, and left as it was, `SHN_ABS` was section 65,521 of
+/// the program and the sections from 65,280 on were taken for reserved ones and never laid out.
+let reserved_base = 1099511627776;
+
+/// The merged number of `SHN_ABS`.
+let merged_abs : :integer;
+let merged_abs = reserved_base + shn_abs;
+
+let merged_part : :integer -> :integer -> :integer -> [[:any]] -> MergedPart;
+let merged_part machine base ybase parsed = {
+    let offsets = fn from sizes -> list.reverse (list.head (list.fold (fn [acc, at] n -> [list.cons at acc, at + n]) [[], from] sizes));
+    let section_base = offsets base (list.map (fn r -> list.length r.[1]) parsed);
+    let symbol_base = offsets ybase (list.map (fn r -> list.length r.[2]) parsed);
+    let moved = fn sb n -> if n == 0 { 0 } else if n >= shn_loreserve { reserved_base + n } else { sb + n };
+    let symbols_ = list.concat (list.map (fn [r, sb] -> list.map (fn sym -> Symbol.set_shndx (moved sb (Symbol.shndx sym)) sym) r.[2])
+        (list.zip parsed section_base));
+    let defined = list.fold (fn m [i, sym] ->
+        if Symbol.global sym && Symbol.shndx sym != 0 && Symbol.name sym != "" { m.[Symbol.name sym => ybase + i] } else { m }
+    ) %{} (list.enumerate symbols_);
+    let sections_ = list.concat (list.map (fn [r, sb] -> list.map (fn sec -> sec
+        |> Section.set_index (sb + Section.index sec)
+        |> Section.set_link (if Section.kind sec == sht_rela || Section.kind sec == sht_symtab { sb + Section.link sec } else { Section.link sec })
+        |> Section.set_info (if Section.kind sec == sht_rela { sb + Section.info sec } else { Section.info sec })) r.[1])
+        (list.zip parsed section_base));
+    let relocs = list.fold (fn m [[r, sb], yb] -> list.fold (fn mm [idx, rels] ->
+        mm.[sb + idx => list.forced (list.map (fn rel -> Reloc.set_symbol (yb + Reloc.symbol rel) rel) rels)]) m (map.pairs r.[3]))
+        %{} (list.zip (list.zip parsed section_base) symbol_base);
+    let relas_of = list.fold (fn m sec -> if Section.kind sec == sht_rela {
+        m.[Section.info sec => list.cons (Section.index sec) m.[Section.info sec else []]]
+    } else { m }) %{} sections_;
+    let roots = list.map Section.index (list.filter (fn sec -> allocated sec && Section.name sec != ".eh_frame"
+        && not (list.any (fn pre -> str.starts_with pre (Section.name sec)) per_symbol_prefixes)) sections_);
+    MergedPart.make machine (array.of_list sections_) (array.of_list symbols_) relocs defined relas_of roots
+        (base + list.length sections_) (ybase + list.length symbols_)
+};
+
+/// What `laid_out` reads: the two parts as one, each section and symbol by its number, and a
+/// relocation's undefined symbol, where one of them defines it as global, that one.
+group Merged {
+    machine : :integer,
+    sections : :array,
+    symbols : :array,
+    relocs_at : :integer -> [Reloc],
+    relas_of : :integer -> [:integer],
+    roots : [:integer],
+    defined : :string -> :integer,
+}
+
+let combined : MergedPart -> MergedPart -> Merged;
+let combined kept own = {
+    let syms = array.append (MergedPart.symbols kept) (MergedPart.symbols own);
+    let defined = fn name -> match map.lookup name (MergedPart.defined own) {
+        Option.some(i) => i,
+        Option.none => (MergedPart.defined kept).[name else (0 - 1)],
     };
-    let parts = list.map (fn [[r, sb], yb] -> {
-        let ss = list.map (fn sec -> sec
-            |> Section.set_index (sb + Section.index sec)
-            |> Section.set_link (if Section.kind sec == sht_rela || Section.kind sec == sht_symtab { sb + Section.link sec } else { Section.link sec })
-            |> Section.set_info (if Section.kind sec == sht_rela { sb + Section.info sec } else { Section.info sec })) r.[0];
-        let relocs = list.fold (fn m sec -> if Section.kind sec != sht_rela { m } else {
-            m.[sb + Section.index sec => list.map (fn rel -> Reloc.set_symbol (resolved (yb + Reloc.symbol rel)) rel) (relocs_of sec)]
-        }) %{} r.[0];
-        [ss, relocs]
-    }) (list.zip (list.zip read section_base) symbol_base);
-    Merged.make machine (list.concat (list.map list.head parts))
-        all_symbols (list.fold (fn m part -> list.fold (fn mm kv -> mm.[kv.[0] => kv.[1]]) m (map.pairs part.[1])) %{} parts)
+    let resolved = fn i -> {
+        let sym = syms.[i];
+        if Symbol.shndx sym == 0 { match defined (Symbol.name sym) { j if j >= 0 => j, _ => i } } else { i }
+    };
+    let relocs_at = fn idx -> {
+        let raw = if idx < MergedPart.sections_count kept { (MergedPart.relocs kept).[idx else []] } else { (MergedPart.relocs own).[idx else []] };
+        list.map (fn rel -> Reloc.set_symbol (resolved (Reloc.symbol rel)) rel) raw
+    };
+    let relas_of = fn idx -> if idx < MergedPart.sections_count kept { (MergedPart.relas_of kept).[idx else []] } else { (MergedPart.relas_of own).[idx else []] };
+    Merged.make (MergedPart.machine own) (array.append (MergedPart.sections kept) (MergedPart.sections own)) syms
+        relocs_at relas_of (list.append (MergedPart.roots kept) (MergedPart.roots own)) defined
 };
 
 /// A table of NUL-ended names after a first NUL, and each name's offset in it. The pieces and
@@ -321,21 +398,50 @@ let aarch64_stub at slot = {
     le 4 adrp + le 4 ldr + le 4 3592356384 + le 4 3573751839
 };
 
+// --- what is kept -------------------------------------------------------------------------
+//
+// LLVM writes each function and each datum in a section of its own (`.text.NAME`, `.data.NAME`,
+// `.rodata.NAME`, ..), and only what can be reached from the rest is laid out: every section
+// that is not one of those -- the machine's own code, `_start` among it -- and whatever their
+// relocations name, and theirs. A native program carries the whole runtime and the whole
+// library, each compiled once for every program (`aot_objects`), and what it does not reach of
+// them was four megabytes of an executable that needed half of one. The unwind tables name every
+// function and are named by none: nothing unwinds through Dream's code, so they go.
+
+let per_symbol_prefixes : [:string];
+let per_symbol_prefixes = [".text.", ".data.", ".rodata.", ".bss.", ".data.rel.ro.", ".tbss.", ".tdata."];
+
+/// The sections of `m` to lay out, by number.
+let live_sections : Merged -> :map;
+let live_sections m = {
+    let syms = Merged.symbols m;
+    let rec walk work !seen = match work {
+        [] => seen,
+        [i, ..rest] => if map.has i seen { walk rest seen } else {
+            let named = list.flat_map (fn r -> list.map (fn rel -> Symbol.shndx syms.[Reloc.symbol rel]) ((Merged.relocs_at m) r))
+                ((Merged.relas_of m) i);
+            walk (list.append (list.filter (fn n -> n > 0 && n < reserved_base) named) rest) seen.[i => true]
+        },
+    };
+    walk (Merged.roots m) %{}
+};
+
 priv let laid_out : Options -> Merged -> Result :string :string;
 priv let laid_out o m = {
     let ss = Merged.sections m;
     let machine = Merged.machine m;
-    let relocs_of = fn s -> (Merged.relocs m).[Section.index s else []];
+    let relocs_of = fn s -> (Merged.relocs_at m) (Section.index s);
     // A segment starts on a page of the largest size its kernel may have.
     let seg_page = if machine == em_aarch64 { 65536 } else { page };
     let syms = Merged.symbols m;
-    let kept = list.filter allocated ss;
+    let live = live_sections m;
+    let live_list = list.sort (map.keys live);
+    let kept = list.filter allocated (list.map (fn i -> ss.[i]) live_list);
     let ro = list.filter (fn s -> not (writable s) && not (executable s)) kept;
     let rx = list.filter executable kept;
     let rw = list.filter (fn s -> writable s && Section.kind s != sht_nobits) kept;
     let bss = list.filter (fn s -> writable s && Section.kind s == sht_nobits) kept;
-    let relas = list.filter (fn s -> Section.kind s == sht_rela
-                                      && allocated ss.[Section.info s]) ss;
+    let relas = list.map (fn i -> ss.[i]) (list.flat_map (fn i -> (Merged.relas_of m) i) (list.filter (fn i -> allocated ss.[i]) live_list));
 
     // Imports: every symbol a relocation names and the object does not define.
     let used = list.unique (list.flat_map (fn s ->
@@ -395,7 +501,7 @@ priv let laid_out o m = {
         let s = syms.[i];
         match Symbol.shndx s {
             0 => if Symbol.name s == payload_symbol { payload_at } else { stub_of (Symbol.name s) },
-            n if n == shn_abs => Symbol.value s,
+            n if n == merged_abs => Symbol.value s,
             n => addresses.[n] + Symbol.value s,
         }
     };
@@ -502,9 +608,10 @@ priv let laid_out o m = {
                 // No executable stack: an object with no note would otherwise ask for one.
                 le 4 1685382481 + le 4 6 + zeros 48,
             ];
-            match list.find (fn s -> Symbol.name s == "_start" && Symbol.shndx s != 0) (array.to_list syms) {
-                Option.none => Result.error "the object defines no _start",
-                Option.some(start) => {
+            match (Merged.defined m) "_start" {
+                j if j < 0 => Result.error "the object defines no _start",
+                j => {
+                    let start = syms.[j];
                     let entry = addresses.[Symbol.shndx start] + Symbol.value start;
                     let seq = fn at pieces -> list.fold (fn [out, here] [where, text] ->
                         [list.cons text (list.cons (zeros (where - here)) out), where + len text]) [[], at] pieces;
@@ -529,7 +636,7 @@ priv let laid_out o m = {
                         Option.values (list.map (fn i -> {
                             let sym = syms.[i];
                             let n = Symbol.shndx sym;
-                            if Symbol.name sym != "" && n > 0 && n < list.length ss && executable ss.[n] {
+                            if Symbol.name sym != "" && n > 0 && n < len ss && executable ss.[n] && map.has n live {
                                 Option.some [Symbol.name sym, symbol_address i]
                             } else { Option.none }
                         }) (list.range 0 (len syms)))

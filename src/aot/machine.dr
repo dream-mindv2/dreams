@@ -998,11 +998,12 @@ let used_once : :integer -> core.Expr -> :map -> :bool;
 let used_once v e once = { let [n, good] = occurs v e once; n <= 1 && good };
 
 /// The parameters used once, as `once_key`s: every parameter, less those found otherwise, until
-/// nothing changes.
-let once_params : [core.Function] -> :map;
-let once_params fs = {
+/// nothing changes. `known` are another set's, found already -- the library's, for a program
+/// translated on it -- and stay as they are.
+let once_params_on : [core.Function] -> :map -> :map;
+let once_params_on fs known = {
     let all = list.fold (fn m f -> list.fold (fn m1 [i, _] -> m1.[once_key (core.Function.symbol f) i => true]) m
-        (list.enumerate (core.Function.params f))) %{} fs;
+        (list.enumerate (core.Function.params f))) known fs;
     once_round fs all
 };
 
@@ -1016,10 +1017,10 @@ let once_round fs once = {
 };
 
 /// `[variables, thunk symbols]`: where a thunk is made that is entered at most once.
-let once_thunks : [core.Function] -> [:map, :map];
-let once_thunks fs = {
+let once_thunks_on : [core.Function] -> :map -> [:map, :map];
+let once_thunks_on fs known = {
     let thunks = list.fold (fn m f -> if core.Function.how f == :thunk { m.[core.Function.symbol f => true] } else { m }) %{} fs;
-    let once = once_params fs;
+    let once = once_params_on fs known;
     list.fold (fn acc f -> once_sites (core.Function.body f) thunks once acc) [%{}, %{}] fs
 };
 
@@ -2222,6 +2223,26 @@ let first_atoms = ["integer", "float", "char", "bool", "unit", "string", "atom",
 let to_ir : image.Image -> image.Image -> image.Image -> :integer -> :bool -> Result :string [:string];
 let to_ir user lib rt arch direct = {
     let entry = image.Image.entry user;
+    let [lib_names, native_arity, lib_arity, wanted] = library_setting lib rt;
+    let st = core.program %{"u" => user, "l" => lib} [["u", entry, :function]] lib_names native_arity lib_arity wanted;
+    finished user st lib_names rt arch direct no_lib_part
+};
+
+/// The program on the library already translated and written (`lib_part`): only its own code is
+/// translated, numbered on from where the library's ended.
+let to_ir_from : image.Image -> image.Image -> image.Image -> :integer -> LibPart -> Result :string [:string];
+let to_ir_from user lib rt arch part = {
+    let entry = image.Image.entry user;
+    let [lib_names, native_arity, lib_arity, _] = library_setting lib rt;
+    let st = core.program %{"u" => user, "l" => lib} [["u", entry, :function]] lib_names native_arity lib_arity (LibPart.st part);
+    finished user st lib_names rt arch true part
+};
+
+/// What translating the program and the library work from, for `lib` and `rt`: the library's
+/// functions by name, the runtime's natives' arities and the library's, and the state translation
+/// starts in, the closures the runtime calls already made.
+let library_setting : image.Image -> image.Image -> [:any];
+let library_setting lib rt = {
     let atoms = list.fold (fn m [i, name] -> m.[name => i]) %{} (list.enumerate first_atoms);
     let lib_names = dialect.by_name lib;
     let arities = fn img names -> list.fold (fn m [name, f] -> m.[name => image.Func.arity (image.func img f)]) %{} names;
@@ -2237,7 +2258,81 @@ let to_ir user lib rt arch direct = {
         let [_, st1] = core.wrapper_of_library %{:lib_arity => lib_arity} name st;
         st1
     }) start (map.values library_roots);
-    let st = core.program %{"u" => user, "l" => lib} [["u", entry, :function]] lib_names native_arity lib_arity wanted;
+    [lib_names, native_arity, lib_arity, wanted]
+};
+
+// --- the library, by itself -----------------------------------------------------------------
+//
+// What a program reaches of the library was translated and written with it, numbered by the
+// order the program reached it in, so it was different text in every program and compiled
+// again for each: in a small program most of the code there was. Translated whole, first and by
+// itself, the library is the same text in every program, and its parts are kept as the
+// runtime's are (`aot_objects`); and what translating it leaves -- the state the program's
+// translation goes on from, the counter its names go on from, its text, the CAFs it made and
+// which of its parameters are used once -- is kept between builds too (driver.dr, `lib_part!`),
+// since translating all of it was twenty seconds of CPU.
+
+/// The library translated and written: what `to_ir_from` goes on from.
+group LibPart { st : core.St, next : :integer, text : :string, cafs : [:string], once : :map, rt : [:any] }
+
+/// No library written apart: the program's translation reaches it as it goes.
+let no_lib_part : LibPart;
+let no_lib_part = LibPart.make core.empty_st 0 "" [] %{} [];
+
+let lib_part : image.Image -> image.Image -> :integer -> Result LibPart [:string];
+let lib_part lib rt arch = {
+    let [lib_names, native_arity, lib_arity, wanted] = library_setting lib rt;
+    let roots = list.map (fn f -> ["l", f, :function]) (list.sort (map.values lib_names));
+    let st = core.program %{"l" => lib} roots lib_names native_arity lib_arity wanted;
+    let unit_ = dialect.whole_unit rt (list.append runtime_roots (map.keys (core.St.natives st))) arch;
+    let fns = list.reverse (core.St.functions st);
+    let names = names_of st lib_names unit_;
+    let [once_vars, once_syms] = once_thunks_on fns %{};
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] %{}
+        once_vars once_syms 0 %{} %{} true "" arch false "" %{} %{} [];
+    let g = list.fold (fn g1 f -> function_d f g1) g0 fns;
+    match core.St.refused st {
+        [] => Result.ok (LibPart.make (core.St.set_functions [] st) (Gen.next g)
+            (str.concat_all (list.append (Gen.data g) (list.reverse (Gen.code g))))
+            (cafs_of fns) (once_params_on fns %{})
+            // The runtime translated by the dialect, all of it, which is the same for every program too.
+            [dialect.Unit.text unit_, dialect.Unit.imports unit_, dialect.Unit.symbols unit_, dialect.Unit.refused unit_, dialect.Unit.atoms unit_]),
+        why => Result.error (list.unique (list.reverse why)),
+    }
+};
+
+/// `part` as plain data, to be kept between builds, and back.
+let lib_part_data : LibPart -> [:any];
+let lib_part_data part = {
+    let st = LibPart.st part;
+    [[core.St.next st, core.St.strings st, core.St.floats st, core.St.atoms st, core.St.natives st, core.St.refused st,
+      core.St.needed_lib st, core.St.wrapped st, core.St.records st, core.St.done st, core.St.lib_done st],
+     LibPart.next part, LibPart.text part, LibPart.cafs part, LibPart.once part, LibPart.rt part]
+};
+
+let lib_part_of : [:any] -> LibPart;
+let lib_part_of d = {
+    let [f, next, text, cafs, once, rt] = d;
+    let [n, strings, floats, atoms, natives, refused, needed, wrapped, records, done, lib_done] = f;
+    LibPart.make (core.St.make n [] [] strings floats atoms natives refused needed wrapped records done lib_done) next text cafs once rt
+};
+
+/// The CAFs among `fns`, as the census table names them.
+let cafs_of : [core.Function] -> [:string];
+let cafs_of fns = list.map (fn f -> "ptr @caf_" + str.slice 1 (len (core.Function.symbol f) - 1) (core.Function.symbol f))
+    (list.filter (fn f -> core.Function.how f == :caf) fns);
+
+/// What a core call by name means: a library function, a machine native, `raise!`.
+let names_of : core.St -> :map -> dialect.Unit -> :map;
+let names_of st lib_names unit_ = list.fold (fn m name -> m.["@lib_" + name => "@l" + to_string lib_names.[name]])
+    (list.fold (fn m name -> m.["@m_" + name => (dialect.Unit.symbols unit_).[name]])
+        %{"@raise!" => (dialect.Unit.symbols unit_).["raise!"]} (map.keys core.machine_natives))
+    (map.keys (core.St.needed_lib st));
+
+/// The program translated, with the runtime and `part`, written.
+let finished : image.Image -> core.St -> :map -> image.Image -> :integer -> :bool -> LibPart -> Result :string [:string];
+let finished user st lib_names rt arch direct part = {
+    let entry = image.Image.entry user;
     let natives = map.keys (core.St.natives st);
     // The whole runtime, in the same order for every program, so that its text is the same and
     // its compiled parts are had again from the cache (`aot_objects` in dream/src/aot_object.cpp)
@@ -2245,9 +2340,16 @@ let to_ir user lib rt arch direct = {
     // 170 KB larger for what it does not reach. The library was tried the same way, all of it
     // first: it is most of a small program's code, but translating all of it for every build cost
     // more than compiling what was reached, twenty seconds of CPU where it had been nine.
-    let unit_ = dialect.whole_unit rt (list.append runtime_roots natives) arch;
-    match list.append (list.reverse (core.St.refused st)) (dialect.Unit.refused unit_) {
-        [] => Result.ok (assemble user st unit_ lib_names entry arch direct),
+    let unit_ = match LibPart.rt part {
+        [text, imports, symbols, refused, atoms] => dialect.Unit.make text imports symbols refused atoms,
+        _ => dialect.whole_unit rt (list.append runtime_roots natives) arch,
+    };
+    // A native the program asks for that the runtime has not got, which a unit made for this
+    // program would have said.
+    let missing = list.map (fn r -> "the runtime has no `" + r + "`")
+        (list.filter (fn r -> not (map.has r (dialect.Unit.symbols unit_))) (list.append runtime_roots natives));
+    match list.concat [list.reverse (core.St.refused st), dialect.Unit.refused unit_, missing] {
+        [] => Result.ok (assemble user st unit_ lib_names entry arch direct part),
         why => Result.error (list.unique why),
     }
 };
@@ -2411,21 +2513,18 @@ let direct_stack_of natives = if list.any deep_c natives { 8388608 } else { 2621
 let deep_c : :string -> :bool;
 let deep_c name = list.any (fn prefix -> str.starts_with prefix name) ["ffi_", "tls_", "t_gpu", "net_connect"];
 
-let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :bool -> :string;
-let assemble user st unit_ lib_names entry arch direct = {
+let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :bool -> LibPart -> :string;
+let assemble user st unit_ lib_names entry arch direct part = {
     // The atoms the dialect asked for by name are numbered with the rest.
     let st_with = list.fold (fn s1 name -> list.nth 1 (core.intern_atom name s1)) st (dialect.Unit.atoms unit_);
     let atom_words = list.map (fn name ->
         str.concat_all ["@aw_", name, " = internal constant i64 ",
                         core.immediate_word 3 (core.St.atoms st_with).[name], "\n"]) (dialect.Unit.atoms unit_);
-    let names = list.fold (fn m name -> m.["@lib_" + name => "@l" + to_string lib_names.[name]])
-        (list.fold (fn m name -> m.["@m_" + name => (dialect.Unit.symbols unit_).[name]])
-            %{"@raise!" => (dialect.Unit.symbols unit_).["raise!"]} (map.keys core.machine_natives))
-        (map.keys (core.St.needed_lib st));
+    let names = names_of st lib_names unit_;
     let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
         %{} (core.St.functions st);
-    let [once_vars, once_syms] = once_thunks (core.St.functions st);
-    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] (if direct { %{} } else { workers })
+    let [once_vars, once_syms] = once_thunks_on (core.St.functions st) (LibPart.once part);
+    let g0 = Gen.make (LibPart.next part) [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] (if direct { %{} } else { workers })
         once_vars once_syms 0 %{} %{} direct "" arch false "" %{} %{} [];
     let g = list.fold (fn g1 f -> if direct { function_d f g1 } else { function f g1 }) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
@@ -2466,8 +2565,7 @@ let assemble user st unit_ lib_names entry arch direct = {
         // cost a native compile 8%.
         "@i_native_frames = internal constant i64 ", if direct { "1" } else { "0" }, "\n"];
     // Every CAF, for the census of the shared region to start from.
-    let cafs = list.map (fn f -> "ptr @caf_" + str.slice 1 (len (core.Function.symbol f) - 1) (core.Function.symbol f))
-        (list.filter (fn f -> core.Function.how f == :caf) (core.St.functions st));
+    let cafs = list.append (LibPart.cafs part) (cafs_of (core.St.functions st));
     let cafs_table = str.concat_all ["@i_cafs = internal constant <{ i64", str.concat_all (list.map (fn _ -> ", ptr") cafs),
         " }> <{ i64 ", to_string (list.length cafs), str.concat_all (list.map (fn c -> ", " + c) cafs), " }>\n"];
     let arity = image.Func.arity (image.func user entry);
@@ -2507,7 +2605,7 @@ let assemble user st unit_ lib_names entry arch direct = {
         Gen.data g,
         // Between these, the runtime: the same text for every program, which the splitter puts in
         // parts of its own and compiles once (`aot_objects`, "Parts kept").
-        ["; dream: cached\n", dialect.Unit.text unit_, "; dream: end cached\n"],
+        ["; dream: cached\n", dialect.Unit.text unit_, LibPart.text part, "; dream: end cached\n"],
         list.reverse (Gen.code g),
         [main_],
     ])

@@ -36,6 +36,27 @@ Three decisions were made by asking:
 The VM's nodes are a program to be analysed, not a template to expand. Flags
 such as `STRICT` and hints such as `ITYP` are inputs to the analyses.
 
+## What a build keeps
+
+A native program is mostly the runtime and the library, and those are the same in every
+program, so a build makes them once and keeps them in `DREAMS_AOT_CACHE` (`~/.cache/dream/aot`
+by default; `0` for none):
+
+- **The library part** (`machine.lib_part`, `lib-*.wire`): the whole library translated and
+  written first and by itself, so its atoms, strings and symbols are numbered the same for every
+  program, with the state the program's translation goes on from and the runtime as the dialect
+  translates it. Keyed by the compiler, the library, the runtime and the machine.
+- **Compiled parts** (`*.o`): the runtime and the library stand between `; dream: cached`
+  markers in the IR, and the splitter gives them parts of their own, the same text each time,
+  kept under the SHA-256 of their text, LLVM's version and the level (dream/src/aot_object.cpp).
+- **The kept objects merged** (`link.merged_part`, `merged-*.wire`): read and numbered once,
+  first, so a link reads and merges only the program's own objects after them.
+
+Every function and datum is a section of its own, and the linker lays out only what is reached
+from the sections that are not (`live_sections`), so an executable holds what it uses of all
+that: `01_basics` is 390 KB. A warm build of a small example is about a second and a half on the
+VM, against two before and nine seconds of LLVM's CPU on one core before parts.
+
 ## The execution model
 
 An STG-style machine, because laziness, cheap processes and unbounded recursion

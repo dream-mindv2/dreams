@@ -15,6 +15,7 @@ import std.num;
 import std.os;
 import std.str;
 import std.vm;
+import std.wire;
 
 import dreams.aot.dialect;
 import dreams.aot.image;
@@ -92,7 +93,8 @@ let parts_asked! ir = match os.env! "DREAMS_AOT_PARTS" {
 let object_and_link! : :string -> :string -> :string -> :string -> Result :integer [:string];
 let object_and_link! ir out payload interp = match vm.llvm_objects! ir opt_level (parts_asked! ir) {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
-    Result.ok(objects) => match link.link_all (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ())) (after_keeping! objects) {
+    Result.ok([objects, kept]) => match linked! (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ()))
+                                        (after_keeping! objects) kept {
         Result.error(why) => Result.error [why],
         Result.ok(exe) => {
             file.write! out exe;
@@ -100,6 +102,42 @@ let object_and_link! ir out payload interp = match vm.llvm_objects! ir opt_level
             Result.ok (len exe)
         },
     },
+};
+
+/// `objects` linked: the last `kept` -- the runtime's and the library's, the same bytes in every
+/// build -- merged once and kept in the AOT cache under their digests (`link.merged_part`), and
+/// the program's own read and merged after them.
+let linked! : link.Options -> [:string] -> :integer -> Result :string :string;
+let linked! o objects kept = match list.find (fn obj -> str.slice 0 4 obj != str.of_bytes [127, 69, 76, 70]) objects {
+    Option.some(_) => Result.error "not an ELF object",
+    Option.none => {
+        let own = list.take (list.length objects - kept) objects;
+        let theirs = list.drop (list.length objects - kept) objects;
+        let part = if kept == 0 { link.no_part } else { kept_part! theirs };
+        link.link_parsed o part (list.map link.parse own)
+    },
+};
+
+let kept_part! : [:string] -> link.MergedPart;
+let kept_part! objects = {
+    let make = fn () -> link.merged_part (str.byte 18 (list.head objects) + 256 * str.byte 19 (list.head objects)) 0 0 (list.map link.parse objects);
+    match aot_cache! () {
+        () => make (),
+        dir => {
+            // The format's version is in the key: what a link reads of a kept part changes with the linker.
+            let at = str.concat_all [dir, "/merged-", io.digest (str.concat_all (list.cons "merged-2" (list.map io.digest objects))), ".wire"];
+            let made = fn! () -> {
+                let part = make ();
+                file.mkdir_all! dir;
+                file.replace! at (wire.pack part);
+                part
+            };
+            match file.read! at {
+                Option.some(bytes) => match wire.decode bytes { Result.ok(part) => part, _ => made () },
+                Option.none => made (),
+            }
+        },
+    }
 };
 
 /// Whether an image was written in the runtime's dialect and stands alone: it says so
@@ -115,6 +153,48 @@ let chosen! name = match name {
     n => match target.named n {
         Option.none => Result.error [str.concat_all ["no target `", n, "`: x86_64-linux or aarch64-linux"]],
         Option.some(t) => Result.ok [t, if target.Target.arch t == target.Target.arch (target.host ()) { loader! () } else { target.Target.loader t }],
+    },
+};
+
+/// Where native builds keep what they made once: `DREAMS_AOT_CACHE`, none when it is empty or `0`,
+/// or `$XDG_CACHE_HOME/dream/aot`, or `~/.cache/dream/aot` -- where `vm.llvm_objects!` keeps
+/// compiled parts too (dream/src/aot_object.cpp).
+let aot_cache! : () -> :string | :unit;
+let aot_cache! () = match os.env! "DREAMS_AOT_CACHE" {
+    () => match os.env! "XDG_CACHE_HOME" {
+        () => match os.env! "HOME" { () => (), home => home + "/.cache/dream/aot" },
+        "" => match os.env! "HOME" { () => (), home => home + "/.cache/dream/aot" },
+        xdg => xdg + "/dream/aot",
+    },
+    "" => (),
+    "0" => (),
+    dir => dir,
+};
+
+/// The library translated and written for `arch` (`machine.lib_part`), read from the cache when a
+/// build with this compiler, library and runtime made it before, and kept there when not: making
+/// it is translating all of the library, twenty seconds of CPU, where reading it is a moment.
+let lib_part! : image.Image -> image.Image -> :string -> :string -> :integer -> Result machine.LibPart [:string];
+let lib_part! lib rt lib_bytes rt_bytes arch = match aot_cache! () {
+    () => machine.lib_part lib rt arch,
+    dir => {
+        let key = io.digest (str.concat_all [vm.image_digest (), ":", io.digest lib_bytes, ":", io.digest rt_bytes, ":", to_string arch, ":lib-part-1"]);
+        let at = str.concat_all [dir, "/lib-", key, ".wire"];
+        let made = fn! () -> match machine.lib_part lib rt arch {
+            Result.ok(part) => {
+                file.mkdir_all! dir;
+                file.replace! at (wire.pack (machine.lib_part_data part));
+                Result.ok part
+            },
+            failed => failed,
+        };
+        match file.read! at {
+            Option.some(bytes) => match wire.decode bytes {
+                Result.ok(d) => Result.ok (machine.lib_part_of d),
+                _ => made (),
+            },
+            Option.none => made (),
+        }
     },
 };
 
@@ -134,9 +214,15 @@ let build! bytes out lib_bytes rt_bytes target_name = match chosen! target_name 
                 }
             } else {
                 match [image.read lib_bytes, image.read rt_bytes] {
-                    // Direct style (dreams/docs/aot-direct.md, stage 4); `DREAMS_AOT_CPS=1` is the code
-                    // that jumps, kept to measure against while the two both exist.
-                    [Result.ok(lib), Result.ok(rt)] => match machine.to_ir img lib rt arch (os.env! "DREAMS_AOT_CPS" == ()) {
+                    // Direct style (dreams/docs/aot-direct.md, stage 4), on the library written once
+                    // and kept (`lib_part!`); `DREAMS_AOT_CPS=1` is the code that jumps, kept to
+                    // measure against while the two both exist.
+                    [Result.ok(lib), Result.ok(rt)] => match (if os.env! "DREAMS_AOT_CPS" != () { machine.to_ir img lib rt arch false } else {
+                        match lib_part! lib rt lib_bytes rt_bytes arch {
+                            Result.ok(part) => machine.to_ir_from img lib rt arch part,
+                            Result.error(why) => Result.error why,
+                        }
+                    }) {
                         Result.error(why) => Result.error why,
                         Result.ok(ir) => written! ir out (image.payload_bytes img) interp,
                     },
