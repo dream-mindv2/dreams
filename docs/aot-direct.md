@@ -121,6 +121,65 @@ that "close to C++" is a number.
 4. **The code generator.** `machine.dr` writes direct style from the same core program
    (`core.dr` is untouched): forces and calls as calls, thunks as functions that return, `try!` and
    `raise!` through the runtime. Behind `--aot-direct` until the suite passes, then the default.
+   *Built (stage 4), and the default since; `DREAMS_AOT_CPS=1` is the code that jumps:* `machine.function_d` and `dexpr`. Each
+   function's direct body (`@..d`) answers its value, or 0 for a failure whose error is in the
+   context, as a native answers; each call is followed by a test of that, and a failure goes to
+   the `catching` around it or out of the function. Beside each body is a shim under the usual
+   symbol, which the runtime jumps to and which calls the body and answers the frame on top or
+   unwinds, so the runtime's ten jumps into code are unchanged and infos say where the direct
+   body is in a ninth word. Direct code reaches runtime code that answers through frames -- a
+   parking native, `raise!`, `apply!` for anything but an exact closure, a shared thunk -- by a
+   *bridge*: a frame whose code returns (`frame_bridge!`), below which the call is an ordinary
+   call, so that the chain of jumps it starts comes back to the caller with the answer, or with 0
+   when an unwinding reaches it. A thunk's body marks it a hole, evaluates and writes its answer
+   over it, or an indirection to the raise. What the stage needed beside the generator:
+
+   - *Parking keeps the stack.* `schedule!` switches off a process's stack (`dream_switch`) and
+     `dispatch!` switches back into it, so a direct caller below a park is still there.
+   - *The context moves.* A process resumed on another worker finds `%p` stale: after any call
+     that may have parked, generated code reads the worker's context again from a word of the
+     thread's control block glibc keeps for split stacks (`%fs:0x70`, `ctx_of`, written once per
+     thread by `note_context!`). On aarch64, with no such word, a process stays on the worker it
+     first ran on. Pinned at first, `net` was five times slower.
+   - *Repeated and long rests out of line.* The core repeats a `seq` under every branch that
+     reaches it, and a `match` is a decision tree; written in line, `show_all` was one function of
+     49 MB. A repeated `seq`, or one whose rest is long, is a function of its own called with what
+     it needs, and identical ones are one body (`finish`), as continuations were.
+   - *Pinning objects, not chunks.* With the native stack read, pinning whole chunks kept every
+     collection's allocation chunk, so nothing young died (`tree` spent three quarters of its time
+     collecting). Now a chunk a word falls in is walked and only the objects a word points into
+     are marked (bit 2 of the info) and kept; the gaps become fillers. Allocation chunks are
+     16 KB in direct style, to-space a chain of them, and a collection is asked for when a
+     budget's worth, or twice what the last kept, has been allocated (`ctx_gc_at`).
+   - *Segmented stacks.* A process starts on a 256 KB slot of an arena (8 MB for a program that
+     can reach deep C, and for the first process), a quarter of it its stack of frames, which
+     cannot move. A function entered too near the floor is called again on a new segment
+     (`segment_call!`, `dream_call_on`), its answer the answer of the call that ran low; the
+     collector reads every segment. Fifty thousand parked processes fit under `ulimit -v`, and a
+     recursion as deep as a compiler's still runs, overflow being the chain passing 256 MB (1 GB
+     for the first process). A bridge checks the stack of frames' floor before it pushes.
+
+   Measured against code that jumps on the same machine (ms, best of three):
+
+   | bench | CPS | direct | C++ |
+   |---|---|---|---|
+   | tree | 69 | 121 | 106 |
+   | maps | 604 | 381 | 41 |
+   | sorts | 370 | 330 | 64 |
+   | recs | 470 | 521 | 5 |
+   | strs | 133 | 117 | 27 |
+   | procs | 150 | 259 | - |
+   | fanout | 17 | 22 | - |
+   | net | 104 | 122 | - |
+
+   And the workload that matters most: native `dreams` compiling `mind` takes 1.81 s in direct
+   style against 2.21 s (7.25 s CPU against 7.95; the VM takes 2.84 s), the image byte for byte
+   the same, which is why direct style is the default with four of the eight behind.
+
+   What is left between them is the conservative stack: a frame's dead slot still points at
+   what it held, and in `tree` that keeps whole subtrees alive through a collection -- 71 MB
+   copied where code that jumps copies 16 KB. Precise stack maps (LLVM's statepoints) are the
+   answer to that, and the next thing here.
 5. **The runtime's own machine functions** -- `enter!`, `apply!`, the parking natives, `spawn!`,
    the update frames -- in direct style, and the CPS ones removed.
 6. **Then the gains a C++ compiler has and this does not yet:** strictness analysis, so that most

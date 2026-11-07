@@ -323,6 +323,22 @@ let primitive cx name args s = match name {
             } else {
                 "call i64 asm sideeffect \"movq %rsp, $0\", \"=r,~{rbx},~{rbp},~{r12},~{r13},~{r14},~{r15},~{memory}\"()"
             }) s1,
+            // A switch from one machine stack to another, saving where this one stood at `save` as
+            // `run_on!` does, and coming back here when something switches to it again: a process
+            // that parks with frames of its own on its stack keeps them (dreams/docs/aot-direct.md).
+            ["switch!", [save, to]] => ["0", line (str.concat_all ["  call void @dream_switch(i64 ", save, ", i64 ", to, ")"]) s1],
+            // The worker's context as this thread holds it, in a word of the thread's control
+            // block glibc keeps for split stacks and nothing else uses: direct-style code reads it
+            // after a call that may have parked, since the process may go on on another worker.
+            // On aarch64, where a process in direct style stays on its worker instead, there is
+            // nothing to read and nothing written.
+            ["ctx_here!", [_]] => if State.arch s1 == 1 { ["0", s1] } else { instr "call i64 asm sideeffect \"movq %fs:0x70, $0\", \"=r\"()" s1 },
+            ["set_ctx_here!", [ctx]] => if State.arch s1 == 1 { ["0", s1] } else {
+                ["0", line (str.concat_all ["  call void asm sideeffect \"movq $0, %fs:0x70\", \"r\"(i64 ", ctx, ")"]) s1]
+            },
+            // A call of `record`'s function with its six words on the stack whose top is `top`,
+            // coming back here with its answer: a stack that has run low goes on in a segment.
+            ["call_on!", [top, record]] => instr (str.concat_all ["call i64 @dream_call_on(i64 ", top, ", i64 ", record, ")"]) s1,
             ["return_to!", [sp]] => ["0", line (str.concat_all ["  call void @dream_return_to(i64 ", sp, ")"]) s1],
             // A thread of the blocking pool, which runs C calls a worker must not wait in.
             ["start_pool!", [ctx]] => instr (str.concat_all ["call i64 @dream_start_pool(i64 ", ctx, ")"]) s1,
@@ -449,6 +465,18 @@ let call_of cx n args tail s = {
                 let call = str.concat_all ["call tailcc i64 ", function_name target, "(", args_text vals, ")"];
                 instr (if tail { "musttail " + call } else { call }) s2
             },
+        // A call through a code address with the machine's own signature, which comes back with
+        // its answer: what direct-style code is, called from the runtime.
+        ["call!", _] => {
+            let [vals, s1] = values cx args s;
+            match vals {
+                [code, ..rest] => {
+                    let [fn_, s2] = instr (str.concat_all ["inttoptr i64 ", code, " to ptr"]) s1;
+                    instr (str.concat_all ["call tailcc i64 ", fn_, "(", args_text rest, ")"]) s2
+                },
+                _ => refuse (cx.[:name] + ": a call needs a code address") s1,
+            }
+        },
         // A jump is a call that must not come back, so it means nothing but in tail
         // position: the code address is called with the machine's own signature.
         ["jump!", _] => {

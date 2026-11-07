@@ -132,7 +132,9 @@ let build! bytes out lib_bytes rt_bytes target_name = match chosen! target_name 
                 }
             } else {
                 match [image.read lib_bytes, image.read rt_bytes] {
-                    [Result.ok(lib), Result.ok(rt)] => match machine.to_ir img lib rt arch {
+                    // Direct style (dreams/docs/aot-direct.md, stage 4); `DREAMS_AOT_CPS=1` is the code
+                    // that jumps, kept to measure against while the two both exist.
+                    [Result.ok(lib), Result.ok(rt)] => match machine.to_ir img lib rt arch (os.env! "DREAMS_AOT_CPS" == ()) {
                         Result.error(why) => Result.error why,
                         Result.ok(ir) => written! ir out (image.payload_bytes img) interp,
                     },

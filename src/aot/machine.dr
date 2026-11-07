@@ -50,6 +50,22 @@ group Gen {
     /// The pointer made of a word in this block, by the word (`pointer_at`): forgotten at the
     /// next block, where it might not have been made.
     ptrs : %{:string => :string},
+    /// Whether functions are written in direct style (`function_d`), and there the block a
+    /// failure goes to -- a `catching`'s handler -- or "" to answer 0 out of the function.
+    direct : :bool,
+    err : :string,
+    arch : :integer,
+    /// In direct style, whether something called so far in this function may have parked, after
+    /// which the process may be running on another worker, and the context is read from the
+    /// thread instead of `%p`; and the name it was read under in this block, or "" (`ctx_of`).
+    moved : :bool,
+    pcur : :string,
+    /// In direct style, the `seq`s of the function bound more than once -- the core repeats one
+    /// under each branch that reaches it -- each written once as a function of its own, by its
+    /// variable, and those not written yet (`out_of_line`).
+    dups : :map,
+    dconts : :map,
+    dpending : [[:any]],
 }
 
 let args_text : [:string] -> :string;
@@ -91,7 +107,21 @@ let local_at : :integer -> Gen -> Gen;
 let local_at !n g = Gen.set_local n g;
 
 let start : :string -> Gen -> Gen;
-let start name g = Gen.set_label name (emit (name + ":") g) |> Gen.set_ptrs %{};
+let start name g = Gen.set_label name (emit (name + ":") g) |> Gen.set_ptrs %{} |> Gen.set_pcur "";
+
+/// The context, as a name this block may use: `%p`, until something has been called that may
+/// have parked, and then the worker's own as the thread holds it -- the process may have been
+/// resumed on another (dreams/docs/aot-direct.md, "Moving"). Read once a block.
+let ctx_of : Gen -> [:string, Gen];
+let ctx_of g = if not (Gen.moved g) { ["%p", g] } else if Gen.pcur g != "" { [Gen.pcur g, g] } else {
+    let [v, g1] = instr "call i64 asm sideeffect \"movq %fs:0x70, $0\", \"=r\"()" g;
+    [v, Gen.set_pcur v g1]
+};
+
+/// After a call that may have parked: the context is to be read again. On aarch64 a process in
+/// direct style stays on the worker it first ran on, and `%p` stays good.
+let may_have_moved : Gen -> Gen;
+let may_have_moved g = if Gen.direct g && Gen.arch g != 1 { g |> Gen.set_moved true |> Gen.set_pcur "" } else { g };
 
 /// The symbol of a function of the runtime.
 let rt_symbol : Gen -> :string -> :string;
@@ -180,7 +210,7 @@ let call_rt names name args g = instr (str.concat_all ["call tailcc i64 ", rt_sy
 /// `v == 0` goes to a block that raises; anything else goes on. What it raises is the
 /// runtime's to say, since a native has no business knowing where the stack is.
 let raise_if_zero : :string -> :string -> Gen -> Gen;
-let raise_if_zero sp v g = {
+let raise_if_zero sp v g = if Gen.direct g { or_failing v g } else {
     let [bad, g1] = instr (str.concat_all ["icmp eq i64 ", v, ", 0"]) g;
     let [raises, g2] = label_of "raises" g1;
     let [fine, g3] = label_of "fine" g2;
@@ -230,18 +260,19 @@ let cold_text symbols = str.concat_all (list.map (fn name -> str.concat_all [
 /// Allocation, in line: a call for this was a tenth of a run. Only the end of the chunk is the
 /// runtime's. 0 and 8 are `ctx_hp` and `ctx_limit` in `rt/main.dr`.
 let bump_alloc : :integer -> Gen -> [:string, Gen];
-let bump_alloc bytes g = {
-    let [hp, g1] = load_at "%p" 0 g;
+let bump_alloc bytes g0 = {
+    let [ctx, g] = ctx_of g0;
+    let [hp, g1] = load_at ctx 0 g;
     let [next, g2] = instr (str.concat_all ["add i64 ", hp, ", ", to_string bytes]) g1;
-    let [limit, g3] = load_at "%p" 8 g2;
+    let [limit, g3] = load_at ctx 8 g2;
     let [over, g4] = instr (str.concat_all ["icmp ugt i64 ", next, ", ", limit]) g3;
     let [fits, g5] = label_of "fits" g4;
     let [more, g6] = label_of "more" g5;
     let [done, g7] = label_of "got" g6;
     let g8 = start fits (emit (str.concat_all ["  br i1 ", over, ", label %", more, ", label %", fits]) g7);
-    let g9 = store_at "%p" 0 next g8;
+    let g9 = store_at ctx 0 next g8;
     let g10 = start more (emit ("  br label %" + done) g9);
-    let [slow, g11] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol "alloc!", "(i64 %p, i64 ", to_string bytes, ", i64 0)"]) g10;
+    let [slow, g11] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol "alloc!", "(i64 ", ctx, ", i64 ", to_string bytes, ", i64 0)"]) g10;
     let g12 = start done (emit ("  br label %" + done) g11);
     instr (str.concat_all ["phi i64 [ ", hp, ", %", fits, " ], [ ", slow, ", %", more, " ]"]) g12
 };
@@ -334,7 +365,8 @@ let tagged_arith sp op a b g = {
     let [cold, g11a] = label_of "cold" g11;
     let [floated, g11b] = if may_be_floats { both_floats op a b cold done g11a } else { [[], emit ("  br label %" + cold) g11a] };
     let g11c = start cold g11b;
-    let [s, g12] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol (slow_name op), "(i64 %p, i64 ", a, ", i64 ", b, ")"]) g11c;
+    let [ctx, g11d] = ctx_of g11c;
+    let [s, g12] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol (slow_name op), "(i64 ", ctx, ", i64 ", a, ", i64 ", b, ")"]) g11d;
     let g13 = raise_if_zero sp s g12;
     let from_slow = Gen.label g13;
     let g14 = start done (emit ("  br label %" + done) g13);
@@ -394,7 +426,8 @@ let tagged_compare sp op a b g = {
     let [bit, g7] = instr (str.concat_all ["icmp ", condition, " i64 ", a, ", ", b]) g6;
     let [word, g7b] = as_bool bit g7;
     let g8 = start slow (emit ("  br label %" + done) g7b);
-    let [slow_word, g9] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol (op + "_slow!"), "(i64 %p, i64 ", a, ", i64 ", b, ")"]) g8;
+    let [ctx, g8x] = ctx_of g8;
+    let [slow_word, g9] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol (op + "_slow!"), "(i64 ", ctx, ", i64 ", a, ", i64 ", b, ")"]) g8x;
     let g10 = raise_if_zero sp slow_word g9;
     let from_slow = Gen.label g10;
     let g11 = start done (emit ("  br label %" + done) g10);
@@ -427,12 +460,17 @@ let info_symbol name =
 let info_text : :string -> :string -> :integer -> :integer -> :integer -> :string;
 let info_text name code kind size arity = info_with name code kind size arity "null" "null" 0 "null";
 
-/// An info: seven words, `rt/main.dr` says what each is.
+/// An info: nine words, `rt/main.dr` says what each is. The last is the direct-style entry, or
+/// null: a thunk's body that answers its value, which a force calls (`force_d!`), and a function's
+/// that a known call or an exact application calls (dreams/docs/aot-direct.md).
 let info_with : :string -> :string -> :integer -> :integer -> :integer -> :string -> :string -> :integer -> :string -> :string;
-let info_with name code kind size arity call shown impure place =
-    str.concat_all [name, " = internal constant <{ ptr, i64, i64, i64, ptr, ptr, i64, ptr }> <{ ptr ", code, ", i64 ", to_string kind,
+let info_with name code kind size arity call shown impure place = info_direct name code kind size arity call shown impure place "null";
+
+let info_direct : :string -> :string -> :integer -> :integer -> :integer -> :string -> :string -> :integer -> :string -> :string -> :string;
+let info_direct name code kind size arity call shown impure place direct =
+    str.concat_all [name, " = internal constant <{ ptr, i64, i64, i64, ptr, ptr, i64, ptr, ptr }> <{ ptr ", code, ", i64 ", to_string kind,
                     ", i64 ", to_string size, ", i64 ", to_string arity, ", ptr ", call, ", ptr ", shown, ", i64 ", to_string impure,
-                    ", ptr ", place, " }>\n"];
+                    ", ptr ", place, ", ptr ", direct, " }>\n"];
 
 /// A value of the right-hand side of a `bind`.
 let rhs : core.Rhs -> :map -> :string -> Gen -> [:string, Gen];
@@ -444,12 +482,15 @@ let rhs r env sp g = {
         core.Rhs.arith(op, a, b) => tagged_arith sp op (text a) (text b) g,
         core.Rhs.compare(op, a, b) => tagged_compare sp op (text a) (text b) g,
         core.Rhs.native(name, args) => {
-            let [v, g1] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g name, "(",
-                                                 args_text (list.cons "%p" (list.map text args)), ")"]) g;
+            let [ctx, g0] = ctx_of g;
+            let [v, g1] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g0 name, "(",
+                                                 args_text (list.cons ctx (list.map text args)), ")"]) g0;
             [v, raise_if_zero sp v g1]
         },
-        core.Rhs.peek(name, args) => instr (str.concat_all ["call tailcc i64 ", rt_symbol g name, "(",
-                                                 args_text (list.cons "%p" (list.map text args)), ")"]) g,
+        core.Rhs.peek(name, args) => {
+            let [ctx, g0] = ctx_of g;
+            instr (str.concat_all ["call tailcc i64 ", rt_symbol g0 name, "(", args_text (list.cons ctx (list.map text args)), ")"]) g0
+        },
         core.Rhs.alloc(info, args) => {
             let [o, g1] = bump_alloc (8 * (1 + list.length args)) g;
             let g2 = store_at o 0 (str.concat_all ["ptrtoint (ptr ", info_symbol info, " to i64)"]) g1;
@@ -1370,6 +1411,465 @@ let function f g = {
     drain (data_onto (list.concat [cafs, infos, Gen.data g7]) g7)
 };
 
+// --- direct style ------------------------------------------------------------------------------
+//
+// The same core, written so that a function returns its answer (dreams/docs/aot-direct.md). A
+// force is a test in line and, for what is not yet a value, a call (`force_d!`); a call of a
+// known function is a call, and in tail position a `musttail` one, so a loop is still a loop; a
+// `seq` is the code after a call, in the same function, its values in registers. What fails
+// answers 0, as a native does, with the error in the context: each call is followed by a test
+// of that, and a failure goes to the `catching` around it or out of the function.
+//
+// The runtime's own code still answers through frames on the process's stack, and each function
+// here has a shim beside it, under its usual symbol, that the runtime jumps to: it calls the
+// function and answers the frame on top, or unwinds. Infos keep pointing at the shims, and say
+// where the direct entry is in their last word. Direct code reaches runtime code that answers
+// through frames -- a machine native that may park, `raise!`, `apply!` for what is not an exact
+// closure -- by a bridge: a frame whose code returns, so that the chain of jumps the call starts
+// comes back to its caller with the answer, or with 0 when something unwinds into it.
+
+/// A direct body's symbol: the shim's, with a `d`.
+let direct_symbol : :string -> :string;
+let direct_symbol symbol = symbol + "d";
+
+/// Whether a call's target is runtime code that answers through frames.
+let frame_target : :string -> :bool;
+let frame_target symbol = str.starts_with "@m_" symbol || symbol == "@raise!";
+
+/// The block goes where a failure goes: the handler around it, or out with 0.
+let failing : Gen -> Gen;
+let failing g = if Gen.err g != "" { emit ("  br label %" + Gen.err g) g } else { emit "  ret i64 0" g };
+
+/// `v` of 0 fails; otherwise generation goes on in a block of its own.
+let or_failing : :string -> Gen -> Gen;
+let or_failing v g = {
+    let [bad, g1] = instr (str.concat_all ["icmp eq i64 ", v, ", 0"]) g;
+    let [fails, g2] = label_of "fails" g1;
+    let [fine, g3] = label_of "fine" g2;
+    let g4 = emit (str.concat_all ["  br i1 ", bad, ", label %", fails, ", label %", fine]) g3;
+    start fine (failing (start fails g4))
+};
+
+/// `v` as the answer: to the block that joins, or out of the function.
+let answered : :string -> Gen -> Gen;
+let answered v g = if Gen.join g != "" {
+    Gen.set_leaves (list.cons [Gen.label g, v, ""] (Gen.leaves g)) g |> emit ("  br label %" + Gen.join g)
+} else { emit ("  ret i64 " + v) g };
+
+/// Whether a call here is the last thing the function does, with nothing to catch its failure.
+let in_tail : Gen -> :bool;
+let in_tail g = Gen.join g == "" && Gen.err g == "";
+
+/// A call of direct code, or a jump to it in tail position; then the answer.
+let direct_call : :string -> [:string] -> Gen -> Gen;
+let direct_call target args g0 = {
+    let [ctx, g] = ctx_of g0;
+    let all = list.cons ctx (list.drop 1 args);
+    if in_tail g {
+        let [r, g1] = instr (str.concat_all ["musttail call tailcc i64 ", target, "(", args_text all, ")"]) g;
+        emit ("  ret i64 " + r) g1
+    } else {
+        let [v, g1] = instr (str.concat_all ["call tailcc i64 ", target, "(", args_text all, ")"]) g;
+        answered v (or_failing v (may_have_moved g1))
+    }
+};
+
+/// A frame whose code returns, on the stack below `sp`: where a bridge's chain comes back.
+let bridge_below : :string -> Gen -> [:string, Gen];
+let bridge_below sp g = {
+    let [at, g1] = reserve sp 1 g;
+    [at, store_at at 0 "ptrtoint (ptr @i_bridge to i64)" g1]
+};
+
+/// Whether the stack of frames has room below `sp` for a bridge and what the runtime pushes past
+/// it: in direct style it cannot grow, and going below its floor would write over another stack.
+/// Failing with a recursion too deep when it has not (`frames_full!`).
+let frames_room : :string -> Gen -> Gen;
+let frames_room sp g0 = {
+    let [ctx, g] = ctx_of g0;
+    let [floor, g1] = load_at ctx 816 g;
+    let [low, g2] = instr (str.concat_all ["icmp ult i64 ", sp, ", ", floor]) g1;
+    let [full, g3] = label_of "full" g2;
+    let [room, g4] = label_of "room" g3;
+    let g5 = start full (emit (str.concat_all ["  br i1 ", low, ", label %", full, ", label %", room]) g4);
+    let [_, g6] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g5 "frames_full!", "(", args_text [ctx, sp, "0", "0", "0", "0"], ")"]) g5;
+    start room (failing g6)
+};
+
+/// Runtime code that answers through frames, called across a bridge: its answer, or 0.
+let bridged : :string -> :string -> [:string] -> [:string] -> Gen -> [:string, Gen];
+let bridged target sp regs extra g0 = {
+    let g = frames_room sp g0;
+    let [at, g1] = bridge_below sp g;
+    let [below, g2] = pushing extra at g1;
+    let pad = list.replicate (4 - list.length regs) "0";
+    let [ctx, g3] = ctx_of g2;
+    let [v, g4] = instr (str.concat_all ["call tailcc i64 ", target, "(", args_text (list.concat [[ctx, below], regs, pad]), ")"]) g3;
+    [v, may_have_moved g4]
+};
+
+/// `v` evaluated: itself when it is a value, which is asked in line, and otherwise what
+/// `force_d!` answers, or a failure.
+let forced : :string -> :string -> Gen -> [:string, Gen];
+let forced v sp g = {
+    let [low, g1] = instr (str.concat_all ["and i64 ", v, ", 7"]) g;
+    let [is_object, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g1;
+    let [object, g3] = label_of "object" g2;
+    let [slow, g4] = label_of "force" g3;
+    let [done, g5] = label_of "forced" g4;
+    let from_start = Gen.label g5;
+    let g6 = start object (emit (str.concat_all ["  br i1 ", is_object, ", label %", object, ", label %", done]) g5);
+    let [info, g7] = load_at v 0 g6;
+    let [kind, g8] = load_at info 8 g7;
+    let [ready, g9] = instr (str.concat_all ["icmp ugt i64 ", kind, ", 2"]) g8;
+    let g10 = start slow (emit (str.concat_all ["  br i1 ", ready, ", label %", done, ", label %", slow]) g9);
+    // A thunk with a body of its own is called here; anything else is `force_d!`'s.
+    let [is_thunk, g10a] = instr (str.concat_all ["icmp eq i64 ", kind, ", 0"]) g10;
+    let [body, g10b] = load_at info 64 g10a;
+    let [has_body, g10c] = instr (str.concat_all ["icmp ne i64 ", body, ", 0"]) g10b;
+    let [direct, g10d] = instr (str.concat_all ["and i1 ", is_thunk, ", ", has_body]) g10c;
+    let [general, g10e] = instr (str.concat_all ["ptrtoint ptr ", rt_symbol g10d "force_d!", " to i64"]) g10d;
+    let [code, g10f] = instr (str.concat_all ["select i1 ", direct, ", i64 ", body, ", i64 ", general]) g10e;
+    let [target, g10g] = instr (str.concat_all ["inttoptr i64 ", code, " to ptr"]) g10f;
+    let [ctx, g10h] = ctx_of g10g;
+    let [r, g11] = instr (str.concat_all ["call tailcc i64 ", target, "(", args_text [ctx, sp, v, "0", "0", "0"], ")"]) g10h;
+    let g12 = or_failing r (may_have_moved g11);
+    let from_slow = Gen.label g12;
+    let g13 = start done (emit ("  br label %" + done) g12);
+    instr (str.concat_all ["phi i64 [ ", v, ", %", from_start, " ], [ ", v, ", %", object, " ], [ ", r, ", %", from_slow, " ]"]) g13
+};
+
+/// Generate `e` in direct style: it ends the current block, answering out of the function, or
+/// to `Gen.join` when that is set, or failing.
+let dexpr : core.Expr -> :map -> :string -> Gen -> Gen;
+let dexpr e env sp g = match e {
+    core.Expr.ret(a) => answered (atom_text env a) g,
+    core.Expr.enter(a) => {
+        let [v, g1] = forced (atom_text env a) sp g;
+        answered v g1
+    },
+    core.Expr.call(symbol, args) => dcall symbol "0" args env sp g,
+    core.Expr.call_closure(f, symbol, args) => dcall symbol (atom_text env f) args env sp g,
+    core.Expr.apply(f, args) => {
+        let vals = list.map (atom_text env) args;
+        let fv = atom_text env f;
+        let count = list.length vals;
+        let [low, g1] = instr (str.concat_all ["and i64 ", fv, ", 7"]) g;
+        let [is_object, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g1;
+        let [object, g3] = label_of "object" g2;
+        let [exact, g4] = label_of "exact" g3;
+        let [general, g5] = label_of "general" g4;
+        let g6 = start object (emit (str.concat_all ["  br i1 ", is_object, ", label %", object, ", label %", general]) g5);
+        let [info, g7] = load_at fv 0 g6;
+        let [kind, g8] = load_at info 8 g7;
+        let [arity, g9] = load_at info 24 g8;
+        let [is_closure, g10] = instr (str.concat_all ["icmp eq i64 ", kind, ", 3"]) g9;
+        let [fits, g11] = instr (str.concat_all ["icmp eq i64 ", arity, ", ", to_string count]) g10;
+        let [both, g12] = instr (str.concat_all ["and i1 ", is_closure, ", ", fits]) g11;
+        let g13 = start exact (emit (str.concat_all ["  br i1 ", both, ", label %", exact, ", label %", general]) g12);
+        let [code, g14] = load_at info 64 g13;
+        let [target, g15] = instr (str.concat_all ["inttoptr i64 ", code, " to ptr"]) g14;
+        let regs = list.take 3 vals;
+        let [below, g16] = pushing (list.drop 3 vals) sp g15;
+        let pad = list.replicate (3 - list.length regs) "0";
+        let g17 = start general (direct_call target (list.concat [["%p", below, fv], regs, pad]) g16);
+        // Anything else -- a partial application, too few or too many, not a function -- is
+        // `apply!`'s, its arguments on the stack below the bridge.
+        let [v, g18] = bridged (rt_symbol g17 "apply!") sp [fv, to_string count] vals g17;
+        answered v (or_failing v g18)
+    },
+    core.Expr.choose(a, yes, no) => {
+        let v = atom_text env a;
+        let [is_true, g1] = instr (str.concat_all ["icmp eq i64 ", v, ", ", core.true_word]) g;
+        let [then_, g2] = label_of "then" g1;
+        let [other, g3] = label_of "other" g2;
+        let [else_, g4] = label_of "else" g3;
+        let [wrong, g5] = label_of "wrong" g4;
+        let g6 = start then_ (emit (str.concat_all ["  br i1 ", is_true, ", label %", then_, ", label %", other]) g5);
+        let g7 = start other (dexpr yes env sp g6);
+        let [is_false, g8] = instr (str.concat_all ["icmp eq i64 ", v, ", ", core.false_word]) g7;
+        let g9 = start wrong (emit (str.concat_all ["  br i1 ", is_false, ", label %", else_, ", label %", wrong]) g8);
+        let [_, g10] = bridged (rt_symbol g9 "not_bool!") sp [v] [] g9;
+        dexpr no env sp (start else_ (failing g10))
+    },
+    core.Expr.seq(x, live, inner, rest) if map.has x (Gen.dups g) || core_within rest inline_budget < 0 => {
+        let [v, g1] = match inner {
+            core.Expr.enter(a) => forced (atom_text env a) sp g,
+            _ => valued inner env sp g,
+        };
+        if v == "" { g1 } else { out_of_line x live rest v env sp g1 }
+    },
+    core.Expr.seq(x, _, core.Expr.enter(a), rest) => {
+        let [v, g1] = forced (atom_text env a) sp g;
+        dexpr rest env.[x => v] sp g1
+    },
+    core.Expr.entry_force(a, x, _, _, body) => {
+        let [v, g1] = forced (atom_text env a) sp g;
+        dexpr body env.[x => v] sp g1
+    },
+    core.Expr.seq(x, _, inner, rest) => {
+        let [v, g1] = valued inner env sp g;
+        if v == "" { g1 } else { dexpr rest env.[x => v] sp g1 }
+    },
+    core.Expr.catching(x, _, body, handler, cleanup) => {
+        let [j, g1] = label_of "join" g;
+        let [h, g2] = label_of "caught" g1;
+        let [outer_join, outer_leaves, outer_err] = [Gen.join g2, Gen.leaves g2, Gen.err g2];
+        let g3 = dexpr body env sp (g2 |> Gen.set_join j |> Gen.set_leaves [] |> Gen.set_err h);
+        // The error, or 0 when it is not this one's to catch -- a kill, past anything but a cleanup.
+        let g4 = start h (Gen.set_err outer_err g3);
+        let [ctx, g4a] = ctx_of g4;
+        let [caught, g5] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g4a "caught_d!", "(",
+            args_text [ctx, sp, if cleanup { "1" } else { "0" }, "0", "0", "0"], ")"]) g4a;
+        let g6 = dexpr handler env.[x => caught] sp (or_failing caught g5);
+        let leaves = list.reverse (Gen.leaves g6);
+        let g7 = g6 |> Gen.set_join outer_join |> Gen.set_leaves outer_leaves;
+        if list.is_empty leaves { g7 } else {
+            let [v, g8] = instr ("phi i64 " + phi_args (list.map (fn l -> [l.[1], l.[0]]) leaves)) (start j g7);
+            answered v g8
+        }
+    },
+    core.Expr.bind(x, r, rest) => {
+        let [v, g1] = rhs r env sp g;
+        dexpr rest env.[x => v] sp g1
+    },
+    core.Expr.raised(a) => {
+        let [_, g1] = bridged (rt_symbol g "raise!") sp [str.concat_all ["ptrtoint (ptr ", Gen.place g, " to i64)"], atom_text env a] [] g;
+        failing g1
+    },
+    core.Expr.raise_text(_) => {
+        let [_, g1] = bridged (rt_symbol g "native_failed!") sp [] [] g;
+        failing g1
+    },
+};
+
+/// `inner`'s answer, in a block that follows it: generated with its answers joined, and their
+/// phi. "" when every way through it fails, and nothing follows.
+let valued : core.Expr -> :map -> :string -> Gen -> [:string, Gen];
+let valued inner env sp g = {
+    let [j, g1] = label_of "join" g;
+    let [outer_join, outer_leaves] = [Gen.join g1, Gen.leaves g1];
+    let g2 = dexpr inner env sp (g1 |> Gen.set_join j |> Gen.set_leaves []);
+    let leaves = list.reverse (Gen.leaves g2);
+    let g3 = g2 |> Gen.set_join outer_join |> Gen.set_leaves outer_leaves;
+    if list.is_empty leaves { ["", g3] } else {
+        instr ("phi i64 " + phi_args (list.map (fn l -> [l.[1], l.[0]]) leaves)) (start j g3)
+    }
+};
+
+/// What follows a `seq` the core repeats, or a long one, called as a function of its own -- the
+/// answer in `%a`, what it needs as its arguments -- and written once (`drain_d`). In line, a
+/// repeated one was written at every copy, and a `match`'s decision tree was one function, where
+/// code that jumps had a continuation for each `seq` and wrote each different one once
+/// (`finish`): `show_all`, with `show` inlined into it, was 49 MB of IR and four minutes of LLVM.
+let out_of_line : :integer -> [:integer] -> core.Expr -> :string -> :map -> :string -> Gen -> Gen;
+let out_of_line x live rest v env sp g = {
+    let [symbol, g1] = match map.lookup x (Gen.dconts g) {
+        Option.some(known) => [known, g],
+        Option.none => {
+            let k = "@kd" + to_string (Gen.next g);
+            [k, g |> Gen.set_next (Gen.next g + 1) |> Gen.set_dconts ((Gen.dconts g).[x => k])
+                  |> Gen.set_dpending (list.cons [k, live, x, rest] (Gen.dpending g))]
+        },
+    };
+    let vals = list.map (fn y -> env.[y]) live;
+    let regs = list.take 3 vals;
+    let [below, g2] = pushing (list.drop 3 vals) sp g1;
+    let pad = list.replicate (3 - list.length regs) "0";
+    direct_call symbol (list.concat [["%p", below, v], regs, pad]) g2
+};
+
+/// The functions `out_of_line` asked for, each taking its arguments apart as a call's are. Doing
+/// one may ask for more.
+let drain_d : Gen -> Gen;
+let drain_d g = match Gen.dpending g {
+    [] => g,
+    [[symbol, live, x, rest], ..others] => {
+        let g0 = g |> Gen.set_dpending others |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_join "" |> Gen.set_err ""
+                   |> Gen.set_leaves [] |> Gen.set_moved false |> Gen.set_pcur "";
+        let registers = ["%b", "%c", "%d"];
+        let extra = if list.length live > 3 { list.length live - 3 } else { 0 };
+        let [env, g1] = list.fold (fn [m, st] [i, y] ->
+            if i < 3 { [m.[y => registers.[i]], st] } else {
+                let [loaded, st1] = load_at "%sp0" (8 * (i - 3)) st;
+                [m.[y => loaded], st1]
+            }) [%{x => "%a"}, g0] (list.enumerate live);
+        let [sp, g2] = sp_past (8 * extra) g1;
+        drain_d (finish symbol (dexpr rest env sp g2))
+    },
+};
+
+/// The variable of each `seq` in `e`, bound more than once. A repeated one is the same tree each
+/// time, and is not walked again.
+let seq_dups : core.Expr -> :map -> :map;
+let seq_dups e !seen = match e {
+    core.Expr.seq(x, _, inner, rest) => if map.has x seen { seen.[x => 2] } else { seq_dups rest (seq_dups inner seen.[x => 1]) },
+    core.Expr.entry_force(_, _, _, _, body) => seq_dups body seen,
+    core.Expr.catching(_, _, body, handler, _) => seq_dups handler (seq_dups body seen),
+    core.Expr.choose(_, yes, no) => seq_dups no (seq_dups yes seen),
+    core.Expr.bind(_, _, rest) => seq_dups rest seen,
+    _ => seen,
+};
+
+/// The `seq`s of `body` that `dexpr` writes out of line.
+let dups_of : core.Expr -> :map;
+let dups_of body = map.filter (fn _ n -> n > 1) (seq_dups body %{});
+
+/// A known function called: its direct body, or runtime code across a bridge.
+let dcall : :string -> :string -> [core.Atom] -> :map -> :string -> Gen -> Gen;
+let dcall symbol self args env sp g = {
+    let vals = list.map (atom_text env) args;
+    let regs = list.take 3 vals;
+    let extra = list.drop 3 vals;
+    if frame_target symbol {
+        let [v, g1] = bridged (target_of g symbol) sp (list.cons self regs) extra g;
+        answered v (or_failing v g1)
+    } else {
+        let [below, g1] = pushing extra sp g;
+        let pad = list.replicate (3 - list.length regs) "0";
+        direct_call (direct_symbol (target_of g1 symbol)) (list.concat [["%p", below, self], regs, pad]) g1
+    }
+};
+
+/// At a direct function's entry: the guard against the machine's stack pointer, which is how
+/// both a stack run too deep and a collection or a switch asked for are seen (`entry_d!`). It
+/// comes after the arguments past the third are read: below `sp` they are words, not a frame,
+/// and the collector reads the stack from `sp` as frames, while what is in hand is where it
+/// reads conservatively.
+let dsafepoint : :string -> :string -> Gen -> Gen;
+let dsafepoint self sp g = {
+    let asm_ = if Gen.arch g == 1 { "call i64 asm \"mov $0, sp\", \"=r\"()" } else { "call i64 asm \"movq %rsp, $0\", \"=r\"()" };
+    let [here, g0] = instr asm_ g;
+    let [guard_ptr, g0b] = pointer_at "%p" 16 g0;
+    let [guard, g1] = instr ("load volatile i64, ptr " + guard_ptr) g0b;
+    let [asked, g2] = instr (str.concat_all ["icmp ult i64 ", here, ", ", guard]) g1;
+    let [stop, g3] = label_of "stop" g2;
+    let [go_on, g4] = label_of "go" g3;
+    let g5 = start stop (emit (str.concat_all ["  br i1 ", asked, ", label %", stop, ", label %", go_on]) g4);
+    // What a call again on another segment needs that the registers do not say: which function,
+    // and where its stack stood (`segment_call!`).
+    let g5a = store_at "%p" 24 (str.concat_all ["ptrtoint (ptr ", self, " to i64)"]) g5;
+    let g5b = store_at "%p" 32 "%sp0" g5a;
+    let [r, g6] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g5b "entry_d!", "(", args_text ["%p", sp, "%a", "%b", "%c", "%d"], ")"]) g5b;
+    let g7 = or_failing r (may_have_moved g6);
+    // Run to its end on a segment of its own: that is the answer.
+    let [ctx, g8] = ctx_of g7;
+    let [ran, g9] = load_at ctx 808 g8;
+    let [elsewhere, g10] = instr (str.concat_all ["icmp ne i64 ", ran, ", 0"]) g9;
+    let [answer, g11] = label_of "ran" g10;
+    let g12 = start answer (emit (str.concat_all ["  br i1 ", elsewhere, ", label %", answer, ", label %", go_on]) g11);
+    let g13 = store_at ctx 808 "0" g12;
+    start go_on (emit ("  ret i64 " + r) g13)
+};
+
+/// The shim under a function's own symbol: the direct body called, and its answer given to the
+/// frame on top past `extra` words of arguments, or an unwinding from there.
+let shim : :string -> :integer -> Gen -> Gen;
+let shim symbol extra g0 = {
+    let g = g0 |> Gen.set_moved false |> Gen.set_pcur "";
+    let [v, g1a] = instr (str.concat_all ["call tailcc i64 ", direct_symbol symbol, "(i64 %p, i64 %sp0, i64 %a, i64 %b, i64 %c, i64 %d)"]) g;
+    let [ctx, g1] = ctx_of (may_have_moved g1a);
+    let [sp, g2] = sp_past (8 * extra) g1;
+    let [bad, g3] = instr (str.concat_all ["icmp eq i64 ", v, ", 0"]) g2;
+    let [fails, g4] = label_of "fails" g3;
+    let [fine, g5] = label_of "fine" g4;
+    let g6 = start fine (emit (str.concat_all ["  br i1 ", bad, ", label %", fails, ", label %", fine]) g5);
+    let g7 = start fails (jump (rt_symbol g6 "return!") [ctx, sp, v, "0", "0", "0"] g6);
+    finish symbol (jump (rt_symbol g7 "native_failed!") [ctx, sp, "0", "0", "0", "0"] g7)
+};
+
+/// One core function in direct style, its shim and its infos.
+let function_d : core.Function -> Gen -> Gen;
+let function_d f g = {
+    let symbol = core.Function.symbol f;
+    let params = core.Function.params f;
+    let captures = core.Function.captures f;
+    let how = core.Function.how f;
+    let plain = str.slice 1 (len symbol - 1) symbol;
+    let arity = list.length params;
+    let extra = if arity > 3 { arity - 3 } else { 0 };
+    let [place_text, place_sym] = place_of f plain;
+    let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_place place_sym |> Gen.set_join "" |> Gen.set_err ""
+              |> Gen.set_leaves [] |> Gen.set_moved false |> Gen.set_pcur "" |> (fn x -> data_onto (list.append place_text (Gen.data x)) x);
+    let g1 = Gen.set_dups (dups_of (core.Function.body f)) g0;
+    let registers = ["%b", "%c", "%d"];
+    let env0 = list.fold (fn m [i, v] -> if i < 3 { m.[v => registers.[i]] } else { m }) %{} (list.enumerate params);
+    let [env1, g2] = list.fold (fn [m, st] [i, v] ->
+        if i < 3 { [m, st] } else {
+            let [loaded, st1] = load_at "%sp0" (8 * (i - 3)) st;
+            [m.[v => loaded], st1]
+        }) [env0, g1] (list.enumerate params);
+    let [env2, g3] = list.fold (fn [m, st] [i, v] -> {
+        let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
+        [m.[v => loaded], st1]
+    }) [env1, g2] (list.enumerate captures);
+    let [sp, g4a] = sp_past (8 * extra) g3;
+    let g4 = dsafepoint (direct_symbol symbol) sp g4a;
+    let g6 = if how == :function { dexpr (core.Function.body f) env2 sp g4 } else { updating (core.Function.body f) captures env2 sp g4 };
+    let g7 = drain_d (finish (direct_symbol symbol) (emit (str.concat_all ["; ", core.Function.name f]) g6));
+    let g8 = shim symbol extra (g7 |> Gen.set_lines [] |> Gen.set_label "entry");
+    let g9 = if how == :thunk && map.has symbol (Gen.once_syms g) { thunk_once_d f g8 } else { g8 };
+    let size = if list.is_empty captures { 1 } else { list.length captures };
+    let infos = match how {
+        :thunk => [info_direct (info_symbol symbol) symbol 0 size 0 "null" "null" 0 "null" (direct_symbol symbol)],
+        :caf => [info_direct (info_symbol symbol) symbol 0 1 0 "null" "null" 0 "null" (direct_symbol symbol)],
+        _ => [
+            string_object ("@fn_" + plain) (core.Function.name f),
+            info_direct ("@i_c" + plain) (rt_symbol g9 "code_value!") 3 (list.length captures) arity symbol ("@fn_" + plain)
+                (if core.Function.impure f { 1 } else { 0 }) "null" (direct_symbol symbol),
+            str.concat_all ["@c_", plain, " = internal constant <{ ptr }> <{ ptr @i_c", plain, " }>, align 8\n"],
+        ],
+    };
+    let cafs = if how == :caf {
+        [str.concat_all ["@caf_", plain, " = internal global <{ ptr, ptr, i64, i64 }> <{ ptr @i_shared, ptr @caft_", plain, ", i64 0, i64 0 }>, align 8\n"],
+         str.concat_all ["@caft_", plain, " = internal constant <{ ptr, i64 }> <{ ptr ", info_symbol symbol, ", i64 1 }>, align 8\n"]]
+    } else { [] };
+    data_onto (list.concat [cafs, infos, Gen.data g9]) g9
+};
+
+/// A thunk's body, which marks it a hole, evaluates, and writes the answer over it -- or, if
+/// that fails, an indirection to the raise, which is what reaching it again does
+/// (`thunk_raised_d!`).
+let updating : core.Expr -> [:integer] -> :map -> :string -> Gen -> Gen;
+let updating body captures env sp g = {
+    let h1 = store_at "%a" 0 "ptrtoint (ptr @i_hole to i64)" g;
+    let [owner, h2] = load_at "%p" 120 h1;
+    let h3 = filled "%a" (list.length captures - 1) (store_at "%a" 8 owner h2);
+    let [j, h4] = label_of "answer" h3;
+    let [r, h5] = label_of "raised" h4;
+    let h6 = dexpr body env sp (h5 |> Gen.set_join j |> Gen.set_leaves [] |> Gen.set_err r);
+    let leaves = list.reverse (Gen.leaves h6);
+    let h7 = start r (h6 |> Gen.set_join "" |> Gen.set_leaves [] |> Gen.set_err "");
+    let [ctx, h7a] = ctx_of h7;
+    let [_, h8] = instr (str.concat_all ["call tailcc i64 ", rt_symbol h7a "thunk_raised_d!", "(", args_text [ctx, sp, "%a", "0", "0", "0"], ")"]) h7a;
+    let h9 = emit "  ret i64 0" h8;
+    if list.is_empty leaves { h9 } else {
+        let [v, h10] = instr ("phi i64 " + phi_args (list.map (fn l -> [l.[1], l.[0]]) leaves)) (start j h9);
+        let h11 = store_at "%a" 8 v h10;
+        emit ("  ret i64 " + v) (store_at "%a" 0 "ptrtoint (ptr @i_ind to i64)" h11)
+    }
+};
+
+/// The entry of a thunk entered at most once: no hole, no update.
+let thunk_once_d : core.Function -> Gen -> Gen;
+let thunk_once_d f g = {
+    let symbol = core.Function.symbol f;
+    let osym = symbol + "o";
+    let captures = core.Function.captures f;
+    let g0 = g |> Gen.set_lines [] |> Gen.set_label "entry" |> Gen.set_join "" |> Gen.set_err "" |> Gen.set_leaves []
+              |> Gen.set_moved false |> Gen.set_pcur "" |> Gen.set_dups (dups_of (core.Function.body f));
+    let [env, g2a] = list.fold (fn [m, st] [i, v] -> {
+        let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
+        [m.[v => loaded], st1]
+    }) [%{}, g0] (list.enumerate captures);
+    let g2 = dsafepoint (direct_symbol osym) "%sp0" g2a;
+    let g3 = dexpr (core.Function.body f) env "%sp0" g2;
+    let g4 = drain_d (finish (direct_symbol osym) (emit (str.concat_all ["; ", core.Function.name f, " (entered once)"]) g3));
+    let g5 = shim osym 0 (g4 |> Gen.set_lines [] |> Gen.set_label "entry");
+    let size = if list.is_empty captures { 1 } else { list.length captures };
+    datum_onto (info_direct (info_symbol osym) osym 0 size 0 "null" "null" 0 "null" (direct_symbol osym)) g5
+};
+
 /// `g` with its data, made now: left to be made, the data of each function held the
 /// generator it was made from, and through it every one before.
 let data_onto : [:string] -> Gen -> Gen;
@@ -1463,7 +1963,9 @@ let fixed_infos g = {
      info_text "@i_m_connect" (rt "net_connect_m!") 0 0 0,
      info_text "@i_m_tls_handshake" (rt "tls_handshake_m!") 0 0 0,
      info_with "@i_cb_return" (rt "frame_cb_return!") 20 2 0 (rt "cb_raised!") "null" 0 "null",
-     info_text "@i_apply_rest" (rt "frame_apply_rest!") 0 0 0]
+     info_text "@i_apply_rest" (rt "frame_apply_rest!") 0 0 0,
+     // Where a bridge from direct code comes back: a frame of one word whose code returns.
+     info_text "@i_bridge" (rt "frame_bridge!") 25 1 0]
 };
 
 /// The functions the machine itself calls or lays out.
@@ -1474,7 +1976,9 @@ let runtime_roots = ["init!", "run_process!", "alloc!", "enter!", "apply!", "rai
                      "frame_retry_call!", "frame_enter_again!", "frame_start!", "join_m!", "recv_m!",
                      "await_message_m!", "sleep_until_m!", "child_wait_m!", "io_read_m!", "io_write_m!", "net_accept_m!", "net_connect_m!", "net_connected_m!", "set_args!", "tls_handshake_m!", "ffi_call_m!", "cb_enter!", "frame_cb_return!", "cb_raised!",
                      "to_float!", "add_slow!", "sub_slow!", "mul_slow!", "div_slow!", "mod_slow!",
-                     "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!"];
+                     "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!",
+                     // What direct-style code calls (`dexpr`).
+                     "return!", "force_d!", "entry_d!", "caught_d!", "thunk_raised_d!", "frame_bridge!", "run_root!", "frames_full!"];
 
 /// What the runtime reaches in the library by name, as function values.
 let library_roots : %{:string => :string};
@@ -1490,8 +1994,8 @@ let first_atoms = ["integer", "float", "char", "bool", "unit", "string", "atom",
 
 /// A whole program as IR: `user`'s entry, with what it reaches of the library and the
 /// runtime, or everything that stopped it.
-let to_ir : image.Image -> image.Image -> image.Image -> :integer -> Result :string [:string];
-let to_ir user lib rt arch = {
+let to_ir : image.Image -> image.Image -> image.Image -> :integer -> :bool -> Result :string [:string];
+let to_ir user lib rt arch direct = {
     let entry = image.Image.entry user;
     let atoms = list.fold (fn m [i, name] -> m.[name => i]) %{} (list.enumerate first_atoms);
     let lib_names = dialect.by_name lib;
@@ -1512,7 +2016,7 @@ let to_ir user lib rt arch = {
     let natives = map.keys (core.St.natives st);
     let unit_ = dialect.unit_of rt (list.append runtime_roots natives) arch;
     match list.append (list.reverse (core.St.refused st)) (dialect.Unit.refused unit_) {
-        [] => Result.ok (assemble user st unit_ lib_names entry arch),
+        [] => Result.ok (assemble user st unit_ lib_names entry arch direct),
         why => Result.error (list.unique why),
     }
 };
@@ -1566,14 +2070,44 @@ let stacks_text run arch = str.concat_all [
         "  ldp d14, d15, [sp], #16", "  ldp d12, d13, [sp], #16", "  ldp d10, d11, [sp], #16",
         "  ldp d8, d9, [sp], #16", "  ldp x27, x28, [sp], #16", "  ldp x25, x26, [sp], #16",
         "  ldp x23, x24, [sp], #16", "  ldp x21, x22, [sp], #16", "  ldp x19, x20, [sp], #16",
+        "  ldp x29, x30, [sp], #16", "  ret",
+        ".globl dream_call_on", "dream_call_on:",
+        "  stp x29, x30, [sp, #-16]!", "  mov x29, sp", "  mov sp, x0", "  sub sp, sp, #16", "  str x29, [sp]",
+        "  mov x0, x1", "  bl dream_segment_entry", "  ldr x29, [sp]", "  mov sp, x29", "  ldp x29, x30, [sp], #16", "  ret",
+        ".globl dream_switch", "dream_switch:",
+        "  stp x29, x30, [sp, #-16]!", "  stp x19, x20, [sp, #-16]!", "  stp x21, x22, [sp, #-16]!",
+        "  stp x23, x24, [sp, #-16]!", "  stp x25, x26, [sp, #-16]!", "  stp x27, x28, [sp, #-16]!",
+        "  stp d8, d9, [sp, #-16]!", "  stp d10, d11, [sp, #-16]!", "  stp d12, d13, [sp, #-16]!",
+        "  stp d14, d15, [sp, #-16]!", "  mov x9, sp", "  str x9, [x0]", "  mov sp, x1",
+        "  ldp d14, d15, [sp], #16", "  ldp d12, d13, [sp], #16", "  ldp d10, d11, [sp], #16",
+        "  ldp d8, d9, [sp], #16", "  ldp x27, x28, [sp], #16", "  ldp x25, x26, [sp], #16",
+        "  ldp x23, x24, [sp], #16", "  ldp x21, x22, [sp], #16", "  ldp x19, x20, [sp], #16",
         "  ldp x29, x30, [sp], #16", "  ret"] } else { [
         ".text", ".globl dream_run_on", "dream_run_on:",
         "  pushq %rbp", "  pushq %rbx", "  pushq %r12", "  pushq %r13", "  pushq %r14", "  pushq %r15",
         "  movq %rsp, (%rcx)", "  movq %rdi, %rsp", "  movq %rsi, %rdi", "  movq %rdx, %rsi",
         "  call dream_process_entry", "  ud2",
         ".globl dream_return_to", "dream_return_to:", "  movq %rdi, %rsp",
+        "  popq %r15", "  popq %r14", "  popq %r13", "  popq %r12", "  popq %rbx", "  popq %rbp", "  ret",
+        // A call on another stack: the old stack pointer kept on the new one, the call made from
+        // there, and the old one back before returning its answer (`segment_call!`).
+        ".globl dream_call_on", "dream_call_on:",
+        "  pushq %rbp", "  movq %rsp, %rbp", "  movq %rdi, %rsp", "  pushq %rbp", "  subq $8, %rsp",
+        "  movq %rsi, %rdi", "  call dream_segment_entry", "  addq $8, %rsp", "  popq %rsp", "  popq %rbp", "  ret",
+        // Saved as `dream_run_on` saves, so that either side may be the one switched back to.
+        ".globl dream_switch", "dream_switch:",
+        "  pushq %rbp", "  pushq %rbx", "  pushq %r12", "  pushq %r13", "  pushq %r14", "  pushq %r15",
+        "  movq %rsp, (%rdi)", "  movq %rsi, %rsp",
         "  popq %r15", "  popq %r14", "  popq %r13", "  popq %r12", "  popq %rbx", "  popq %rbp", "  ret"] })),
     "declare void @dream_run_on(i64, i64, i64, i64)\n",
+    "declare void @dream_switch(i64, i64)\n",
+    "declare i64 @dream_call_on(i64, i64)\n",
+    // The call `dream_call_on` makes, from a record of the function and its six words.
+    "define dso_local i64 @dream_segment_entry(i64 %r) {\n  %rp = inttoptr i64 %r to ptr\n",
+    "  %f = load i64, ptr %rp\n  %fp = inttoptr i64 %f to ptr\n",
+    str.concat_all (list.map (fn i -> str.concat_all ["  %q", to_string i, " = getelementptr i64, ptr %rp, i64 ", to_string (i + 1),
+        "\n  %w", to_string i, " = load i64, ptr %q", to_string i, "\n"]) (list.range 0 6)),
+    "  %v = call tailcc i64 %fp(i64 %w0, i64 %w1, i64 %w2, i64 %w3, i64 %w4, i64 %w5)\n  ret i64 %v\n}\n",
     "declare void @dream_return_to(i64)\n",
     "define dso_local void @dream_process_entry(i64 %p, i64 %pcb) {\n  %r = call tailcc i64 ", run,
     "(i64 %p, i64 %pcb, i64 0, i64 0, i64 0, i64 0)\n  unreachable\n}\n"];
@@ -1635,12 +2169,19 @@ let callback_text enter arch = str.concat_all [
 let native_stack_of : [:string] -> :integer;
 let native_stack_of natives = if list.any deep_c natives { 8388608 } else { 65536 };
 
+/// A segment of a process's machine stack in direct style, where its recursion is: a process
+/// starts on one, a quarter of it the stack of frames the runtime's code uses (`carved!` in
+/// rt/main.dr), and goes on in another when it runs low (`segment_call!`). A program that can
+/// reach C that goes deeper has segments of a thread's size, as C cannot be moved off one.
+let direct_stack_of : [:string] -> :integer;
+let direct_stack_of natives = if list.any deep_c natives { 8388608 } else { 262144 };
+
 /// Whether a native of the runtime calls C that may use a thread's stack.
 let deep_c : :string -> :bool;
 let deep_c name = list.any (fn prefix -> str.starts_with prefix name) ["ffi_", "tls_", "t_gpu", "net_connect"];
 
-let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :string;
-let assemble user st unit_ lib_names entry arch = {
+let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :bool -> :string;
+let assemble user st unit_ lib_names entry arch direct = {
     // The atoms the dialect asked for by name are numbered with the rest.
     let st_with = list.fold (fn s1 name -> list.nth 1 (core.intern_atom name s1)) st (dialect.Unit.atoms unit_);
     let atom_words = list.map (fn name ->
@@ -1653,8 +2194,9 @@ let assemble user st unit_ lib_names entry arch = {
     let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
         %{} (core.St.functions st);
     let [once_vars, once_syms] = once_thunks (core.St.functions st);
-    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] workers once_vars once_syms 0 %{} %{};
-    let g = list.fold (fn g1 f -> function f g1) g0 (core.St.functions st);
+    let g0 = Gen.make 0 [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] (if direct { %{} } else { workers })
+        once_vars once_syms 0 %{} %{} direct "" arch false "" %{} %{} [];
+    let g = list.fold (fn g1 f -> if direct { function_d f g1 } else { function f g1 }) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
     let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));
     let atom_objects = list.map (fn [name, i] -> string_object ("@atom" + to_string i) name) atom_list;
@@ -1686,12 +2228,12 @@ let assemble user st unit_ lib_names entry arch = {
         str.join_str ", " (list.map (fn [_, i] -> if map.has i records { "ptr @shown" + to_string i } else { "ptr @atom" + to_string i }) atom_list), "]\n"];
     // What no one process owns (the shared region's ends, in rt/main.dr).
     let world = str.concat_all ["@i_world = internal global [80 x i64] zeroinitializer, align 8\n",
-        "@i_native_stack = internal constant i64 ", to_string (native_stack_of (map.keys (core.St.natives st))), "\n",
+        "@i_native_stack = internal constant i64 ", to_string (if direct { direct_stack_of (map.keys (core.St.natives st)) } else { native_stack_of (map.keys (core.St.natives st)) }), "\n",
         // 1 when the code keeps values of its own on the native stack, which the collector then
         // reads for pins (`pin_native!`). Code that jumps keeps none there: reading the stack
         // anyway found the runtime's own stale words, which pinned whole allocation chunks and
         // cost a native compile 8%.
-        "@i_native_frames = internal constant i64 0\n"];
+        "@i_native_frames = internal constant i64 ", if direct { "1" } else { "0" }, "\n"];
     // Every CAF, for the census of the shared region to start from.
     let cafs = list.map (fn f -> "ptr @caf_" + str.slice 1 (len (core.Function.symbol f) - 1) (core.Function.symbol f))
         (list.filter (fn f -> core.Function.how f == :caf) (core.St.functions st));
@@ -1704,8 +2246,17 @@ let assemble user st unit_ lib_names entry arch = {
         "define dso_local i32 @main(i32 %argc, ptr %argv) {\n  %p = call tailcc i64 ", (dialect.Unit.symbols unit_).["init!"],
         "()\n  %ac = sext i32 %argc to i64\n  %av = ptrtoint ptr %argv to i64\n  %au = call tailcc i64 ", (dialect.Unit.symbols unit_).["set_args!"],
         "(i64 %p, i64 %ac, i64 %av)\n  %tp = add i64 %p, 40\n  %tq = inttoptr i64 %tp to ptr\n  %top = load i64, ptr %tq\n",
-        "  %sp = sub i64 %top, 8\n  %r = call tailcc i64 @u", to_string entry, "(",
-        args_text (list.concat [["%p", "%sp", "0"], args, pad]), ")\n  ret i32 0\n}\n"];
+        "  %sp = sub i64 %top, 8\n",
+        // In direct style the first process runs on a stack of its own, as every process does,
+        // from the scheduler (`run_root!`): run here, on the thread's, what it left on the stack
+        // was lost the first time it parked.
+        if direct {
+            str.concat_all ["  %r = call tailcc i64 ", (dialect.Unit.symbols unit_).["run_root!"], "(",
+                args_text (list.concat [["%p", "%sp", str.concat_all ["ptrtoint (ptr @u", to_string entry, " to i64)"]], args, pad]), ")\n"]
+        } else {
+            str.concat_all ["  %r = call tailcc i64 @u", to_string entry, "(", args_text (list.concat [["%p", "%sp", "0"], args, pad]), ")\n"]
+        },
+        "  ret i32 0\n}\n"];
     str.concat_all (list.concat [
         [str.concat_all ["target triple = \"", dialect.triple_of arch, "\"\n"], dialect.start_text arch, "declare void @__libc_start_main()\n",
          "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n",
