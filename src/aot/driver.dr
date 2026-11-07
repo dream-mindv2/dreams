@@ -63,10 +63,12 @@ let written! ir out payload interp = {
     object_and_link! ir out payload interp
 };
 
-/// How many parts LLVM is to compile `ir` in, at once: one for each 16 MB, up to 32. A small
-/// program is one, as it always was; a compiler's 700 MB was one, on one core, for twenty minutes.
+/// How many parts LLVM is to compile `ir` in, at once: one for each half megabyte, up to 32. A
+/// compiler's 700 MB was one part, on one core, for twenty minutes; and at one for each 16 MB,
+/// every program the suites build -- four megabytes, most of it the runtime and the library --
+/// was still one, nine seconds of LLVM on one core where eight parts take two.
 let parts_for : :string -> :integer;
-let parts_for ir = num.min 32 (1 + len ir / 16777216);
+let parts_for ir = num.min 32 (1 + len ir / 524288);
 
 /// `objects`, each written to `DREAMS_AOT_KEEP_OBJECTS/part-N.o` first when that is set, for the
 /// linker to be timed by itself.

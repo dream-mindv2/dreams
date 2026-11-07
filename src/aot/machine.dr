@@ -316,6 +316,173 @@ let speculated op a b symbol payload g = {
     instr (str.concat_all ["phi i64 [ ", v, ", %", from_fast, " ], [ ", o, ", %", from_slow, " ]"]) g14
 };
 
+// --- cheap trees, done now -------------------------------------------------------------------
+//
+// `Rhs.eager` (core.dr): arithmetic on words that may not be numbers yet, done now when they are.
+// Each node is a pair, whether it is a double and its 64 bits -- an integer untagged, or the
+// double's bits -- so that integers stay exact and a float anywhere below an operation makes it
+// one in doubles, as `+` on the two does. Anything that is not a number where one is read, a
+// field read off what is not a record, an integer that leaves the fixnums: the suspension is made
+// instead, as it would have been.
+
+/// `tree` now, or its suspension `symbol` holding `payload`.
+let eagerly : core.Cheap -> :map -> :string -> [:string] -> Gen -> [:string, Gen];
+let eagerly tree env symbol payload g = {
+    let [later, g1] = label_of "later" g;
+    let [done, g2] = label_of "eager" g1;
+    let [root, g3] = match tree {
+        core.Cheap.op(name, l, r) if cheap_comparison name => {
+            let [dl, bl, h1] = cheap_pair l env later g2;
+            let [dr, br, h2] = cheap_pair r env later h1;
+            let [any, h3] = instr (str.concat_all ["or i1 ", dl, ", ", dr]) h2;
+            let [fl, h4] = as_double dl bl h3;
+            let [fr, h5] = as_double dr br h4;
+            let fcond = %{"eq" => "oeq", "ne" => "une", "lt" => "olt", "le" => "ole", "gt" => "ogt", "ge" => "oge"}.[name];
+            let icond = %{"eq" => "eq", "ne" => "ne", "lt" => "slt", "le" => "sle", "gt" => "sgt", "ge" => "sge"}.[name];
+            let [fbit, h6] = instr (str.concat_all ["fcmp ", fcond, " double ", fl, ", ", fr]) h5;
+            let [ibit, h7] = instr (str.concat_all ["icmp ", icond, " i64 ", bl, ", ", br]) h6;
+            let [bit, h8] = instr (str.concat_all ["select i1 ", any, ", i1 ", fbit, ", i1 ", ibit]) h7;
+            as_bool bit h8
+        },
+        _ => {
+            let [d, bits, h1] = cheap_pair tree env later g2;
+            let [boxed, h2] = label_of "boxed" h1;
+            let [tagged, h3] = label_of "tagged" h2;
+            let [joined, h4] = label_of "number" h3;
+            let h5 = start boxed (emit (str.concat_all ["  br i1 ", d, ", label %", boxed, ", label %", tagged]) h4);
+            let [o, h6] = bump_alloc 16 h5;
+            let h7 = store_at o 8 bits (store_at o 0 "ptrtoint (ptr @i_float to i64)" h6);
+            let from_box = Gen.label h7;
+            let h8 = start tagged (emit ("  br label %" + joined) h7);
+            let [twice, h9] = instr (str.concat_all ["shl i64 ", bits, ", 1"]) h8;
+            let [word, h10] = instr (str.concat_all ["or i64 ", twice, ", 1"]) h9;
+            let from_tag = Gen.label h10;
+            let h11 = start joined (emit ("  br label %" + joined) h10);
+            instr (str.concat_all ["phi i64 [ ", o, ", %", from_box, " ], [ ", word, ", %", from_tag, " ]"]) h11
+        },
+    };
+    let from_now = Gen.label g3;
+    let g4 = start later (emit ("  br label %" + done) g3);
+    let [t, g5] = bump_alloc (8 * (1 + list.length payload)) g4;
+    let g6 = store_at t 0 (str.concat_all ["ptrtoint (ptr ", info_symbol symbol, " to i64)"]) g5;
+    let g7 = list.fold (fn st [i, x] -> store_at t (8 * (i + 1)) x st) g6 (list.enumerate payload);
+    let from_later = Gen.label g7;
+    let g8 = start done (emit ("  br label %" + done) g7);
+    instr (str.concat_all ["phi i64 [ ", root, ", %", from_now, " ], [ ", t, ", %", from_later, " ]"]) g8
+};
+
+let cheap_comparison : :string -> :bool;
+let cheap_comparison name = name == "eq" || name == "ne" || name == "lt" || name == "le" || name == "gt" || name == "ge";
+
+/// A node as `[is a double, bits]`, going to `later` where it cannot be had now.
+let cheap_pair : core.Cheap -> :map -> :string -> Gen -> [:string, :string, Gen];
+let cheap_pair t env later g = match t {
+    core.Cheap.leaf(a) => number_pair (atom_text env a) later g,
+    core.Cheap.field(a, index) => {
+        let v = atom_text env a;
+        let [low, g1] = instr (str.concat_all ["and i64 ", v, ", 7"]) g;
+        let [object, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g1;
+        let [some, g3] = instr (str.concat_all ["icmp ne i64 ", v, ", 0"]) g2;
+        let [both, g4] = instr (str.concat_all ["and i1 ", object, ", ", some]) g3;
+        let [is_obj, g5] = label_of "obj" g4;
+        let g6 = start is_obj (emit (str.concat_all ["  br i1 ", both, ", label %", is_obj, ", label %", later]) g5);
+        let [info, g7] = load_at v 0 g6;
+        let [kind, g8] = load_at info 8 g7;
+        let [record, g9] = instr (str.concat_all ["icmp eq i64 ", kind, ", 9"]) g8;
+        let [count, g10] = load_at v 8 g9;
+        // The count is a fixnum: `index` is inside when it is below the count's word.
+        let [inside, g11] = instr (str.concat_all ["icmp sgt i64 ", count, ", ", to_string (2 * index + 1)]) g10;
+        let [fits, g12] = instr (str.concat_all ["and i1 ", record, ", ", inside]) g11;
+        let [read, g13] = label_of "field" g12;
+        let g14 = start read (emit (str.concat_all ["  br i1 ", fits, ", label %", read, ", label %", later]) g13);
+        let [field, g15] = load_at v (8 * (3 + index)) g14;
+        number_pair field later g15
+    },
+    core.Cheap.op(name, l, r) => {
+        let [dl, bl, g1] = cheap_pair l env later g;
+        let [dr, br, g2] = cheap_pair r env later g1;
+        let [any, g3] = instr (str.concat_all ["or i1 ", dl, ", ", dr]) g2;
+        // In doubles, as the operation on a float does.
+        let [fl, g4] = as_double dl bl g3;
+        let [fr, g5] = as_double dr br g4;
+        let [fv, g6] = instr (str.concat_all [%{"add" => "fadd", "sub" => "fsub", "mul" => "fmul"}.[name], " double ", fl, ", ", fr]) g5;
+        let [fbits, g7] = instr (str.concat_all ["bitcast double ", fv, " to i64"]) g6;
+        // In integers, exactly, and only while they stay fixnums.
+        let [iv, over, g8] = checked (%{"add" => "sadd", "sub" => "ssub", "mul" => "smul"}.[name]) bl br g7;
+        let [twice, g9] = instr (str.concat_all ["shl i64 ", iv, ", 1"]) g8;
+        let [back, g10] = instr (str.concat_all ["ashr i64 ", twice, ", 1"]) g9;
+        let [lost, g11] = instr (str.concat_all ["icmp ne i64 ", back, ", ", iv]) g10;
+        let [bad_int, g12] = instr (str.concat_all ["or i1 ", over, ", ", lost]) g11;
+        let [not_any, g13] = instr (str.concat_all ["xor i1 ", any, ", true"]) g12;
+        let [fails, g14] = instr (str.concat_all ["and i1 ", not_any, ", ", bad_int]) g13;
+        let [ok, g15] = label_of "fit" g14;
+        let g16 = start ok (emit (str.concat_all ["  br i1 ", fails, ", label %", later, ", label %", ok]) g15);
+        let [bits, g17] = instr (str.concat_all ["select i1 ", any, ", i64 ", fbits, ", i64 ", iv]) g16;
+        [any, bits, g17]
+    },
+};
+
+/// A word as `[is a double, bits]`: a fixnum untagged, a float's bits, and anything else -- a
+/// suspension, a big integer, not a number -- to `later`.
+let number_pair : :string -> :string -> Gen -> [:string, :string, Gen];
+let number_pair v0 later g0 = {
+    let [v, g] = past_indirection v0 g0;
+    let [low, g1] = instr (str.concat_all ["and i64 ", v, ", 1"]) g;
+    let [fix, g2] = instr (str.concat_all ["icmp eq i64 ", low, ", 1"]) g1;
+    let [untagged, g3] = instr (str.concat_all ["ashr i64 ", v, ", 1"]) g2;
+    let [obj, g4] = label_of "boxed" g3;
+    let [done, g5] = label_of "num" g4;
+    let from_fix = Gen.label g5;
+    let g6 = start obj (emit (str.concat_all ["  br i1 ", fix, ", label %", done, ", label %", obj]) g5);
+    let [low3, g7] = instr (str.concat_all ["and i64 ", v, ", 7"]) g6;
+    let [aligned, g8] = instr (str.concat_all ["icmp eq i64 ", low3, ", 0"]) g7;
+    let [some, g9] = instr (str.concat_all ["icmp ne i64 ", v, ", 0"]) g8;
+    let [object, g10] = instr (str.concat_all ["and i1 ", aligned, ", ", some]) g9;
+    let [look, g11] = label_of "look" g10;
+    let g12 = start look (emit (str.concat_all ["  br i1 ", object, ", label %", look, ", label %", later]) g11);
+    let [info, g13] = load_at v 0 g12;
+    let [kind, g14] = load_at info 8 g13;
+    let [float, g15] = instr (str.concat_all ["icmp eq i64 ", kind, ", 6"]) g14;
+    let [read, g16] = label_of "dbl" g15;
+    let g17 = start read (emit (str.concat_all ["  br i1 ", float, ", label %", read, ", label %", later]) g16);
+    let [bits, g18] = load_at v 8 g17;
+    let from_float = Gen.label g18;
+    let g19 = start done (emit ("  br label %" + done) g18);
+    let [d, g20] = instr (str.concat_all ["phi i1 [ false, %", from_fix, " ], [ true, %", from_float, " ]"]) g19;
+    let [b, g21] = instr (str.concat_all ["phi i64 [ ", untagged, ", %", from_fix, " ], [ ", bits, ", %", from_float, " ]"]) g20;
+    [d, b, g21]
+};
+
+/// `v`, or what it points to if it is an indirection: a suspension evaluated where it was is one,
+/// and a field of a record made lazily is one after its first reading.
+let past_indirection : :string -> Gen -> [:string, Gen];
+let past_indirection v g = {
+    let [low3, g1] = instr (str.concat_all ["and i64 ", v, ", 7"]) g;
+    let [aligned, g2] = instr (str.concat_all ["icmp eq i64 ", low3, ", 0"]) g1;
+    let [some, g3] = instr (str.concat_all ["icmp ne i64 ", v, ", 0"]) g2;
+    let [object, g4] = instr (str.concat_all ["and i1 ", aligned, ", ", some]) g3;
+    let [look, g5] = label_of "ind" g4;
+    let [done, g6] = label_of "past" g5;
+    let from_start = Gen.label g6;
+    let g7 = start look (emit (str.concat_all ["  br i1 ", object, ", label %", look, ", label %", done]) g6);
+    let [info, g8] = load_at v 0 g7;
+    let [kind, g9] = load_at info 8 g8;
+    let [is_ind, g10] = instr (str.concat_all ["icmp eq i64 ", kind, ", 1"]) g9;
+    let [target, g11] = load_at v 8 g10;
+    let [w, g12] = instr (str.concat_all ["select i1 ", is_ind, ", i64 ", target, ", i64 ", v]) g11;
+    let from_look = Gen.label g12;
+    let g13 = start done (emit ("  br label %" + done) g12);
+    instr (str.concat_all ["phi i64 [ ", v, ", %", from_start, " ], [ ", w, ", %", from_look, " ]"]) g13
+};
+
+/// Bits as a double: a float's own, or an integer's value.
+let as_double : :string -> :string -> Gen -> [:string, Gen];
+let as_double is_double bits g = {
+    let [f, g1] = instr (str.concat_all ["bitcast i64 ", bits, " to double"]) g;
+    let [i, g2] = instr (str.concat_all ["sitofp i64 ", bits, " to double"]) g1;
+    instr (str.concat_all ["select i1 ", is_double, ", double ", f, ", double ", i]) g2
+};
+
 let spec_checked : :string -> :string -> :string -> :string -> :string -> Gen -> [:string, Gen, :string];
 let spec_checked name a b done slow g = {
     let [v, bit, g1] = checked name a b g;
@@ -479,6 +646,7 @@ let rhs r env sp g = {
     match r {
         core.Rhs.self_closure => ["%a", g],
         core.Rhs.speculate(op, a, b, symbol, payload) => speculated op (text a) (text b) symbol (list.map text payload) g,
+        core.Rhs.eager(tree, symbol, payload) => eagerly tree env symbol (list.map text payload) g,
         core.Rhs.arith(op, a, b) => tagged_arith sp op (text a) (text b) g,
         core.Rhs.compare(op, a, b) => tagged_compare sp op (text a) (text b) g,
         core.Rhs.native(name, args) => {
@@ -1572,9 +1740,13 @@ let dexpr e env sp g = match e {
         let regs = list.take 3 vals;
         let [below, g16] = pushing (list.drop 3 vals) sp g15;
         let pad = list.replicate (3 - list.length regs) "0";
-        let g17 = start general (direct_call target (list.concat [["%p", below, fv], regs, pad]) g16);
-        // Anything else -- a partial application, too few or too many, not a function -- is
-        // `apply!`'s, its arguments on the stack below the bridge.
+        let g16a = direct_call target (list.concat [["%p", below, fv], regs, pad]) g16;
+        // Not an exact closure: a partial application that these fill, its function's arguments
+        // all in registers, is called here too (`pap_calls`).
+        let [slow, g16b] = label_of "slow" g16a;
+        let g17 = start slow (pap_calls fv vals sp slow (start general g16b));
+        // Anything else -- too few or too many, not a function -- is `apply!`'s, its arguments
+        // on the stack below the bridge.
         let [v, g18] = bridged (rt_symbol g17 "apply!") sp [fv, to_string count] vals g17;
         answered v (or_failing v g18)
     },
@@ -1714,6 +1886,59 @@ let seq_dups e !seen = match e {
 /// The `seq`s of `body` that `dexpr` writes out of line.
 let dups_of : core.Expr -> :map;
 let dups_of body = map.filter (fn _ n -> n > 1) (seq_dups body %{});
+
+/// A partial application `f` of `kind` given `vals`, called directly when the closure it holds
+/// takes exactly what it held and these, three at most, so that all of them are registers:
+/// `list.map (step 0.01) ps` went through `apply!` for every element. Else to `slow`.
+let pap_calls : :string -> [:string] -> :string -> :string -> Gen -> Gen;
+let pap_calls f vals sp slow g00 = {
+    let count = list.length vals;
+    if count >= 3 { emit ("  br label %" + slow) g00 } else {
+        // Reached also when `f` is no object at all.
+        let [flow, g0a] = instr (str.concat_all ["and i64 ", f, ", 7"]) g00;
+        let [fobj, g0b] = instr (str.concat_all ["icmp eq i64 ", flow, ", 0"]) g0a;
+        let [look, g0c] = label_of "look" g0b;
+        let g0 = start look (emit (str.concat_all ["  br i1 ", fobj, ", label %", look, ", label %", slow]) g0c);
+        let [finfo, g0d] = load_at f 0 g0;
+        let [kind, g] = load_at finfo 8 g0d;
+        let [is_pap, g1] = instr (str.concat_all ["icmp eq i64 ", kind, ", 4"]) g;
+        let [pap, g2] = label_of "pap" g1;
+        let g3 = start pap (emit (str.concat_all ["  br i1 ", is_pap, ", label %", pap, ", label %", slow]) g2);
+        let [count_word, g4] = load_at f 8 g3;
+        let [inner, g5] = load_at f 16 g4;
+        let [low, g6] = instr (str.concat_all ["and i64 ", inner, ", 7"]) g5;
+        let [is_object, g7] = instr (str.concat_all ["icmp eq i64 ", low, ", 0"]) g6;
+        let [obj, g8] = label_of "inner" g7;
+        let g9 = start obj (emit (str.concat_all ["  br i1 ", is_object, ", label %", obj, ", label %", slow]) g8);
+        let [info, g10] = load_at inner 0 g9;
+        let [ikind, g11] = load_at info 8 g10;
+        let [arity, g12] = load_at info 24 g11;
+        let [is_closure, g13] = instr (str.concat_all ["icmp eq i64 ", ikind, ", 3"]) g12;
+        // Held, as the count word says it: one more than it, tagged.
+        let [held, g14] = instr (str.concat_all ["ashr i64 ", count_word, ", 1"]) g13;
+        let [held1, g15] = instr (str.concat_all ["sub i64 ", held, ", 1"]) g14;
+        let [total, g16] = instr (str.concat_all ["add i64 ", held1, ", ", to_string count]) g15;
+        let [fits, g17] = instr (str.concat_all ["icmp eq i64 ", arity, ", ", total]) g16;
+        let [ok, g18] = instr (str.concat_all ["and i1 ", is_closure, ", ", fits]) g17;
+        let [code, g19] = load_at info 64 g18;
+        let [target, g20] = instr (str.concat_all ["inttoptr i64 ", code, " to ptr"]) g19;
+        // One way for each number held that leaves room: 1 or 2 with one given, 1 with two.
+        list.fold (fn st h -> {
+            let [here, st1] = label_of "held" st;
+            let [next, st2] = label_of "next" st1;
+            let [is_h, st3] = instr (str.concat_all ["icmp eq i64 ", held1, ", ", to_string h]) st2;
+            let [both, st4] = instr (str.concat_all ["and i1 ", ok, ", ", is_h]) st3;
+            let st5 = start here (emit (str.concat_all ["  br i1 ", both, ", label %", here, ", label %", next]) st4);
+            let [kept, st6] = list.fold (fn [acc, gg] i -> {
+                let [w, gg1] = load_at f (24 + 8 * i) gg;
+                [list.append acc [w], gg1]
+            }) [[], st5] (list.range 0 h);
+            let args = list.append kept vals;
+            let pad = list.replicate (3 - list.length args) "0";
+            start next (direct_call target (list.concat [["%p", sp, inner], args, pad]) st6)
+        }) g20 (list.range 1 (4 - count)) |> emit ("  br label %" + slow)
+    }
+};
 
 /// A known function called: its direct body, or runtime code across a bridge.
 let dcall : :string -> :string -> [core.Atom] -> :map -> :string -> Gen -> Gen;
@@ -2014,7 +2239,13 @@ let to_ir user lib rt arch direct = {
     }) start (map.values library_roots);
     let st = core.program %{"u" => user, "l" => lib} [["u", entry, :function]] lib_names native_arity lib_arity wanted;
     let natives = map.keys (core.St.natives st);
-    let unit_ = dialect.unit_of rt (list.append runtime_roots natives) arch;
+    // The whole runtime, in the same order for every program, so that its text is the same and
+    // its compiled parts are had again from the cache (`aot_objects` in dream/src/aot_object.cpp)
+    // rather than compiled for each, a quarter of a small program's LLVM time. An executable is
+    // 170 KB larger for what it does not reach. The library was tried the same way, all of it
+    // first: it is most of a small program's code, but translating all of it for every build cost
+    // more than compiling what was reached, twenty seconds of CPU where it had been nine.
+    let unit_ = dialect.whole_unit rt (list.append runtime_roots natives) arch;
     match list.append (list.reverse (core.St.refused st)) (dialect.Unit.refused unit_) {
         [] => Result.ok (assemble user st unit_ lib_names entry arch direct),
         why => Result.error (list.unique why),
@@ -2274,7 +2505,9 @@ let assemble user st unit_ lib_names entry arch direct = {
         closures,
         [atom_count, atom_table, types_table, display_table, world, cafs_table, tick_text, worker_text (dialect.Unit.symbols unit_).["worker_loop!"] (dialect.Unit.symbols unit_).["pool_loop!"], tls_text, stacks_text (dialect.Unit.symbols unit_).["run_process!"] arch, cold_text (dialect.Unit.symbols unit_), callback_text (dialect.Unit.symbols unit_).["cb_enter!"] arch],
         Gen.data g,
-        [dialect.Unit.text unit_],
+        // Between these, the runtime: the same text for every program, which the splitter puts in
+        // parts of its own and compiles once (`aot_objects`, "Parts kept").
+        ["; dream: cached\n", dialect.Unit.text unit_, "; dream: end cached\n"],
         list.reverse (Gen.code g),
         [main_],
     ])

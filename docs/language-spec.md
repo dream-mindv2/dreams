@@ -1205,6 +1205,12 @@ the atom its values carry (below).
   kept in a table then keeps the table it was computed from; `!` is the fix.
   A default is not forced: it is computed once, when first read.
   Only a field can be strict: `!` before a member is an error.
+  A field typed as a scalar -- `:integer`, `:float`, `:bool`, `:char` or
+  `:atom` -- is strict without the `!`, and so is a union variant's: it holds
+  a value that is nothing but itself, and suspending one was an allocation and
+  a call for nothing but to put it off (a loop making records of four floats
+  ran six times slower for it). A field with any other type, or none, is
+  lazy as before.
 
 **What a record is at run time.** A value of a `group` or a `struct` holds its
 fields, lazily, by position, and an atom naming its declaration, qualified by

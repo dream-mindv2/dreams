@@ -201,8 +201,26 @@ let record_derived owner kind name fields members bases span =
 /// -- `type Ps = [Period]`, a field's `: Period`, `types.check Period v` --
 /// where a name has to be a value and the module is not one. A signature
 /// never reads it: the checker asks for the module first (`typecheck.type_ref`).
+/// Whether a field's type is a scalar -- an integer, a float, a boolean, a character, an atom --
+/// which makes the field strict without a `!` ("A strict field" in docs/language-spec.md). Such
+/// a field holds a number, and a suspension of one was an allocation and a call for nothing but
+/// to put it off: four of them made a loop of records of floats six times slower, and a chain
+/// of suspensions as long as the loop.
+let scalar_type : :any -> :bool;
+let scalar_type t = match t {
+    [:atom, n, _] => n == "integer" || n == "float" || n == "bool" || n == "char" || n == "atom",
+    _ => false,
+};
+
+/// `f`, strict if its type is a scalar.
+let strict_by_type : [:any] -> [:any];
+let strict_by_type f = if not (ast.param_strict (ast.field_param f)) && scalar_type (ast.field_type f) {
+    list.cons (ast.strict_param (ast.field_name f) (ast.field_span f)) (list.drop 1 f)
+} else { f };
+
 let record_parts : :string -> :atom -> :string -> [[:any]] -> [[:any]] -> [ast.Decl] -> ast.Span -> [ast.Decl];
-let record_parts owner kind name fields members bases span = {
+let record_parts owner kind name fields0 members bases span = {
+    let fields = map strict_by_type fields0;
     let named f = ast.name_e (ast.field_name f) (ast.field_span f);
     // `derive dyn`: every value carries its record's dispatch table in slot 0
     // -- the first position of a list or an array, the key `0` of a map, so
@@ -495,7 +513,8 @@ let union_decl owner name params variants members kind span = {
     let constructors = map (fn v -> {
         let fs = ast.variant_fields v;
         ast.let_d (ast.variant_name v)
-                  (map (fn f -> ast.param (list.nth 0 f) (list.nth 1 f)) fs)
+                  (map (fn f -> if scalar_type (list.nth 2 f) { ast.strict_param (list.nth 0 f) (list.nth 1 f) }
+                                else { ast.param (list.nth 0 f) (list.nth 1 f) }) fs)
                   (constructed (variant_id v) true
                                (map (fn f -> ast.name_e (list.nth 0 f) (list.nth 1 f)) fs) at_)
                   false at_

@@ -32,12 +32,24 @@ union Atom {
     address(symbol : :string),
 }
 
+/// What `Rhs.eager` computes: leaves that must be numbers when it runs, a record's field read by
+/// position, and the operations on them.
+union Cheap {
+    leaf(a : Atom),
+    field(a : Atom, index : :integer),
+    op(name : :string, l : Cheap, r : Cheap),
+}
+
 union Rhs {
     /// Small-integer arithmetic done now if it can be, on evaluated operands, and otherwise
     /// the suspension (`symbol`, `payload`) that would have been made.
     /// The closure this function was entered with, at its entry.
     self_closure,
     speculate(op : :string, a : Atom, b : Atom, symbol : :string, payload : [Atom]),
+    /// Arithmetic on what may not be evaluated yet, a record's fields read on the way, done now
+    /// when every leaf is a number -- integers exactly, in doubles once a float is in it -- and
+    /// otherwise the suspension that would have been made (`Cheap`).
+    eager(tree : Cheap, symbol : :string, payload : [Atom]),
     /// `+` and the rest, on values in hand.
     arith(op : :string, a : Atom, b : Atom),
     /// `==` and the rest, answering a boolean or a suspended comparison.
@@ -117,6 +129,11 @@ group St {
     needed_lib : :map,
     wrapped : :map,
     records : :map,
+    /// What `program` has translated, by unit, function and how, and the library's functions it
+    /// has queued by name: kept here, not in `program`, so that a second call goes on from the
+    /// first -- the library first, the same for every program, then the program (machine.to_ir).
+    done : :map,
+    lib_done : :map,
 }
 
 /// The slots of the function being translated: a slot's atom, and which variables are
@@ -129,7 +146,7 @@ group Env {
 }
 
 let empty_st : St;
-let empty_st = St.make 0 [] [] %{} %{} %{} %{} [] %{} %{} %{};
+let empty_st = St.make 0 [] [] %{} %{} %{} %{} [] %{} %{} %{} %{} %{};
 
 let fresh : St -> [:integer, St];
 let fresh s = [St.next s, St.set_next (St.next s + 1) s];
@@ -161,10 +178,18 @@ let fits_fixnum n = n >= -4611686018427387904 && n < 4611686018427387904;
 let atom_vars : Atom -> [:integer];
 let atom_vars a = match a { Atom.var(i) => [i], _ => [] };
 
+let cheap_vars : Cheap -> [:integer];
+let cheap_vars t = match t {
+    Cheap.leaf(a) => atom_vars a,
+    Cheap.field(a, _) => atom_vars a,
+    Cheap.op(_, l, r) => list.append (cheap_vars l) (cheap_vars r),
+};
+
 let rhs_vars : Rhs -> [:integer];
 let rhs_vars r = match r {
     Rhs.self_closure => [],
     Rhs.speculate(_, a, b, _, payload) => list.concat [atom_vars a, atom_vars b, list.flat_map atom_vars payload],
+    Rhs.eager(tree, _, payload) => list.append (cheap_vars tree) (list.flat_map atom_vars payload),
     Rhs.arith(_, a, b) => list.append (atom_vars a) (atom_vars b),
     Rhs.compare(_, a, b) => list.append (atom_vars a) (atom_vars b),
     Rhs.native(_, args) => list.flat_map atom_vars args,
@@ -627,6 +652,9 @@ let value cx i env s k = {
             Option.none => k (Atom.word unit_word) env (refuse_in cx.[:name] "a slot read before it is bound" s),
         },
         9 => forcing (Env.captures env).[a],
+        // Arithmetic on numbers is a cheap tree, done in line, floats unboxed between its
+        // operations, and whatever is not a number yet takes the way it always took.
+        o if (o >= 21 && o <= 23 || o >= 28 && o <= 31) && cx.[:plain else (0 - 1)] != i && cheap_node cx i env 16 >= 0 => eager_value cx i env s k,
         21 => arithmetic cx op n env s k,
         22 => arithmetic cx op n env s k,
         23 => arithmetic cx op n env s k,
@@ -643,6 +671,12 @@ let value cx i env s k = {
         43 => type_test cx n env s k,
         o if o == 17 || o == 18 => lazily cx i env s k,
         o if o == 36 || o == 37 || o == 44 || o == 81 => lazily cx i env s k,
+        13 => applied_then cx a (image.kids cx.[:img] (image.Node.b n) (image.Node.c n)) env s (fn e env1 s1 -> {
+            let [x, s2] = fresh s1;
+            let var = Atom.var x;
+            let [rest, s3] = k var (mark_forced var env1) s2;
+            [seq_of x e rest, s3]
+        }),
         _ => {
             let [x, s1] = fresh s;
             let [e, s2] = tail cx i env s1;
@@ -801,6 +835,15 @@ let bound_maybe rhs_ k env s known =
         let [rest, s3] = k (Atom.var y) (mark_forced (Atom.var y) env) s2;
         [Expr.bind x rhs_ (seq_of y (Expr.enter (Atom.var x)) rest), s3]
     };
+
+/// Node `i`, a cheap tree, evaluated: done now (`Rhs.eager`), and its suspension forced when it
+/// could not be, which evaluates it as `arithmetic` would have, in the same order.
+let eager_value : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let eager_value cx i env s k = lazily cx i env s (fn a env1 s1 -> {
+    let [y, s2] = fresh s1;
+    let [rest, s3] = k (Atom.var y) (mark_forced (Atom.var y) env1) s2;
+    [seq_of y (Expr.enter a) rest, s3]
+});
 
 let arithmetic : :any -> :integer -> image.Node -> Env -> St -> :any -> [Expr, St];
 let arithmetic cx op n env s k =
@@ -1014,23 +1057,35 @@ let caf_symbol symbol = str.concat_all ["@caf_", str.slice 1 (len symbol - 1) sy
 
 /// A call: whatever the callee node says it is.
 let applied : :any -> :integer -> [:integer] -> Env -> St -> [Expr, St];
-let applied cx callee args env s = {
+let applied cx callee args env s = applied_then cx callee args env s (fn e _ s1 -> [e, s1]);
+
+/// A call, handed to `done` with what evaluating its arguments left in the environment. A
+/// closure or a suspension made for an argument may have captured a slot of a `let rec` that
+/// has no value yet, and the hole it holds is in that environment, to be patched when the slot
+/// has one (`settle_holes`): `value` went on from the environment before the arguments, and the
+/// hole was lost, so that `let rec prog = P.make (list.map (fn i -> f prog i) xs) (vm.unique! ())`
+/// left `prog` as 0 inside the closure -- reached once `P`'s strict field made that `let` strict.
+let applied_then : :any -> :integer -> [:integer] -> Env -> St -> :any -> [Expr, St];
+let applied_then cx callee args env s done = {
     let n = image.node cx.[:img] callee;
     let unknown = fn () -> value cx callee env s (fn f env1 s1 ->
-        lazies cx args env1 s1 (fn atoms _ s2 -> [Expr.apply f atoms, s2]));
+        lazies cx args env1 s1 (fn atoms env2 s2 -> done (Expr.apply f atoms) env2 s2));
     match image.Node.op n {
-        11 => builtin cx names_of_builtins.[image.Node.a n] args env s,
+        11 => {
+            let [e, s1] = builtin cx names_of_builtins.[image.Node.a n] args env s;
+            done e env s1
+        },
         o if o == 8 || o == 9 => match known_callee cx.[:img] cx.[:strict] callee (list.length args) {
             Option.some(f) => value cx callee env (queue cx f s) (fn fa env1 s1 ->
-                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env1 s1 (fn atoms _ s2 ->
-                    [Expr.call_closure fa (symbol_of cx.[:unit] f) atoms, s2])),
+                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env1 s1 (fn atoms env2 s2 ->
+                    done (Expr.call_closure fa (symbol_of cx.[:unit] f) atoms) env2 s2)),
             Option.none => unknown (),
         },
         10 => {
             let g = image.global cx.[:img] (image.Node.a n);
             let f = image.Global.target g;
             if image.Global.kind g == 0 && image.Func.arity (image.func cx.[:img] f) == list.length args {
-                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env (queue cx f s) (fn atoms _ s2 -> [Expr.call (symbol_of cx.[:unit] f) atoms, s2])
+                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env (queue cx f s) (fn atoms env2 s2 -> done (Expr.call (symbol_of cx.[:unit] f) atoms) env2 s2)
             } else { unknown () }
         },
         12 => {
@@ -1042,14 +1097,17 @@ let applied cx callee args env s = {
                 if module_ == "std.vm" && member == "host_members" {
                     let [table, s1] = intern_string (host_table cx) s;
                     lazies cx args env (St.set_needed_lib ((St.needed_lib s1).["host_members_in" => true]) s1)
-                        (fn atoms _ s2 -> [Expr.call "@lib_host_members_in" (list.cons (Atom.address table) atoms), s2])
+                        (fn atoms env2 s2 -> done (Expr.call "@lib_host_members_in" (list.cons (Atom.address table) atoms)) env2 s2)
                 } else if module_ == "std.vm" && member == "image_digest" {
                     // What the VM answers running this image -- the SHA-256 of its bytes -- is
                     // known now, and is the program's name for itself: `dreams` keys its cache
                     // with it, so a build native and one on the VM read each other's units.
                     let [digest, s1] = intern_string (image_digest_of cx.[:img]) s;
-                    [Expr.ret (Atom.address digest), s1]
-                } else { native_call cx module_ member args env s }
+                    done (Expr.ret (Atom.address digest)) env s1
+                } else {
+                    let [e, s1] = native_call cx module_ member args env s;
+                    done e env s1
+                }
             } else { unknown () }
         },
         _ => unknown (),
@@ -1729,6 +1787,18 @@ let lazily cx i env s k = {
             let [rest, s5] = k (Atom.var x) env s4;
             [Expr.bind x (Rhs.speculate name ax bx symbol payload) rest, s5]
         },
+        // Cheap but not known evaluated: arithmetic whose leaves are what is in hand, literals and
+        // fields of a record by position. A suspension of it was an allocation and, when forced,
+        // a call, for what is a few instructions on numbers that are there by then -- and a
+        // record of floats made in a loop is made of such fields, each forced in the next.
+        o if (o >= 21 && o <= 23 || o >= 26 && o <= 31) && cheap_node cx i env 16 >= 0 => {
+            let [symbol, payload, _, s1] = lifted_thunk cx i env s;
+            let [x, s2] = fresh s1;
+            cheap_tree cx i env s2 (fn tree env1 s3 -> {
+                let [rest, s4] = k (Atom.var x) env1 s3;
+                [Expr.bind x (Rhs.eager tree symbol payload) rest, s4]
+            })
+        },
         11 => {
             let [f, s1] = builtin_value cx a s;
             k f env s1
@@ -1839,7 +1909,9 @@ let lifted_thunk cx i env s = {
     let [vars, s1] = fresh_many (list.length pieces) s;
     let [id, s2] = fresh s1;
     let inner = lifted_env pieces vars env;
-    let [body, s3] = tail cx i inner s2;
+    // The suspension of a cheap tree is what runs when it could not be done now, so its own node
+    // is the arithmetic as ever, and not the tree again (`eager_value`).
+    let [body, s3] = tail cx.[:plain => i] i inner s2;
     let symbol = str.concat_all ["@t", cx.[:unit], to_string id];
     let f = Function.make symbol symbol :thunk false [] vars body (cx.[:name] + " (suspended)")
         (match cx.[:place] { [n, path, line, col] => [n, path, line, col, 1], _ => [] });
@@ -1853,6 +1925,64 @@ let lifted_thunk cx i env s = {
         _ => (),
     }) (list.enumerate pieces);
     [symbol, (if list.is_empty values_ { [Atom.word "1"] } else { values_ }), holes, s4]
+};
+
+/// What is left of `budget` after node `i` as a `Cheap` tree -- below zero when it is not one, or
+/// too big to be worth doing in line. A comparison is only ever the root.
+let cheap_node : :any -> :integer -> Env -> :integer -> :integer;
+let cheap_node cx i env !budget = if budget < 0 { budget } else {
+    let n = image.node cx.[:img] i;
+    match image.Node.op n {
+        1 => if fits_fixnum (image.integer cx.[:img] (image.Node.a n)) { budget - 1 } else { 0 - 1 },
+        2 => budget - 1,
+        8 => if map.has (image.Node.a n) (Env.slots env) { budget - 1 } else { 0 - 1 },
+        9 => budget - 1,
+        39 => if image.Node.c n == image.no_node && local_or_capture cx (image.Node.a n) env && small_index cx (image.Node.b n) { budget - 1 } else { 0 - 1 },
+        o if o >= 21 && o <= 23 => cheap_node cx (image.Node.b n) env (cheap_node cx (image.Node.a n) env (budget - 1)),
+        o if o >= 26 && o <= 31 => cheap_operand cx (image.Node.b n) env (cheap_operand cx (image.Node.a n) env (budget - 1)),
+        _ => 0 - 1,
+    }
+};
+
+/// A comparison's operand: anything a tree may be but another comparison.
+let cheap_operand : :any -> :integer -> Env -> :integer -> :integer;
+let cheap_operand cx i env !budget = {
+    let o = image.Node.op (image.node cx.[:img] i);
+    if o >= 26 && o <= 31 { 0 - 1 } else { cheap_node cx i env budget }
+};
+
+let local_or_capture : :any -> :integer -> Env -> :bool;
+let local_or_capture cx i env = {
+    let n = image.node cx.[:img] i;
+    match image.Node.op n { 8 => map.has (image.Node.a n) (Env.slots env), 9 => true, _ => false }
+};
+
+let small_index : :any -> :integer -> :bool;
+let small_index cx i = {
+    let n = image.node cx.[:img] i;
+    image.Node.op n == 1 && image.integer cx.[:img] (image.Node.a n) >= 0 && image.integer cx.[:img] (image.Node.a n) < 1024
+};
+
+/// Node `i`, which `cheap_node` passed, as the tree. Literals are atoms as anywhere (`value`).
+let cheap_tree : :any -> :integer -> Env -> St -> :any -> [Expr, St];
+let cheap_tree cx i env s k = {
+    let n = image.node cx.[:img] i;
+    let o = image.Node.op n;
+    match o {
+        8 => k (Cheap.leaf (Env.slots env).[image.Node.a n]) env s,
+        9 => k (Cheap.leaf (Env.captures env).[image.Node.a n]) env s,
+        39 => {
+            let object = image.node cx.[:img] (image.Node.a n);
+            let a = if image.Node.op object == 8 { (Env.slots env).[image.Node.a object] } else { (Env.captures env).[image.Node.a object] };
+            k (Cheap.field a (image.integer cx.[:img] (image.Node.a (image.node cx.[:img] (image.Node.b n))))) env s
+        },
+        _ if o == 1 || o == 2 => value cx i env s (fn a env1 s1 -> k (Cheap.leaf a) env1 s1),
+        _ => {
+            let name = if o >= 21 && o <= 23 { arithmetic_ops.[o] } else { comparison_ops.[o] };
+            cheap_tree cx (image.Node.a n) env s (fn l env1 s1 ->
+                cheap_tree cx (image.Node.b n) env1 s1 (fn r env2 s2 -> k (Cheap.op name l r) env2 s2))
+        },
+    }
 };
 
 /// An operand that can be read without evaluating anything: a small literal, or what has been
@@ -2012,26 +2142,26 @@ let translate cx f how s = {
 let program : :map -> [[:any]] -> :map -> :map -> :map -> St -> St;
 let program units roots lib_names native_arity lib_arity s = {
     let masks = map.map_values strict_masks units;
-    let rec go s1 seen lib_seen = match St.queued s1 {
+    let rec go s1 = match St.queued s1 {
         [] => {
-            let wanted = list.filter (fn n -> not (lib_seen.[n else false])) (map.keys (St.needed_lib s1));
+            let wanted = list.filter (fn n -> not ((St.lib_done s1).[n else false])) (map.keys (St.needed_lib s1));
             match wanted {
                 [] => s1,
                 [name, ..rest] => match map.lookup name lib_names {
-                    Option.none => go (refuse_in "the library" (str.concat_all ["it has no `", name, "`"]) (St.set_needed_lib (map.remove name (St.needed_lib s1)) s1)) seen lib_seen,
-                    Option.some(f) => go (St.set_queued [["l", f, :function]] s1) seen lib_seen.[name => true],
+                    Option.none => go (refuse_in "the library" (str.concat_all ["it has no `", name, "`"]) (St.set_needed_lib (map.remove name (St.needed_lib s1)) s1)),
+                    Option.some(f) => go (St.set_queued [["l", f, :function]] s1 |> St.set_lib_done ((St.lib_done s1).[name => true])),
                 },
             }
         },
         [[unit, f, how], ..rest] => {
             let s2 = St.set_queued rest s1;
             let key = str.concat_all [unit, to_string f, to_string how];
-            if seen.[key else false] { go s2 seen lib_seen }
+            if (St.done s2).[key else false] { go s2 }
             else {
                 let cx = %{:img => units.[unit], :unit => unit, :name => "", :native_arity => native_arity, :lib_arity => lib_arity, :strict => masks.[unit]};
-                go (translate cx f how s2) seen.[key => true] lib_seen
+                go (translate cx f how (St.set_done ((St.done s2).[key => true]) s2))
             }
         },
     };
-    go (St.set_queued roots s) %{} %{}
+    go (St.set_queued roots s)
 };

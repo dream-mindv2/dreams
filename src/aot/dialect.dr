@@ -743,6 +743,20 @@ let unit_of img roots arch = {
         (map.keys (State.atoms s))
 };
 
+/// Every function of the runtime `img` that the dialect writes, in the same order whatever the
+/// program: those from the first of `roots` on. The prelude every module has is in the image
+/// too, before the runtime's own, and is not the dialect's.
+let whole_unit : image.Image -> [:string] -> :integer -> Unit;
+let whole_unit img roots arch = {
+    let named = by_name img;
+    let first = list.fold (fn m r -> match map.lookup r named { Option.some(f) => if f < m { f } else { m }, Option.none => m }) 1000000000 roots;
+    // By name, not as the program asked for them, so that the text is the same each time; a root
+    // the runtime has not got is still said to be missing.
+    let own = list.filter (fn n -> named.[n] >= first) (map.keys named);
+    let absent = list.filter (fn r -> not (map.has r named)) roots;
+    unit_of img (list.append own absent) arch
+};
+
 /// A dialect program by itself: `img` as LLVM IR, or everything in it the dialect
 /// has no meaning for.
 let to_ir : image.Image -> :integer -> Result :string [:string];
