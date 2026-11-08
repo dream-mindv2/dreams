@@ -130,6 +130,12 @@ is the measure of progress.
    (OpenSSL, SChannel, OpenCL, GTK) and possibly the tensor kernels, whose AVX2
    inner loops are to be measured in Dream before being kept in C++.
 7. `mind build --aot`, a manifest setting, macOS and aarch64.
+8. **Later, not now: WebAssembly as a target.** A graphics application's frontend
+   runs on the browser VM -- the VM compiled to WebAssembly -- inside the window's
+   web view, so a native build covers only its backend, and `mind install`
+   installs such an application as an image. Compiling a program to WebAssembly
+   the way it is compiled to x86-64 and aarch64 is what would make the frontend
+   compiled code too.
 
 ## Log
 
