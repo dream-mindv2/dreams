@@ -321,7 +321,12 @@ let merged_part machine base ybase parsed = {
     let relas_of = list.fold (fn m sec -> if Section.kind sec == sht_rela {
         m.[Section.info sec => list.cons (Section.index sec) m.[Section.info sec else []]]
     } else { m }) %{} sections_;
+    // A plain `.rodata`, `.data` or `.bss` is reached only by what refers into it: it holds what LLVM
+    // made for a function -- its jump tables, a switch's table -- where nothing gives each its own
+    // section (`std.llvm` has no `-data-sections`), and as a root it kept every function its
+    // tables named, and everything they called: a native-built `01_basics` was twice the size.
     let roots = list.map Section.index (list.filter (fn sec -> allocated sec && Section.name sec != ".eh_frame"
+        && not (list.contains (Section.name sec) [".rodata", ".data", ".bss"])
         && not (list.any (fn pre -> str.starts_with pre (Section.name sec)) per_symbol_prefixes)) sections_);
     MergedPart.make machine (array.of_list sections_) (array.of_list symbols_) relocs defined relas_of roots
         (base + list.length sections_) (ybase + list.length symbols_)

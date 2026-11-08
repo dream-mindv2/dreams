@@ -1,0 +1,314 @@
+// The IR of a program cut into parts that LLVM compiles one by one, in parallel: what
+// dream/src/aot_object.cpp did in the VM, written here so that a compiler built native, which has
+// no VM to ask, cuts its IR the same way (std.llvm compiles each part).
+//
+// What the AOT writes is simple at the top level, and this reads only that: a `define` runs to its
+// closing `}`, everything else is a line. The target, the declarations and the payload's external
+// symbol go in every part, `module asm` in the first; a function or a datum goes in the part with
+// the least so far. Every definition is made `hidden` rather than `internal` or `private`, so that
+// the others can name it, and each part declares what it names and does not define: a function as
+// its definition says, a datum as a byte, which is all a reference to one needs.
+//
+// Each definition is in a comdat of its own, which is how LLVM is told to give it a section of its
+// own -- `-ffunction-sections`, which its C API has no setting for (`in_comdat`): the executable
+// writer lays out only the sections something reaches (`link.live_sections`).
+//
+// Parts kept. What stands between `; dream: cached` and `; dream: end cached` -- the runtime and
+// the library, the same text for every program -- goes in parts of its own, cut by its size alone,
+// which take nothing from outside it, declare in a fixed order and carry only the header lines
+// they use, so that each is the same text in every program and its object can be kept between
+// builds (`driver.objects!`).
+
+import std.list;
+import std.map;
+import std.str;
+
+/// A top-level item: its text, what it defines (or ""), what kind of thing it is, what an alias is
+/// of, and whether it is in the kept section.
+/// Its strings are strict, so that one held is its text and not a suspension of the whole IR.
+group Top { !text : :string, !name : :string, kind : :atom, !aliasee : :string, cached : :bool }
+
+/// A part: its text, and whether it is one of the kept ones. The text is strict: a part is sent to
+/// the process that compiles it, and a suspension of it would carry everything it is made from.
+group Part { !text : :string, cached : :bool }
+
+/// The bytes a name of a function or datum is made of.
+let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.$";
+
+/// The name after the `@` at byte `at` of `s`.
+let name_after_at : :string -> :integer -> :string;
+let name_after_at s at = str.slice (at + 1) (str.span name_bytes (at + 1) s - at - 1) s;
+
+/// The text's top-level items, in order.
+let tops_of : :string -> [Top];
+let tops_of ir = {
+    let n = str.byte_length ir;
+    let rec go !i !cached !acc = if i >= n { list.reverse acc } else {
+        let eol = str.upto "\n" i ir;
+        let line = str.slice i (eol - i) ir;
+        if str.starts_with "define " line {
+            // To the line that is only `}`.
+            let close = str.find_from eol "\n}\n" ir;
+            let end = if close < 0 { n } else { close + 3 };
+            let at = str.find "@" line;
+            let name = if at < 0 { "" } else { name_after_at line at };
+            go end cached (list.cons (Top.make (str.slice i (end - i) ir) name :function "" cached) acc)
+        } else {
+            let next = if eol < n { eol + 1 } else { eol };
+            let item = str.slice i (next - i) ir;
+            match line {
+                "; dream: cached" => go next true acc,
+                "; dream: end cached" => go next false acc,
+                _ if line == "" || str.byte 0 line == 59 => go next cached acc,
+                _ if str.starts_with "module asm" line => go next cached (list.cons (Top.make item "" :asm "" cached) acc),
+                _ if str.byte 0 line == 64 && not (str.contains_str " = external " line) => {
+                    let name = name_after_at line 0;
+                    if str.contains_str " alias " line {
+                        let target = name_after_at line (str.find_last "@" line);
+                        go next cached (list.cons (Top.make item name :alias target cached) acc)
+                    } else { go next cached (list.cons (Top.make item name :datum "" cached) acc) }
+                },
+                _ => go next cached (list.cons (Top.make item "" :header "" cached) acc),
+            }
+        }
+    };
+    go 0 false []
+};
+
+/// `text` with the linkage of the definition it starts with made `hidden`.
+let hidden : :string -> :string;
+let hidden text = {
+    let eol = str.upto "\n" 0 text;
+    let replaced = fn linkage -> {
+        let at = str.find linkage text;
+        if at >= 0 && at < eol {
+            Option.some (str.concat_all [str.slice 0 at text, " hidden ", str.slice (at + len linkage) (str.byte_length text) text])
+        } else { Option.none }
+    };
+    match replaced " internal " {
+        Option.some(t) => t,
+        Option.none => Option.unwrap_or text (replaced " private "),
+    }
+};
+
+/// A definition in a comdat of its own, which is what gives it a section of its own: LLVM makes a
+/// function's section unique, and the jump tables and constants it makes for it too, when the
+/// target is told to (`-ffunction-sections`, which its C API cannot say) or when the function is in
+/// a comdat. Named in the IR instead, each function had its own `.text.NAME` but LLVM's tables for
+/// all of a part's went in one `.rodata`, and a function whose table was in it kept all of them
+/// (`link.live_sections`). A comdat is declared by name in the part that defines it (`comdats_of`).
+let in_comdat : Top -> :string -> :string;
+let in_comdat t text = {
+    let eol = str.upto "\n" 0 text;
+    let line = str.slice 0 eol text;
+    let rest = str.slice eol (str.byte_length text) text;
+    match Top.kind t {
+        :function => {
+            let brace = str.find_last " {" line;
+            if brace < 0 { text } else { str.concat_all [str.slice 0 brace line, " comdat", str.slice brace (len line) line, rest] }
+        },
+        :datum => {
+            let align = str.find_last ", align " line;
+            if align < 0 { str.concat_all [line, ", comdat", rest] }
+            else { str.concat_all [str.slice 0 align line, ", comdat", str.slice align (len line) line, rest] }
+        },
+        _ => text,
+    }
+};
+
+/// The comdats a part's definitions are in, declared.
+let comdats_of : :array -> [:integer] -> [:string];
+let comdats_of tops members = Option.values (list.map (fn i -> {
+    let t = tops.[i];
+    if Top.kind t == :function || Top.kind t == :datum { Option.some (str.concat_all ["$", Top.name t, " = comdat any\n"]) } else { Option.none }
+}) members);
+
+/// `s` without the first `word` in it, if it has one.
+let without_first : :string -> :string -> :string;
+let without_first word s = {
+    let at = str.find word s;
+    if at < 0 { s } else { str.slice 0 at s + str.slice (at + len word) (str.byte_length s) s }
+};
+
+/// A function's declaration, from its definition's first line.
+let declaration_of : :string -> :string;
+let declaration_of define = {
+    let line = str.slice 0 (str.upto "\n" 0 define) define;
+    let at = str.find "@" line;
+    let open = str.find_from at "(" line;
+    let close = str.find_from open ")" line;
+    // What comes between `define` and the name, but its linkage.
+    let head = list.fold (fn h w -> without_first w h) (str.slice 7 (at - 7) line) ["internal ", "private ", "dso_local ", "hidden "];
+    let params = list.map (fn one -> {
+        let trimmed = str.slice (str.span " " 0 one) (str.byte_length one) one;
+        let pct = str.find_last " %" trimmed;
+        if pct >= 0 { str.slice 0 pct trimmed } else { trimmed }
+    }) (list.filter (fn p -> p != "") (str.split "," (str.slice (open + 1) (close - open - 1) line)));
+    str.concat_all ["declare hidden ", head, "@", str.slice (at + 1) (open - at - 1) line, "(", str.join_str ", " params, ")\n"]
+};
+
+/// Every name `text` refers to with `@`, outside quoted strings, as a set.
+let names_in : :string -> :map;
+let names_in text = {
+    let n = str.byte_length text;
+    let rec go !i !quoted !acc = {
+        let j = str.upto "@\"" i text;
+        if j >= n { acc }
+        else if str.byte j text == 34 { go (j + 1) (not quoted) acc }
+        else if quoted { go (j + 1) quoted acc }
+        else {
+            let name = name_after_at text j;
+            go (j + 1 + str.byte_length name) quoted (if name == "" { acc } else { acc.[name => true] })
+        }
+    };
+    go 0 false %{}
+};
+
+/// `text` with every name `renames` holds replaced by what it says, outside quoted strings.
+let renamed : :string -> :map -> :string;
+let renamed text renames = if map.size renames == 0 { text } else {
+    let n = str.byte_length text;
+    let rec go !i !quoted !acc = {
+        let j = str.upto "@\"" i text;
+        let before = str.slice i (j - i) text;
+        if j >= n { str.concat_all (list.reverse (list.cons before acc)) }
+        else if str.byte j text == 34 { go (j + 1) (not quoted) (list.cons "\"" (list.cons before acc)) }
+        else if quoted { go (j + 1) quoted (list.cons "@" (list.cons before acc)) }
+        else {
+            let name = name_after_at text j;
+            go (j + 1 + str.byte_length name) quoted (list.cons renames.[name else name] (list.cons "@" (list.cons before acc)))
+        }
+    };
+    go 0 false []
+};
+
+/// What an alias is an alias of, through any alias of an alias.
+let alias_targets : [Top] -> :map;
+let alias_targets tops = {
+    let direct = list.fold (fn m t -> if Top.kind t == :alias { m.[Top.name t => Top.aliasee t] } else { m }) %{} tops;
+    let rec through !target !steps = match map.lookup target direct {
+        Option.some(next) if next != target && steps < 64 => through next (steps + 1),
+        _ => target,
+    };
+    map.map_values (fn target -> through target 0) direct
+};
+
+/// Whether a function another part defines is copied into a part that calls it, as
+/// `available_externally`, so that LLVM can inline it there: a small function of the runtime
+/// (`r`) or the library (`l`). Its tests of a kind and its constants were calls once the parts
+/// were apart, and a compile spent a sixth of its time in them.
+let inlinable : :string -> Top -> :bool;
+let inlinable name t =
+    Top.kind t == :function && str.byte_length (Top.text t) <= 4096 && str.byte_length name > 1
+        && (str.byte 0 name == 114 || str.byte 0 name == 108) && str.byte 1 name >= 48 && str.byte 1 name <= 57;
+
+/// The text cut into up to `units` parts for the program's own, each standing alone, and the kept
+/// section into parts of its own, those last.
+///
+/// An alias is not written: whatever names one names what it is an alias of. The AOT writes a
+/// continuation it has written before as an alias of the first, and in `dreams` that was 107,000
+/// aliases of a few dozen functions, all in the part with them; LLVM's GlobalOpt took three
+/// minutes over that part alone.
+let parts_of : :string -> :integer -> [Part];
+let parts_of ir units_asked = {
+    let tops = list.to_array (tops_of ir);
+    let count = len tops;
+    let renames = alias_targets (list.of_array tops);
+    let defined_at = list.fold (fn m i -> if Top.name tops.[i] != "" { m.[Top.name tops.[i] => i] } else { m }) %{} (list.range 0 count);
+    let headers = list.filter (fn t -> Top.kind t == :header) (list.of_array tops);
+    let header = str.concat_all (list.map Top.text headers);
+    let declared = list.fold (fn m t -> map.merge m (names_in (Top.text t))) %{} headers;
+    let placed = fn t -> Top.kind t == :function || Top.kind t == :datum;
+    let [cached_bytes, own_bytes] = list.fold_strict (fn [c, o] t ->
+        if not (placed t) { [c, o] } else if Top.cached t { [c + len (Top.text t), o] } else { [c, o + len (Top.text t)] })
+        [0, 0] (list.of_array tops);
+    // The parts asked for are for what the text is in all; the program's own share is what they
+    // are for, a part for each half megabyte of it, and the kept ones are counted apart.
+    let units = max 1 (min units_asked (1 + own_bytes / 524288));
+    let kept = if cached_bytes == 0 { 0 } else { 1 + cached_bytes / 524288 };
+    let all = units + kept;
+    // Each definition to the part being filled, in the text's order, the next part begun once this
+    // one holds its share: one walk, where finding the lightest part for each was a scan of all of
+    // them for each of a hundred thousand definitions. The kept parts fill the same way from the
+    // kept section alone, so that each is the same text in every program.
+    let own_share = own_bytes / units + 1;
+    let kept_share = if kept == 0 { 1 } else { cached_bytes / kept + 1 };
+    let [members, _, _, _, _] = list.fold (fn [ms, own_u, own_w, kept_u, kept_w] i -> {
+        let t = tops.[i];
+        let size = len (Top.text t);
+        if placed t && Top.cached t {
+            let u = units + kept_u;
+            let next = kept_w + size;
+            if next >= kept_share && kept_u < kept - 1 { [ms.[u => list.cons i ms.[u else []]], own_u, own_w, kept_u + 1, 0] }
+            else { [ms.[u => list.cons i ms.[u else []]], own_u, own_w, kept_u, next] }
+        } else if placed t {
+            let next = own_w + size;
+            if next >= own_share && own_u < units - 1 { [ms.[own_u => list.cons i ms.[own_u else []]], own_u + 1, 0, kept_u, kept_w] }
+            else { [ms.[own_u => list.cons i ms.[own_u else []]], own_u, next, kept_u, kept_w] }
+        } else if Top.kind t == :asm { [ms.[0 => list.cons i ms.[0 else []]], own_u, own_w, kept_u, kept_w] }
+        else { [ms, own_u, own_w, kept_u, kept_w] }
+    }) [%{}, 0, 0, 0, 0] (list.range 0 count);
+    // The header's lines with the names each one has, read once for every part to choose from.
+    let header_names = list.map (fn t -> [Top.text t, map.keys (names_in (Top.text t))]) headers;
+    list.map (fn u -> part_text tops renames defined_at header header_names declared u (u >= units) (list.reverse members.[u else []])) (list.range 0 all)
+};
+
+let max a b = if a > b { a } else { b };
+let min a b = if a < b { a } else { b };
+
+/// Part `u`, whose definitions are the tops at `members`.
+let part_text : :array -> :map -> :map -> :string -> [[:any]] -> :map -> :integer -> :bool -> [:integer] -> Part;
+let part_text tops renames defined_at header header_names declared u cached members = {
+    let body_of = fn i -> {
+        let t = tops.[i];
+        if Top.kind t == :asm { Top.text t } else { renamed (in_comdat t (hidden (Top.text t))) renames }
+    };
+    let bodies = list.map body_of members;
+    let defines = list.fold (fn m i -> if Top.name tops.[i] != "" { m.[Top.name tops.[i] => true] } else { m }) %{} members;
+    let used0 = list.fold (fn m b -> map.merge m (names_in b)) %{} bodies;
+    // What it copies in to inline: what it names, and what those name in turn.
+    let rec copying todo used copied acc = match todo {
+        [] => [used, copied, list.reverse acc],
+        [name, ..rest] => {
+            let at = defined_at.[name else (0 - 1)];
+            let skip = defines.[name else false] || copied.[name else false] || at < 0
+                || not (inlinable name tops.[at]) || (cached && not (Top.cached tops.[at]));
+            if skip { copying rest used copied acc } else {
+                let t = tops.[at];
+                let copy0 = renamed (hidden (Top.text t)) renames;
+                let copy = str.replace "define hidden " "define available_externally " copy0;
+                let more = list.filter (fn m -> not (used.[m else false])) (list.sort (map.keys (names_in copy)));
+                let used2 = list.fold (fn m x -> m.[x => true]) used more;
+                copying (list.append more rest) used2 copied.[name => true] (list.cons copy acc)
+            }
+        },
+    };
+    let [used, copied, copies] = copying (list.sort (map.keys used0)) used0 %{} [];
+    let declarations = Option.values (list.map (fn name ->
+        if defines.[name else false] || declared.[name else false] || copied.[name else false] { Option.none }
+        else { match map.lookup name defined_at {
+            Option.none => Option.none,
+            Option.some(at) => {
+                let t = tops.[at];
+                match Top.kind t {
+                    :function => Option.some (declaration_of (Top.text t)),
+                    :alias => match map.lookup (Top.aliasee t) defined_at {
+                        Option.some(target) if Top.kind tops.[target] == :function => {
+                            let d = declaration_of (Top.text tops.[target]);
+                            let a = str.find "@" d;
+                            Option.some (str.concat_all [str.slice 0 (a + 1) d, name, str.slice (str.find_from a "(" d) (str.byte_length d) d])
+                        },
+                        _ => Option.none,
+                    },
+                    _ => Option.some (str.concat_all ["@", name, " = external hidden global i8, align 8\n"]),
+                }
+            },
+        } }) (list.sort (map.keys used)));
+    let head = if not cached { header } else {
+        // Only the header's lines this part names, and those naming nothing.
+        str.concat_all (Option.values (list.map (fn [text, names] ->
+            if list.is_empty names || list.any (fn x -> used.[x else false]) names { Option.some text } else { Option.none })
+            header_names))
+    };
+    Part.make (str.concat_all (list.concat [[head], comdats_of tops members, declarations, copies, bodies])) cached
+};

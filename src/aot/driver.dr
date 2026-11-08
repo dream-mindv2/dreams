@@ -8,8 +8,11 @@
 // A program it cannot compile yet is refused by name, function by function, rather
 // than built into something that fails later.
 
+import std.console;
 import std.file;
 import std.io;
+import std.llvm;
+import std.proc;
 import std.list;
 import std.num;
 import std.os;
@@ -21,6 +24,7 @@ import dreams.aot.dialect;
 import dreams.aot.image;
 import dreams.aot.link;
 import dreams.aot.machine;
+import dreams.aot.parts;
 import dreams.aot.target;
 
 /// The host module a dialect program imports; a build has to be told it exists.
@@ -91,7 +95,7 @@ let parts_asked! ir = match os.env! "DREAMS_AOT_PARTS" {
 };
 
 let object_and_link! : :string -> :string -> :string -> :string -> Result :integer [:string];
-let object_and_link! ir out payload interp = match vm.llvm_objects! ir opt_level (parts_asked! ir) {
+let object_and_link! ir out payload interp = match objects! ir opt_level (parts_asked! ir) {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
     Result.ok([objects, kept]) => match linked! (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ()))
                                         (after_keeping! objects) kept {
@@ -159,6 +163,71 @@ let chosen! name = match name {
 /// Where native builds keep what they made once: `DREAMS_AOT_CACHE`, none when it is empty or `0`,
 /// or `$XDG_CACHE_HOME/dream/aot`, or `~/.cache/dream/aot` -- where `vm.llvm_objects!` keeps
 /// compiled parts too (dream/src/aot_object.cpp).
+/// The objects of `ir` in up to `units` parts, and how many of them, at the end, are kept parts
+/// (`parts.parts_of`). Built native, through LLVM as a library (`std.llvm`); on the VM, through the
+/// VM's own, which is linked into it for the JIT, unless `DREAMS_AOT_FFI` asks for the library.
+let objects! : :string -> :integer -> :integer -> Result [[:string], :integer] :string;
+let objects! ir level units = if native_build || os.env! "DREAMS_AOT_FFI" != () { library_objects! ir level units }
+    else { vm.llvm_objects! ir level units };
+
+/// Whether this compiler was itself built native.
+let native_build : :bool;
+when native { let native_build = true; }
+when not native { let native_build = false; }
+
+/// `objects!` through `std.llvm`: the parts compiled twelve at a time, a process each, and a kept
+/// part read from the cache when this text was compiled before by this LLVM at this level.
+let library_objects! : :string -> :integer -> :integer -> Result [[:string], :integer] :string;
+let library_objects! ir level units = {
+    let trace = os.env! "DREAMS_AOT_TRACE" != ();
+    let started = vm.now_ns! ();
+    let cut = list.forced (parts.parts_of ir units);
+    let kept = list.length (list.filter parts.Part.cached cut);
+    if trace { console.error! (str.concat_all ["aot: cut into ", to_string (list.length cut), " parts, ", to_string kept, " kept, in ",
+        to_string ((vm.now_ns! () - started) / 1000000), " ms"]); };
+    // `DREAMS_AOT_KEEP_PARTS=DIR`: each part's text as `DIR/part-N.ll`.
+    match os.env! "DREAMS_AOT_KEEP_PARTS" {
+        () => (),
+        dir => strict! (list.map (fn! [i, part] -> file.write! (str.concat_all [dir, "/part-", to_string i, ".ll"]) (parts.Part.text part)) (list.enumerate cut)),
+    }
+    let version = llvm.version! ();
+    let dir = aot_cache! ();
+    let compiling = vm.now_ns! ();
+    let made = proc.map_limit! 12 (fn! part -> part_object! dir version level part) cut;
+    if trace { console.error! (str.concat_all ["aot: compiled in ", to_string ((vm.now_ns! () - compiling) / 1000000), " ms"]); };
+    match list.filter (fn r -> not (Result.is_ok r)) made {
+        [Result.error(why), ..] => Result.error why,
+        _ => Result.ok [list.map (fn r -> Result.unwrap_or "" r) made, kept],
+    }
+};
+
+/// One part's object: read back from the cache for a kept part compiled before, compiled and kept
+/// there when not.
+let part_object! : :string | :unit -> :string -> :integer -> parts.Part -> Result :string :string;
+let part_object! dir version level part = {
+    let text = parts.Part.text part;
+    match dir {
+        () => llvm.object! text level,
+        d => if not (parts.Part.cached part) { llvm.object! text level } else {
+            let at = str.concat_all [d, "/", io.digest (str.concat_all ["dream-aot-part-ffi-1:", version, ":", to_string level, ":", text]), ".o"];
+            match file.read! at {
+                Option.some(object) => Result.ok object,
+                Option.none => {
+                    let compiled = llvm.object! text level;
+                    match compiled {
+                        Result.ok(object) => {
+                            file.mkdir_all! d
+                            file.replace! at object
+                        },
+                        _ => (),
+                    }
+                    compiled
+                },
+            }
+        },
+    }
+};
+
 let aot_cache! : () -> :string | :unit;
 let aot_cache! () = match os.env! "DREAMS_AOT_CACHE" {
     () => match os.env! "XDG_CACHE_HOME" {
