@@ -285,6 +285,16 @@ that "close to C++" is a number.
    than 32 (`DREAM_CENSUS_MIN_MB`): a self-compile ran two, each a major collection of every
    process and a mark of the region, for 2% of its CPU, and its peak was higher for them.
 
+   What copying costs now, and what did not help (2026-11-08). A self-compile copies 567 MB, four
+   fifths of it in minor collections, and the copy waits on memory: in `tree` 45% of
+   `evacuate_heap!` is the instruction after its load of an object's header. Prefetching did not
+   hide it -- the next word's object while copying this one, or an object's fields as it is
+   copied, for the scan to find later -- and neither did asking a minor collection only whether a
+   word is in the nursery, or an object's size of its info first (kept, since they are no slower
+   and say what is meant). Objects over 4 KB are 11 MB of the 567, so a space for large objects
+   would not either. What is copied is small things that live past one collection, mostly
+   suspensions: fewer of them made is the compiler's to give.
+
    | bench | before | after | C++ |
    |---|---|---|---|
    | tree | 102 | 97 | 104 |
