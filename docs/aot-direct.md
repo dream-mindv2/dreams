@@ -245,6 +245,53 @@ that "close to C++" is a number.
    in place. A collector with a nursery, and a map written in place where it is used linearly
    (as a trunk is), are what would close it.
 
+7. **Generations** (2026-11-08). A collection copied a process's whole heap, and a heap that
+   lives was copied again at every one: a third of a native self-compile was the collector.
+   Now most collections are minor ("generations" in rt/main.dr):
+
+   - **The nursery has an address space of its own**, reserved once (16 GB, less under
+     `ulimit -v`, `DREAM_NURSERY_MB`; huge pages where the kernel gives them), and every chunk
+     allocation goes on in comes from it. Whether a word is young is a subtraction and a
+     comparison (`in_nursery!`). The first version sorted the nursery's chunks and searched them,
+     and could not tell a young thunk from an old one as it was updated: 232,000 words
+     remembered at every minor collection of `tree`.
+   - **What survives is old**: copied to chunks outside the nursery that stay where they are
+     until a major collection, when the old have grown to three times what the last major kept,
+     and for a census. Segments a message or a spawn was copied into are old from the start.
+   - **A write into what may be old is remembered**: the word written, not its object, so that
+     an array forced element by element is each element once. Compiled code tests where the
+     thunk it updates is, in line, and calls out (`@cold_remember_value`) only for one outside
+     the nursery; `let rec` patches and the runtime's own writes (`frame_update!`, the raises,
+     `array_store!`) do the same.
+   - **A chunk a stack pins stays the nursery's**, and a word of to-space or of an old object
+     that points into it is remembered as it is moved (`evacuate_kept_at!`), so the collection
+     that does copy it finds the word. A major collection pins in old chunks too, and those go
+     back to the old list (`kept_chunks!`): put on the nursery's, the next minor collection
+     freed them with what was pinned in them.
+   - **The nursery's size follows survival**, per process: four times as large while half of it
+     survives, twice while a quarter does, half while a sixteenth or less does, 2 MB to 256 MB,
+     and never less than twice the stack, which a collection reads word by word. A fixed 8 MB
+     was a win for `maps` and `tree` and a loss of a third for `strs` and `sorts`, whose lists
+     live.
+   - **`DREAM_GC_VERIFY=1`** checks after each minor collection that nothing old points into the
+     nursery at what was not pinned, and names what did: that is how both bugs above were found.
+     `DREAM_GC_FULL=1` makes every collection major, to measure against.
+
+   Pin candidates are sorted by radix now, not Shell's sort: a collection that landed in a deep
+   recursion read 1.3 million words, and sorting them was most of `strs`.
+
+   | bench | before | after | C++ |
+   |---|---|---|---|
+   | tree | 102 | 97 | 104 |
+   | maps | 363 | 280 | 42 |
+   | sorts | 271 | 253 | 63 |
+   | recs | 44 | 42 | 5 |
+   | strs | 86 | 97 | 28 |
+   | native `dreams` compiling `mind` | 1.72 s | 1.50 s | |
+
+   `strs` is where its collections land against its live peak, which a nursery four times as
+   large happens to reach.
+
    What `recs` spends now is the list around the records -- `list.map`'s suspension of each
    element and of the rest, which `list.forced` then walks -- about as much as the arithmetic.
    A strict map, a loop over an array or a trunk that writes as it goes, is what C++'s 5 ms is.

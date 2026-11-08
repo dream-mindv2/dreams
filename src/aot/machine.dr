@@ -260,7 +260,7 @@ let checked intrinsic a b g = {
 // saves nothing is what a loop wants to be.
 let cold_names : [:string];
 let cold_names = ["alloc!", "add_slow!", "sub_slow!", "mul_slow!", "div_slow!", "mod_slow!",
-                  "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!", "to_float!"];
+                  "eq_slow!", "ne_slow!", "lt_slow!", "le_slow!", "gt_slow!", "ge_slow!", "to_float!", "remember_value!"];
 
 let cold_symbol : :string -> :string;
 let cold_symbol name = str.concat_all ["@cold_", str.replace "!" "" name];
@@ -808,7 +808,8 @@ let rhs r env sp g = {
             let g2 = store_at o 0 (str.concat_all ["ptrtoint (ptr ", info_symbol info, " to i64)"]) g1;
             [o, list.fold (fn st [i, a] -> store_at o (8 * (i + 1)) (text a) st) g2 (list.enumerate args)]
         },
-        core.Rhs.patch(object, index, value) => ["0", store_at (text object) (8 * (index + 1)) (text value) g],
+        core.Rhs.patch(object, index, value) => ["0", remembered (text object) (8 * (index + 1)) (text value)
+                                                        (store_at (text object) (8 * (index + 1)) (text value) g)],
         core.Rhs.field(object, index) => load_at (text object) (8 * (index + 1)) g,
         core.Rhs.has_kind(a, kind) => of_kind (text a) kind g,
         core.Rhs.same(a, w) => {
@@ -2255,8 +2256,31 @@ let updating body captures env sp g = {
     if list.is_empty leaves { h9 } else {
         let [v, h10] = instr ("phi i64 " + phi_args (list.map (fn l -> [l.[1], l.[0]]) leaves)) (start j h9);
         let h11 = store_at "%a" 8 v h10;
-        emit ("  ret i64 " + v) (store_at "%a" 0 "ptrtoint (ptr @i_ind to i64)" h11)
+        let h12 = store_at "%a" 0 "ptrtoint (ptr @i_ind to i64)" h11;
+        emit ("  ret i64 " + v) (remembered "%a" 8 v h12)
     }
+};
+
+/// The word at `object + offset` just written with `v`, remembered when `v` is an object and the
+/// word is not in the nursery, as the collector's generations need (`remember!` in rt/main.dr):
+/// a thunk may be old by the time it is updated, and what it is updated with new. Most are not --
+/// a thunk is updated soon after it is made -- and the test of where it is, against the
+/// nursery's address space in the world (`w_young_lo`, `w_young_size`), is the whole cost then.
+let remembered : :string -> :integer -> :string -> Gen -> Gen;
+let remembered object offset v g = {
+    // Only where the word is, in line: whether `v` is an object is asked on the way that is
+    // rarely taken (`remember_value!`), since the thunk updated is nearly always in the nursery.
+    let [at, g1] = instr (str.concat_all ["add i64 ", object, ", ", to_string offset]) g;
+    let [lo, g2] = instr "load i64, ptr getelementptr (i8, ptr @i_world, i64 656)" g1;
+    let [size, g3] = instr "load i64, ptr getelementptr (i8, ptr @i_world, i64 664)" g2;
+    let [off, g4] = instr (str.concat_all ["sub i64 ", at, ", ", lo]) g3;
+    let [young, g5] = instr (str.concat_all ["icmp ult i64 ", off, ", ", size]) g4;
+    let [note, g6] = label_of "remember" g5;
+    let [done, g7] = label_of "remembered" g6;
+    let g8 = start note (emit (str.concat_all ["  br i1 ", young, ", label %", done, ", label %", note]) g7);
+    let [ctx, g9] = ctx_of g8;
+    let [_, g10] = instr (str.concat_all ["call preserve_mostcc i64 ", cold_symbol "remember_value!", "(i64 ", ctx, ", i64 ", at, ", i64 ", v, ")"]) g9;
+    start done (emit ("  br label %" + done) g10)
 };
 
 /// The entry of a thunk entered at most once: no hole, no update.
@@ -2742,7 +2766,7 @@ let assemble user st unit_ lib_names entry arch direct part = {
     let display_table = str.concat_all ["@i_atom_display = internal constant [", to_string (list.length atom_list), " x ptr] [",
         str.join_str ", " (list.map (fn [_, i] -> if map.has i records { "ptr @shown" + to_string i } else { "ptr @atom" + to_string i }) atom_list), "]\n"];
     // What no one process owns (the shared region's ends, in rt/main.dr).
-    let world = str.concat_all ["@i_world = internal global [80 x i64] zeroinitializer, align 8\n",
+    let world = str.concat_all ["@i_world = internal global [96 x i64] zeroinitializer, align 8\n",
         "@i_native_stack = internal constant i64 ", to_string (if direct { direct_stack_of (map.keys (core.St.natives st)) } else { native_stack_of (map.keys (core.St.natives st)) }), "\n",
         // 1 when the code keeps values of its own on the native stack, which the collector then
         // reads for pins (`pin_native!`). Code that jumps keeps none there: reading the stack
