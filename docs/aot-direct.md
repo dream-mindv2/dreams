@@ -292,6 +292,31 @@ that "close to C++" is a number.
    `strs` is where its collections land against its live peak, which a nursery four times as
    large happens to reach.
 
+8. **Maps written in place** (2026-11-08). A loop that threads a map through a strict parameter
+   and lets each version go once it has made the next need not copy the path to every key it
+   sets. The compiler proves that much of a function ("linear accumulators" in core.dr): every
+   use of the parameter is its forcing at the top, the answer in tail position, the parameter
+   passed on unchanged to a tail call of the function itself, or the container of `acc.[k => v]`
+   that is that call's argument, `k` and `v` not reading it. The function is then compiled twice:
+   an entry whose set takes a token never given before (`index_set_fresh!`), and the loop, whose
+   sets write in place into what carries the root's token (`index_set_linear!`) and whose calls
+   of itself stay in it.
+
+   The map proves the rest (rt/main.dr, "maps written in place"). A branch the loop made carries
+   its token one word past its slots, and only such a branch is written: a map that came from
+   anywhere else -- the caller's, what an earlier run of the loop answered -- never carries this
+   run's token, so it is copied on the way down as it always was, and an answer that escapes
+   keeps a token nothing will use again. A write into a branch that has become old is remembered
+   for the collector, as any other is.
+
+   A direct loop building the `maps` benchmark's half a million keys: 230 ms to 146, the collector
+   copying 31 MB where it copied 160. The benchmark itself is a `list.fold` over a range, which a
+   release build's supercompiler fuses into a loop of its own (`<fused range>`), forcing the
+   accumulator with a `force` statement before the call, which counts as the forcing: 274 ms to
+   197 there. A build without the supercompiler calls `list.fold` with a closure and is unchanged;
+   specializing a known lambda into the library's loops is what would carry it there, and arrays
+   and records written the same way are the rest.
+
    What `recs` spends now is the list around the records -- `list.map`'s suspension of each
    element and of the rest, which `list.forced` then walks -- about as much as the arithmetic.
    A strict map, a loop over an array or a trunk that writes as it goes, is what C++'s 5 ms is.

@@ -361,6 +361,129 @@ let forced_by_call img d callee args lets = {
         own (list.enumerate args)
 };
 
+// --- linear accumulators --------------------------------------------------------------------
+//
+// A loop that threads a map through a strict parameter, and lets each version go once it has made
+// the next, need not copy the path to every key it sets. What is proved here is that much of the
+// function: every use of the parameter `acc` is the forcing of it at the top, the answer in tail
+// position, `acc` passed on as it is to a call of the function itself in tail position, or the
+// container of `acc.[k => v]` that is that call's argument, with neither `k` nor `v` reading
+// `acc`. Nothing else holds a version, then, once the next is made: no suspension captured it, no
+// structure has it, and the call does not return to anything that could read it.
+//
+// The function is compiled twice. Its entry, which anything may call, sets the key with a token
+// of its own (`index_set_fresh!`) and goes on in the second, whose sets write in place into what
+// carries the token (`index_set_linear!`) and whose calls of itself stay there. The map proves the
+// rest (rt/main.dr, "maps written in place"): a version that came from outside never carries the
+// token, so it is copied on the way down as it always was. A call of itself passing `acc` on
+// unchanged stays in the entry, since `acc` is still what the caller gave.
+
+/// The parameter of image function `f` that is a linear accumulator, if one is.
+let linear_slot : :any -> :integer -> Option :integer;
+let linear_slot cx f = {
+    let img = cx.[:img];
+    let fr = image.func img f;
+    let arity = image.Func.arity fr;
+    let mask = (Demand.masks cx.[:strict]).[f else 0];
+    let candidates = list.filter (fn i -> i < 60 && (mask >> i) & 1 == 1) (list.range 0 arity);
+    let body = image.Func.body fr;
+    match list.filter (fn sl -> {
+        let [ok, sets] = linear_tail cx f sl body;
+        ok && sets > 0
+    }) candidates {
+        [sl, ..] => Option.some sl,
+        [] => Option.none,
+    }
+};
+
+/// Whether node `i` reads or binds slot `sl`, closures and suspensions included.
+let mentions : image.Image -> :integer -> :integer -> :bool;
+let mentions img sl i = {
+    let [slots, _, bound] = reads img i;
+    slots.[sl else false] || bound.[sl else false]
+};
+
+/// Whether `i` is a statement that only forces slot `sl`: the slot read, or `force` of it, which
+/// is how a strict parameter and a fused loop's accumulator are made evaluated before a call.
+let is_forcing_of : image.Image -> :integer -> :integer -> :bool;
+let is_forcing_of img sl i = {
+    let n = image.node img i;
+    is_local_of img sl i || (image.Node.op n == 20 && is_local_of img sl (image.Node.a n))
+};
+
+let is_local_of : image.Image -> :integer -> :integer -> :bool;
+let is_local_of img sl i = { let n = image.node img i; image.Node.op n == 8 && image.Node.a n == sl };
+
+/// Whether `i` is `acc.[k => v]` with neither `k` nor `v` reading `acc`.
+let is_acc_set : image.Image -> :integer -> :integer -> :bool;
+let is_acc_set img sl i = {
+    let n = image.node img i;
+    image.Node.op n == 40 && is_local_of img sl (image.Node.a n)
+        && not (mentions img sl (image.Node.b n)) && not (mentions img sl (image.Node.c n))
+};
+
+/// `[whether node `i`, in tail position, uses slot `sl` only as a linear accumulator, how many
+/// self calls set it]`.
+let linear_tail : :any -> :integer -> :integer -> :integer -> [:any];
+let linear_tail cx f sl i = {
+    let img = cx.[:img];
+    let n = image.node img i;
+    let both = fn [a, x] [b, y] -> [a && b, x + y];
+    match image.Node.op n {
+        8 => [true, 0],
+        14 => if mentions img sl (image.Node.a n) { [false, 0] }
+              else { both (linear_tail cx f sl (image.Node.b n)) (linear_tail cx f sl (image.Node.c n)) },
+        15 => {
+            let kids = image.kids img (image.Node.a n) (image.Node.b n);
+            match list.reverse kids {
+                [] => [true, 0],
+                [last, ..before] => if list.all (fn k -> is_forcing_of img sl k || not (mentions img sl k)) before {
+                    linear_tail cx f sl last
+                } else { [false, 0] },
+            }
+        },
+        13 => {
+            let args = image.kids img (image.Node.b n) (image.Node.c n);
+            match known_callee img cx.[:strict] (image.Node.a n) (list.length args) {
+                Option.some(g) if g == f && not (mentions img sl (image.Node.a n)) => {
+                    let checked = list.map (fn [j, arg] ->
+                        if j == sl {
+                            if is_local_of img sl arg { [true, 0] } else if is_acc_set img sl arg { [true, 1] } else { [false, 0] }
+                        } else { [not (mentions img sl arg), 0] }) (list.enumerate args);
+                    list.fold both [true, 0] checked
+                },
+                _ => [not (mentions img sl i), 0],
+            }
+        },
+        _ => [not (mentions img sl i), 0],
+    }
+};
+
+/// Whether `container` is the accumulator, in a function that writes it in place.
+let is_linear_container : :any -> :integer -> :bool;
+let is_linear_container cx container = match cx.[:lin_slot else ()] {
+    () => false,
+    sl => is_local_of cx.[:img] sl container,
+};
+
+/// The symbol of the second compiling of `f`, which writes its accumulator in place.
+let linear_symbol : :any -> :integer -> :string;
+let linear_symbol cx f = symbol_of cx.[:unit] f + "w";
+
+/// The symbol a call of `f` with `args` goes to: the in-place compiling when the call hands it the
+/// accumulator set, or -- from the in-place compiling -- the accumulator as it is.
+let self_target : :any -> :integer -> [:integer] -> St -> [:string, St];
+let self_target cx f args s = match cx.[:lin_slot else ()] {
+    () => [symbol_of cx.[:unit] f, queue cx f s],
+    sl => if cx.[:lin_f else (0 - 1)] != f { [symbol_of cx.[:unit] f, queue cx f s] } else {
+        let arg = args.[sl else image.no_node];
+        let img = cx.[:img];
+        if arg != image.no_node && (is_acc_set img sl arg || (cx.[:linear_mode else false] && is_local_of img sl arg)) {
+            [linear_symbol cx f, St.set_queued (list.cons [cx.[:unit], f, :linear] (St.queued s)) s]
+        } else { [symbol_of cx.[:unit] f, queue cx f s] }
+    },
+};
+
 /// A switch forces its subject, and what every arm and its fallback force.
 let forced_by_arms : image.Image -> Demand -> :integer -> [:integer] -> :map -> :integer;
 let forced_by_arms img d subject kids lets = {
@@ -790,13 +913,22 @@ let is_zero cx i = {
 
 /// `c.[k => v]`, the value stored as it stands.
 let setting : :any -> :integer -> :integer -> :integer -> Env -> St -> [Expr, St];
-let setting cx container key v env s =
+let setting cx container key v env s = {
+    // The accumulator of a loop that writes it in place (`linear_slot`): set by the natives that
+    // may, the entry's with a token of its own.
+    let native = if is_linear_container cx container {
+        if cx.[:linear_mode else false] { "index_set_linear!" } else { "index_set_fresh!" }
+    } else { "index_set!" };
     value cx container env s (fn c env1 s1 ->
-        set_step cx c key v env1 s1 (fn x _ s2 -> [Expr.ret x, s2]));
+        set_with native cx c key v env1 s1 (fn x _ s2 -> [Expr.ret x, s2]))
+};
 
 let set_step : :any -> Atom -> :integer -> :integer -> Env -> St -> :any -> [Expr, St];
-let set_step cx c key v env s k = {
-    let s0 = St.set_natives ((St.natives s).["index_set!" => true]) s;
+let set_step cx c key v env s k = set_with "index_set!" cx c key v env s k;
+
+let set_with : :string -> :any -> Atom -> :integer -> :integer -> Env -> St -> :any -> [Expr, St];
+let set_with native cx c key v env s k = {
+    let s0 = St.set_natives ((St.natives s).[native => true]) s;
     let s1 = St.set_needed_lib ((St.needed_lib s0).["list_set" => true]) s0;
     value cx key env s1 (fn key_atom env1 s2 ->
         lazily cx v env1 s2 (fn v_atom env2 s3 -> {
@@ -806,7 +938,7 @@ let set_step cx c key v env s k = {
             let [rest, s7] = k (Atom.var x) (mark_forced (Atom.var x) env2) s6;
             let pick = Expr.choose (Atom.var is_list)
                 (Expr.call "@lib_list_set" [c, key_atom, v_atom])
-                (Expr.bind o (Rhs.native "index_set!" [c, key_atom, v_atom]) (Expr.ret (Atom.var o)));
+                (Expr.bind o (Rhs.native native [c, key_atom, v_atom]) (Expr.ret (Atom.var o)));
             [Expr.bind is_list (Rhs.is_list c) (seq_of x pick rest), s7]
         }))
 };
@@ -1098,9 +1230,12 @@ let applied_then cx callee args env s done = {
             done e env s1
         },
         o if o == 8 || o == 9 => match known_callee cx.[:img] cx.[:strict] callee (list.length args) {
-            Option.some(f) => value cx callee env (queue cx f s) (fn fa env1 s1 ->
-                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env1 s1 (fn atoms env2 s2 ->
-                    done (Expr.call_closure fa (symbol_of cx.[:unit] f) atoms) env2 s2)),
+            Option.some(f) => {
+                let [target, s0] = self_target cx f args s;
+                value cx callee env s0 (fn fa env1 s1 ->
+                    call_args cx (Demand.masks cx.[:strict]).[f else 0] args env1 s1 (fn atoms env2 s2 ->
+                        done (Expr.call_closure fa target atoms) env2 s2))
+            },
             Option.none => unknown (),
         },
         10 => {
@@ -1110,8 +1245,10 @@ let applied_then cx callee args env s done = {
                 match strict_constructor cx f {
                     Option.some(record) => values_of cx args env s (fn atoms env1 s1 ->
                         record_made cx record atoms env1 s1 (fn r env2 s2 -> done (Expr.ret r) env2 s2)),
-                    Option.none =>
-                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env (queue cx f s) (fn atoms env2 s2 -> done (Expr.call (symbol_of cx.[:unit] f) atoms) env2 s2),
+                    Option.none => {
+                let [target, s0] = self_target cx f args s;
+                call_args cx (Demand.masks cx.[:strict]).[f else 0] args env s0 (fn atoms env2 s2 -> done (Expr.call target atoms) env2 s2)
+                    },
                 }
             } else { unknown () }
         },
@@ -2174,7 +2311,7 @@ let forcing_params mask todo current again keep env s k = match todo {
 let translate : :any -> :integer -> :atom -> St -> St;
 let translate cx f how s = {
     let fr = image.func cx.[:img] f;
-    let symbol = if how == :caf { once_symbol cx f } else { symbol_of cx.[:unit] f };
+    let symbol = if how == :caf { once_symbol cx f } else if how == :linear { linear_symbol cx f } else { symbol_of cx.[:unit] f };
     let [params, s1] = fresh_many (image.Func.arity fr) s;
     let [caps, s2] = fresh_many (image.Func.captures fr) s1;
     let name = image.string cx.[:img] (image.Func.name fr);
@@ -2182,13 +2319,18 @@ let translate cx f how s = {
     let captures = list.fold (fn m [i, v] -> m.[i => Atom.var v]) %{} (list.enumerate caps);
     let env = Env.make slots captures %{} [];
     let place = [name, image.func_source cx.[:img] f, image.func_line cx.[:img] f, image.func_col cx.[:img] f];
-    let cx1 = cx |> (fn c -> c.[:name => name]) |> (fn c -> c.[:place => place])
+    let lin = if how == :function || how == :linear { linear_slot cx f } else { Option.none };
+    let cx0 = match lin {
+        Option.some(sl) => cx.[:lin_f => f].[:lin_slot => sl].[:linear_mode => how == :linear],
+        Option.none => cx,
+    };
+    let cx1 = cx0 |> (fn c -> c.[:name => name]) |> (fn c -> c.[:place => place])
                  |> (fn c -> c.[:pure => not (may_effect cx.[:img] f)]);
     // What every path forces is forced first, so that the body knows it has it: a test of what
     // is evaluated then goes away, and what is built from it can be built now.
-    let wanted = if how == :function { (Demand.masks cx.[:strict]).[f else 0] } else { 0 };
+    let wanted = if how == :function || how == :linear { (Demand.masks cx.[:strict]).[f else 0] } else { 0 };
     let indices = list.filter (fn i -> i < 60 && (wanted >> i) & 1 == 1) (list.range 0 (list.length params));
-    let self_symbol = symbol_of cx.[:unit] f;
+    let self_symbol = symbol;
     let [self_var, s2a] = fresh s2;
     let has_self = not (list.is_empty caps) && not (list.is_empty indices);
     let again = fn current -> {
@@ -2198,7 +2340,7 @@ let translate cx f how s = {
     let [forced_body, s3] = forcing_params wanted indices params again (if has_self { [self_var] } else { [] }) env s2a
         (fn env1 s21 -> tail cx1 (image.Func.body fr) env1 s21);
     let body = if has_self { Expr.bind self_var Rhs.self_closure forced_body } else { forced_body };
-    let func_ = Function.make symbol symbol how (image.Func.flags fr & image.func_impure != 0) params caps body name
+    let func_ = Function.make symbol symbol (if how == :linear { :function } else { how }) (image.Func.flags fr & image.func_impure != 0) params caps body name
         (list.append place [0]);
     St.set_functions (list.cons func_ (St.functions s3)) s3
 };
