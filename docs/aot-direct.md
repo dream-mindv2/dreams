@@ -310,12 +310,17 @@ that "close to C++" is a number.
    for the collector, as any other is.
 
    A direct loop building the `maps` benchmark's half a million keys: 230 ms to 146, the collector
-   copying 31 MB where it copied 160. The benchmark itself is a `list.fold` over a range, which a
-   release build's supercompiler fuses into a loop of its own (`<fused range>`), forcing the
-   accumulator with a `force` statement before the call, which counts as the forcing: 274 ms to
-   197 there. A build without the supercompiler calls `list.fold` with a closure and is unchanged;
-   specializing a known lambda into the library's loops is what would carry it there, and arrays
-   and records written the same way are the rest.
+   copying 31 MB where it copied 160. The benchmark itself is a `list.fold` over a range with a
+   lambda, which `fuse.dr` makes a loop of its own (`<fused range>`) in every build, the lambda in
+   it, forcing the accumulator with a `force` statement before the call -- which counts as the
+   forcing: 273 ms to 199. In native `dreams` 46 functions are loops written so, and a
+   self-compile spends 4% less CPU.
+
+   What the compiler's own maps are mostly not: a group by (`acc.[k => list.cons x (acc.[k else
+   []])]`, 29 in the compiler and std), whose new value reads the old map, which wants the read
+   made before the write; and a map inside a state record threaded through a pass
+   (`St.set_natives ((St.natives s).[k => v]) s`, 95 in the compiler), where what is linear is the
+   record. Arrays and records written in place are the same work again.
 
    What `recs` spends now is the list around the records -- `list.map`'s suspension of each
    element and of the rest, which `list.forced` then walks -- about as much as the arithmetic.
