@@ -278,7 +278,12 @@ that "close to C++" is a number.
      `DREAM_GC_FULL=1` makes every collection major, to measure against.
 
    Pin candidates are sorted by radix now, not Shell's sort: a collection that landed in a deep
-   recursion read 1.3 million words, and sorting them was most of `strs`.
+   recursion read 1.3 million words, and sorting them was most of `strs`. And a minor collection
+   takes as candidates only the words into the nursery, since nothing old moves: the compiler's
+   deep recursions had thousands into its old chunks at every collection, sorted to pin nothing
+   (3% of a self-compile's CPU). A census waits for the shared region to grow by 256 MB rather
+   than 32 (`DREAM_CENSUS_MIN_MB`): a self-compile ran two, each a major collection of every
+   process and a mark of the region, for 2% of its CPU, and its peak was higher for them.
 
    | bench | before | after | C++ |
    |---|---|---|---|
