@@ -111,23 +111,35 @@ let start name g = Gen.set_label name (emit (name + ":") g) |> Gen.set_ptrs %{} 
 
 /// The context, as a name this block may use: `%p`, until something has been called that may
 /// have parked, and then the worker's own as the thread holds it -- the process may have been
-/// resumed on another (dreams/docs/aot-direct.md, "Moving"). Read once a block.
+/// resumed on another (dreams/docs/aot-direct.md, "Moving").
 ///
-/// The read says it reads only memory nothing here can see, which is what the slot is: it
-/// changes only inside a call, and every call this code makes may write such memory, so it
-/// is read again after each. Written as a side effect it was a write of all memory as far as
-/// LLVM knew, and a float boxed and then read back on the other side of it was looked at
-/// again -- its info loaded and tested -- where the store was in plain sight.
+/// The context lives in a slot of the function's own (`%ctxs`, made in `header`): `%p` at entry,
+/// and what the thread holds stored there after each call that may have parked
+/// (`may_have_moved`). LLVM makes the slot a value of each block, so that where no such call was
+/// made on the way -- a force whose slow path was not taken -- it is `%p`, and the heap pointer
+/// in it may stay in a register across the join. Read from the thread in every block after a
+/// call anywhere before, it was a load of the heap pointer through a pointer LLVM could not
+/// tell was the same at each allocation.
 let ctx_of : Gen -> [:string, Gen];
 let ctx_of g = if not (Gen.moved g) { ["%p", g] } else if Gen.pcur g != "" { [Gen.pcur g, g] } else {
-    let [v, g1] = instr "call i64 asm \"movq %fs:0x70, $0\", \"=r\"() nounwind memory(inaccessiblemem: read)" g;
+    let [v, g1] = instr "load i64, ptr %ctxs" g;
     [v, Gen.set_pcur v g1]
 };
 
-/// After a call that may have parked: the context is to be read again. On aarch64 a process in
-/// direct style stays on the worker it first ran on, and `%p` stays good.
+/// After a call that may have parked: the context read again from the thread, and kept in the
+/// slot. On aarch64 a process in direct style stays on the worker it first ran on, and `%p`
+/// stays good.
+///
+/// The read says it reads only memory nothing here can see, which is what the thread's slot
+/// is: it changes only inside a call, and every call this code makes may write such memory.
+/// Written as a side effect it was a write of all memory as far as LLVM knew, and a float
+/// boxed and then read back on the other side of it was looked at again -- its info loaded
+/// and tested -- where the store was in plain sight.
 let may_have_moved : Gen -> Gen;
-let may_have_moved g = if Gen.direct g && Gen.arch g != 1 { g |> Gen.set_moved true |> Gen.set_pcur "" } else { g };
+let may_have_moved g = if Gen.direct g && Gen.arch g != 1 {
+    let [v, g1] = instr "call i64 asm \"movq %fs:0x70, $0\", \"=r\"() nounwind memory(inaccessiblemem: read)" g;
+    emit (str.concat_all ["  store i64 ", v, ", ptr %ctxs"]) g1 |> Gen.set_moved true |> Gen.set_pcur v
+} else { g };
 
 /// The symbol of a function of the runtime.
 let rt_symbol : Gen -> :string -> :string;
@@ -1607,7 +1619,8 @@ let core_within e !budget = if budget < 0 { budget } else {
 
 let header : :string -> :string;
 let header symbol = str.concat_all ["define internal tailcc i64 ", symbol, "(i64 %p, i64 %sp0, i64 %a, i64 %b, i64 %c, i64 %d) {\nentry:\n",
-    "  %pp = inttoptr i64 %p to ptr\n  %spp = inttoptr i64 %sp0 to ptr\n  %ap = inttoptr i64 %a to ptr\n"];
+    "  %pp = inttoptr i64 %p to ptr\n  %spp = inttoptr i64 %sp0 to ptr\n  %ap = inttoptr i64 %a to ptr\n",
+    "  %ctxs = alloca i64\n  store i64 %p, ptr %ctxs\n"];
 
 /// Close the function being generated, and start none.
 let finish : :string -> Gen -> Gen;

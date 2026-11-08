@@ -213,6 +213,8 @@ let primitive cx name args s = match name {
             ["ult", [a, b]] => widened (str.concat_all ["icmp ult i64 ", a, ", ", b]) s1,
             ["ule", [a, b]] => widened (str.concat_all ["icmp ule i64 ", a, ", ", b]) s1,
             ["ushr", [a, b]] => binary "lshr" a b s1,
+            // A map's slot is the popcount of its bitmap below the bit (`map_find!`).
+            ["popcount", [a]] => instr (str.concat_all ["call i64 @llvm.ctpop.i64(i64 ", a, ")"]) s1,
             ["udiv", [a, b]] => binary "udiv" a b s1,
             ["urem", [a, b]] => binary "urem" a b s1,
             ["fadd", [a, b]] => float_op "fadd" a b s1,
@@ -788,7 +790,7 @@ let to_ir img arch = {
 /// A C function's declaration, for each of the ones a unit called.
 let declarations : :map -> :integer -> [:string];
 let declarations imports arch = list.append
-    ["declare double @llvm.fabs.f64(double)\n", if arch == 1 { "declare void @llvm.aarch64.hint(i32)\n" } else { "declare void @llvm.x86.sse2.pause()\n" }]
+    ["declare double @llvm.fabs.f64(double)\ndeclare i64 @llvm.ctpop.i64(i64)\n", if arch == 1 { "declare void @llvm.aarch64.hint(i32)\n" } else { "declare void @llvm.x86.sse2.pause()\n" }]
     (list.map (fn [symbol, shape] -> match shape {
         :variadic => "declare i32 @snprintf(ptr, i64, ptr, ...)\n",
         :strtod => "declare double @strtod(ptr, ptr)\n",

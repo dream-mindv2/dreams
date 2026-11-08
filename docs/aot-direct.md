@@ -220,6 +220,31 @@ that "close to C++" is a number.
      `asm sideeffect` it was a write of all memory as far as LLVM knew, and a store just made was
      loaded again on the other side of it.
 
+   Then three that every program has (the same day):
+
+   - **The context in a slot of each function's own** (`%ctxs`, `machine.ctx_of`): `%p` stored at
+     entry, the thread's value stored after each call that may have parked, and LLVM's mem2reg
+     makes the joins. Read again from the thread in every block after any such call, the heap
+     pointer was loaded through a pointer LLVM could not tell was the same one at each allocation.
+   - **Collections spaced at three times what survived** (rt `collect!`), as the VM's majors are;
+     at twice it, a heap that only grows was copied half a byte for every byte made.
+   - **x86-64-v2 as the target CPU** (`aot_object.cpp`), and `prim.popcount` as `llvm.ctpop`: a
+     map's slot is a popcount of its bitmap, which on the first x86-64 was a dozen instructions
+     at every level a lookup went down.
+
+   | bench | before | after | C++ |
+   |---|---|---|---|
+   | tree | 121 | 102 | 106 |
+   | maps | 405 | 363 | 40 |
+   | sorts | 349 | 271 | 62 |
+   | recs | 77 | 44 | 5 |
+   | strs | 117 | 86 | 27 |
+
+   `maps` is what is furthest: a map path-copied as it is built is a new branch at every level
+   for every insert, and the whole of it copied at every collection, where C++ writes one table
+   in place. A collector with a nursery, and a map written in place where it is used linearly
+   (as a trunk is), are what would close it.
+
    What `recs` spends now is the list around the records -- `list.map`'s suspension of each
    element and of the rest, which `list.forced` then walks -- about as much as the arithmetic.
    A strict map, a loop over an array or a trunk that writes as it goes, is what C++'s 5 ms is.
