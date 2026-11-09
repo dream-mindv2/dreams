@@ -2146,8 +2146,14 @@ let dcall symbol self args env sp g = {
 /// comes after the arguments past the third are read: below `sp` they are words, not a frame,
 /// and the collector reads the stack from `sp` as frames, while what is in hand is where it
 /// reads conservatively.
-let dsafepoint : :string -> :string -> Gen -> Gen;
-let dsafepoint self sp g = {
+///
+/// Its stop path, for a function whose arguments are all in registers, is the runtime's (`stop_d!`),
+/// which calls the function again from the top once it has done what was asked. A function with
+/// more than three keeps the stop path in line and goes on from where it was: called again, it
+/// would read its arguments past the third again from below `sp`, where the collector neither
+/// reads nor moves them and a yield writes its bridge -- `22_ml` came back with a float that was not.
+let dsafepoint : :string -> :string -> :integer -> Gen -> Gen;
+let dsafepoint self sp extra g = {
     let asm_ = if Gen.arch g == 1 { "call i64 asm \"mov $0, sp\", \"=r\"()" } else { "call i64 asm \"movq %rsp, $0\", \"=r\"()" };
     let [here, g0] = instr asm_ g;
     let [guard_ptr, g0b] = pointer_at "%p" 16 g0;
@@ -2156,20 +2162,27 @@ let dsafepoint self sp g = {
     let [stop, g3] = label_of "stop" g2;
     let [go_on, g4] = label_of "go" g3;
     let g5 = start stop (emit (str.concat_all ["  br i1 ", asked, ", label %", stop, ", label %", go_on]) g4);
-    // What a call again on another segment needs that the registers do not say: which function,
-    // and where its stack stood (`segment_call!`).
+    // What a call again needs that the registers do not say: which function, and where its stack
+    // stood (`segment_call!`).
     let g5a = store_at "%p" 24 (str.concat_all ["ptrtoint (ptr ", self, " to i64)"]) g5;
     let g5b = store_at "%p" 32 "%sp0" g5a;
-    let [r, g6] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g5b "entry_d!", "(", args_text ["%p", sp, "%a", "%b", "%c", "%d"], ")"]) g5b;
-    let g7 = or_failing r (may_have_moved g6);
-    // Run to its end on a segment of its own: that is the answer.
-    let [ctx, g8] = ctx_of g7;
-    let [ran, g9] = load_at ctx 808 g8;
-    let [elsewhere, g10] = instr (str.concat_all ["icmp ne i64 ", ran, ", 0"]) g9;
-    let [answer, g11] = label_of "ran" g10;
-    let g12 = start answer (emit (str.concat_all ["  br i1 ", elsewhere, ", label %", answer, ", label %", go_on]) g11);
-    let g13 = store_at ctx 808 "0" g12;
-    start go_on (emit ("  ret i64 " + r) g13)
+    if extra == 0 {
+        // The rest is `stop_d!`'s, and the way on from here knows nothing was called: the context
+        // is still `%p`.
+        let [r, g6] = instr (str.concat_all ["musttail call tailcc i64 ", rt_symbol g5b "stop_d!", "(", args_text ["%p", sp, "%a", "%b", "%c", "%d"], ")"]) g5b;
+        start go_on (emit ("  ret i64 " + r) g6)
+    } else {
+        let [r, g6] = instr (str.concat_all ["call tailcc i64 ", rt_symbol g5b "entry_d!", "(", args_text ["%p", sp, "%a", "%b", "%c", "%d"], ")"]) g5b;
+        let g7 = or_failing r (may_have_moved g6);
+        // Run to its end on a segment of its own: that is the answer.
+        let [ctx, g8] = ctx_of g7;
+        let [ran, g9] = load_at ctx 808 g8;
+        let [elsewhere, g10] = instr (str.concat_all ["icmp ne i64 ", ran, ", 0"]) g9;
+        let [answer, g11] = label_of "ran" g10;
+        let g12 = start answer (emit (str.concat_all ["  br i1 ", elsewhere, ", label %", answer, ", label %", go_on]) g11);
+        let g13 = store_at ctx 808 "0" g12;
+        start go_on (emit ("  ret i64 " + r) g13)
+    }
 };
 
 /// The shim under a function's own symbol: the direct body called, and its answer given to the
@@ -2214,7 +2227,7 @@ let function_d f g = {
         [m.[v => loaded], st1]
     }) [env1, g2] (list.enumerate captures);
     let [sp, g4a] = sp_past (8 * extra) g3;
-    let g4 = dsafepoint (direct_symbol symbol) sp g4a;
+    let g4 = dsafepoint (direct_symbol symbol) sp extra g4a;
     let g6 = if how == :function { dexpr (core.Function.body f) env2 sp g4 } else { updating (core.Function.body f) captures env2 sp g4 };
     let g7 = drain_d (finish (direct_symbol symbol) (emit (str.concat_all ["; ", core.Function.name f]) g6));
     let g8 = shim symbol extra (g7 |> Gen.set_lines [] |> Gen.set_label "entry");
@@ -2295,7 +2308,7 @@ let thunk_once_d f g = {
         let [loaded, st1] = load_at "%a" (8 * (i + 1)) st;
         [m.[v => loaded], st1]
     }) [%{}, g0] (list.enumerate captures);
-    let g2 = dsafepoint (direct_symbol osym) "%sp0" g2a;
+    let g2 = dsafepoint (direct_symbol osym) "%sp0" 0 g2a;
     let g3 = dexpr (core.Function.body f) env "%sp0" g2;
     let g4 = drain_d (finish (direct_symbol osym) (emit (str.concat_all ["; ", core.Function.name f, " (entered once)"]) g3));
     let g5 = shim osym 0 (g4 |> Gen.set_lines [] |> Gen.set_label "entry");

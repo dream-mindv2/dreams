@@ -1996,7 +1996,10 @@ let record_made cx n atoms env s k = {
     let shown = if variant { list.drop (list.length parts - 2) parts } else { list.drop (list.length parts - 1) parts };
     let [type_atom, s00] = intern_atom (list.head shown) s0;
     let s1 = St.set_records ((St.records s00).[id => [type_atom, str.join_str "." shown]]) s00;
-    let made = Rhs.alloc "record" (list.append [Atom.word (fixnum_word (list.length atoms)), Atom.word (immediate_word 3 id)] atoms);
+    // The word after the fields is the record's identity, given the first time a map hashes
+    // it (`record_identity!` in mind/std/rt/main.dr), and zero until then.
+    let made = Rhs.alloc "record" (list.concat [[Atom.word (fixnum_word (list.length atoms)), Atom.word (immediate_word 3 id)],
+                                                atoms, [Atom.word "0"]]);
     // Every field evaluated -- a field typed as a scalar is strict, so a record of `:float`s
     // is made so -- and they may all be floats: then it is made as their bits (`record_raw!`),
     // which a field read in arithmetic takes as it lies.

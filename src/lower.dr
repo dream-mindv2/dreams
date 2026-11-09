@@ -3384,9 +3384,13 @@ let rec emit_const v l =
         :atom    => const_atom (atom.name v) l,
         :list    => const_seq :make_list (list.map (fn x -> x) v) l,
         :array   => const_seq :make_array (array.to_list v) l,
+        // A map's pairs come out in the order its keys hash, and an atom hashes
+        // by its index in the runtime that made it -- the VM's or a native
+        // compiler's -- so they are written sorted by what each key prints as,
+        // and an image is the same bytes whichever ran the `comp`.
         :map     => const_seq :make_map
-                        (list.concat (map (fn kv -> [list.nth 0 kv, list.nth 1 kv])
-                                               (map.pairs v))) l,
+                        (list.concat (list.sort_on (fn kv -> to_string (type_of (list.head kv)) + " " + to_string (list.head kv))
+                                                   (map.pairs v))) l,
         _ => match types.record_id v {
             () => emit_leaf :unit l,
             id => const_record (atom.name id) (types.record_fields v) (types.is_variant v) l,

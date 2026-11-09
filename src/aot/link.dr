@@ -130,12 +130,17 @@ let i64_at s i = {
 let cstr_at : :string -> :integer -> :string;
 let cstr_at s from = str.slice from (str.find_from from "\0" s - from) s;
 
+/// The object's sections. An object of 65,280 sections or more says how many, and which holds their
+/// names, in section 0 rather than in its header (ELF's extended numbering), which an object of
+/// comdats -- three sections a function -- reaches: then the header's count is 0 and its index of
+/// the names is `SHN_XINDEX`.
 let sections : :string -> [Section];
 let sections obj = {
     let table = u64_at obj 40;
     let entry = u16_at obj 58;
-    let count = u16_at obj 60;
-    let names = u64_at obj (table + u16_at obj 62 * entry + 24);
+    let count = if u16_at obj 60 == 0 { u64_at obj (table + 32) } else { u16_at obj 60 };
+    let names_at = if u16_at obj 62 == shn_xindex { u32_at obj (table + 40) } else { u16_at obj 62 };
+    let names = u64_at obj (table + names_at * entry + 24);
     list.map (fn i -> {
         let h = table + i * entry;
         let kind = u32_at obj (h + 4);
@@ -146,15 +151,25 @@ let sections obj = {
     }) (list.range 0 count)
 };
 
+/// The object's symbols, each's section a section's number or, for what is in none of them --
+/// `SHN_ABS`, `SHN_COMMON` -- `reserved_base` past the code. A symbol in a section numbered past what
+/// sixteen bits reserve says `SHN_XINDEX`, and its section is in the `SHT_SYMTAB_SHNDX` table beside
+/// the symbols, a word each.
 let symbols : [Section] -> [Symbol];
 let symbols ss = match list.filter (fn s -> Section.kind s == sht_symtab) ss {
     [] => [],
     [table, .._] => {
         let names = Section.bytes ss.[Section.link table];
         let b = Section.bytes table;
+        let wide = match list.filter (fn s -> Section.kind s == sht_symtab_shndx && Section.link s == Section.index table) ss {
+            [x, .._] => Section.bytes x,
+            [] => "",
+        };
         list.map (fn i -> {
             let o = i * 24;
-            Symbol.make (cstr_at names (u32_at b o)) (u16_at b (o + 6)) (u64_at b (o + 8)) (u8_at b (o + 4) / 16 != 0)
+            let raw = u16_at b (o + 6);
+            let shndx = if raw == shn_xindex { u32_at wide (i * 4) } else if raw >= shn_loreserve { reserved_base + raw } else { raw };
+            Symbol.make (cstr_at names (u32_at b o)) shndx (u64_at b (o + 8)) (u8_at b (o + 4) / 16 != 0)
         }) (list.range 0 (Section.size table / 24))
     },
 };
@@ -288,6 +303,8 @@ let no_part : MergedPart;
 let no_part = MergedPart.make 0 (array.of_list []) (array.of_list []) %{} %{} %{} [] 0 0;
 
 let shn_loreserve = 65280;
+let shn_xindex = 65535;
+let sht_symtab_shndx = 18;
 
 /// What a reserved section number of an object -- `SHN_ABS`, `SHN_COMMON` -- is once merged: moved
 /// past every real one. The objects of a native program have more sections between them than
@@ -304,7 +321,9 @@ let merged_part machine base ybase parsed = {
     let offsets = fn from sizes -> list.reverse (list.head (list.fold (fn [acc, at] n -> [list.cons at acc, at + n]) [[], from] sizes));
     let section_base = offsets base (list.map (fn r -> list.length r.[1]) parsed);
     let symbol_base = offsets ybase (list.map (fn r -> list.length r.[2]) parsed);
-    let moved = fn sb n -> if n == 0 { 0 } else if n >= shn_loreserve { reserved_base + n } else { sb + n };
+    // What `symbols` made `reserved_base` and past is no section's; anything else is one of this
+    // object's, numbered after the objects before it.
+    let moved = fn sb n -> if n == 0 { 0 } else if n >= reserved_base { n } else { sb + n };
     let symbols_ = list.concat (list.map (fn [r, sb] -> list.map (fn sym -> Symbol.set_shndx (moved sb (Symbol.shndx sym)) sym) r.[2])
         (list.zip parsed section_base));
     let defined = list.fold (fn m [i, sym] ->

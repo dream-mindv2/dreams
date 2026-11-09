@@ -73,7 +73,7 @@ let written! ir out payload interp = {
 /// every program the suites build -- four megabytes, most of it the runtime and the library --
 /// was still one, nine seconds of LLVM on one core where eight parts take two.
 let parts_for : :string -> :integer;
-let parts_for ir = num.min 32 (1 + len ir / 524288);
+let parts_for ir = num.min 256 (1 + len ir / 524288);
 
 /// `objects`, each written to `DREAMS_AOT_KEEP_OBJECTS/part-N.o` first when that is set, for the
 /// linker to be timed by itself.
