@@ -2442,7 +2442,7 @@ let first_atoms = ["integer", "float", "char", "bool", "unit", "string", "atom",
 
 /// A whole program as IR: `user`'s entry, with what it reaches of the library and the
 /// runtime, or everything that stopped it.
-let to_ir : image.Image -> image.Image -> image.Image -> :integer -> :bool -> Result :string [:string];
+let to_ir : image.Image -> image.Image -> image.Image -> :integer -> :bool -> Result [:string] [:string];
 let to_ir user lib rt arch direct = {
     let entry = image.Image.entry user;
     let [lib_names, native_arity, lib_arity, wanted] = library_setting lib rt;
@@ -2452,7 +2452,7 @@ let to_ir user lib rt arch direct = {
 
 /// The program on the library already translated and written (`lib_part`): only its own code is
 /// translated, numbered on from where the library's ended.
-let to_ir_from : image.Image -> image.Image -> image.Image -> :integer -> LibPart -> Result :string [:string];
+let to_ir_from : image.Image -> image.Image -> image.Image -> :integer -> LibPart -> Result [:string] [:string];
 let to_ir_from user lib rt arch part = {
     let entry = image.Image.entry user;
     let [lib_names, native_arity, lib_arity, _] = library_setting lib rt;
@@ -2552,7 +2552,7 @@ let names_of st lib_names unit_ = list.fold (fn m name -> m.["@lib_" + name => "
     (map.keys (core.St.needed_lib st));
 
 /// The program translated, with the runtime and `part`, written.
-let finished : image.Image -> core.St -> :map -> image.Image -> :integer -> :bool -> LibPart -> Result :string [:string];
+let finished : image.Image -> core.St -> :map -> image.Image -> :integer -> :bool -> LibPart -> Result [:string] [:string];
 let finished user st lib_names rt arch direct part = {
     let entry = image.Image.entry user;
     let natives = map.keys (core.St.natives st);
@@ -2735,7 +2735,9 @@ let direct_stack_of natives = if list.any deep_c natives { 8388608 } else { 2621
 let deep_c : :string -> :bool;
 let deep_c name = list.any (fn prefix -> str.starts_with prefix name) ["ffi_", "tls_", "t_gpu", "net_connect"];
 
-let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :bool -> LibPart -> :string;
+/// The module's text, in the pieces it is written as, each one or more whole top-level items: the
+/// cutter takes them as they are (`parts.tops_of_pieces`), and nothing joins them all.
+let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :bool -> LibPart -> [:string];
 let assemble user st unit_ lib_names entry arch direct part = {
     // The atoms the dialect asked for by name are numbered with the rest.
     let st_with = list.fold (fn s1 name -> list.nth 1 (core.intern_atom name s1)) st (dialect.Unit.atoms unit_);
@@ -2808,7 +2810,7 @@ let assemble user st unit_ lib_names entry arch direct part = {
             str.concat_all ["  %r = call tailcc i64 @u", to_string entry, "(", args_text (list.concat [["%p", "%sp", "0"], args, pad]), ")\n"]
         },
         "  ret i32 0\n}\n"];
-    str.concat_all (list.concat [
+    list.concat [
         [str.concat_all ["target triple = \"", dialect.triple_of arch, "\"\n"], dialect.start_text arch, "declare void @__libc_start_main()\n",
          "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n",
          "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n",
@@ -2830,5 +2832,5 @@ let assemble user st unit_ lib_names entry arch direct part = {
         ["; dream: cached\n", dialect.Unit.text unit_, LibPart.text part, "; dream: end cached\n"],
         list.reverse (Gen.code g),
         [main_],
-    ])
+    ]
 };

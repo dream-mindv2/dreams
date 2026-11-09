@@ -39,11 +39,38 @@ let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
 let name_after_at : :string -> :integer -> :string;
 let name_after_at s at = str.slice (at + 1) (str.span name_bytes (at + 1) s - at - 1) s;
 
+/// The IR's top-level items, in order, from the pieces it was written as: whatever cuts it, a
+/// piece is whole items. Most pieces are one function, its text the item's own and not a copy
+/// cut from the whole: joined first and cut again, the compiler's 1.2 GB of IR was four copies of
+/// itself at once, and every line of it scanned.
+let tops_of_pieces : [:string] -> [Top];
+let tops_of_pieces pieces = {
+    let [acc, _] = list.fold (fn [acc, cached] piece -> tops_in piece cached acc) [[], false] pieces;
+    list.reverse acc
+};
+
 /// The text's top-level items, in order.
 let tops_of : :string -> [Top];
-let tops_of ir = {
+let tops_of ir = list.reverse (list.head (tops_in ir false []));
+
+/// The items of `ir` onto `acc`, last first, the kept section entered or not as `cached` says,
+/// and whether it is at the end.
+let tops_in : :string -> :bool -> [Top] -> [[Top], :bool];
+let tops_in ir cached0 acc0 = {
     let n = str.byte_length ir;
-    let rec go !i !cached !acc = if i >= n { list.reverse acc } else {
+    let close = str.find "\n}\n" ir;
+    if str.starts_with "define " ir && close == n - 3 {
+        // One function, the piece itself.
+        let at = str.find "@" ir;
+        let name = if at < 0 { "" } else { name_after_at ir at };
+        [list.cons (Top.make ir name :function "" cached0) acc0, cached0]
+    } else { items_in ir n cached0 acc0 }
+};
+
+/// `tops_in`, a line at a time.
+let items_in : :string -> :integer -> :bool -> [Top] -> [[Top], :bool];
+let items_in ir n cached0 acc0 = {
+    let rec go !i !cached !acc = if i >= n { [acc, cached] } else {
         let eol = str.upto "\n" i ir;
         let line = str.slice i (eol - i) ir;
         if str.starts_with "define " line {
@@ -72,7 +99,7 @@ let tops_of ir = {
             }
         }
     };
-    go 0 false []
+    go 0 cached0 acc0
 };
 
 /// `text` with the linkage of the definition it starts with made `hidden`.
@@ -209,9 +236,31 @@ let inlinable name t =
 /// continuation it has written before as an alias of the first, and in `dreams` that was 107,000
 /// aliases of a few dozen functions, all in the part with them; LLVM's GlobalOpt took three
 /// minutes over that part alone.
-let parts_of : :string -> :integer -> [Part];
+let parts_of : [:string] -> :integer -> [Part];
 let parts_of ir units_asked = {
-    let tops = list.to_array (tops_of ir);
+    let plan = plan_of ir units_asked;
+    list.map (fn u -> part_of plan u) (list.range 0 (Plan.all plan))
+};
+
+/// What every part is written from, worked out once from all of the IR: its items, the aliases
+/// renamed away, where each name is defined, the header and the names in each of its lines, and
+/// which items each part holds. The parts are then written each by itself (`part_of`), in the
+/// process that compiles it, from this one value shared with all of them: written in turn by
+/// one process, they were 90 seconds of a native self-compile and every one of them held at once.
+group Plan {
+    tops : :array, renames : :map, defined_at : :map, header : :string, header_names : [[:any]],
+    declared : :map, units : :integer, all : :integer, members : :map,
+}
+
+/// Part `u` of `plan`.
+let part_of : Plan -> :integer -> Part;
+let part_of plan u =
+    part_text (Plan.tops plan) (Plan.renames plan) (Plan.defined_at plan) (Plan.header plan) (Plan.header_names plan)
+        (Plan.declared plan) u (u >= Plan.units plan) ((Plan.members plan).[u else []]);
+
+let plan_of : [:string] -> :integer -> Plan;
+let plan_of ir units_asked = {
+    let tops = list.to_array (tops_of_pieces ir);
     let count = len tops;
     let renames = alias_targets (list.of_array tops);
     let defined_at = list.fold (fn m i -> if Top.name tops.[i] != "" { m.[Top.name tops.[i] => i] } else { m }) %{} (list.range 0 count);
@@ -250,7 +299,8 @@ let parts_of ir units_asked = {
     }) [%{}, 0, 0, 0, 0] (list.range 0 count);
     // The header's lines with the names each one has, read once for every part to choose from.
     let header_names = list.map (fn t -> [Top.text t, map.keys (names_in (Top.text t))]) headers;
-    list.map (fn u -> part_text tops renames defined_at header header_names declared u (u >= units) (list.reverse members.[u else []])) (list.range 0 all)
+    Plan.make tops renames defined_at header header_names declared units all
+        (list.fold (fn m [u, ms] -> m.[u => list.reverse ms]) %{} (map.pairs members))
 };
 
 let max a b = if a > b { a } else { b };

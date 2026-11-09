@@ -61,10 +61,10 @@ let loader! () = match file.read! "/proc/self/exe" {
 };
 
 /// `ir` made an executable at `out`: its size, or what stopped it.
-let written! : :string -> :string -> :string -> :string -> Result :integer [:string];
+let written! : [:string] -> :string -> :string -> :string -> Result :integer [:string];
 let written! ir out payload interp = {
     // The IR, for a debugger: built with clang it has the symbols this writer omits.
-    match os.env! "DREAMS_AOT_KEEP_IR" { () => (), path => file.write! path ir };
+    match os.env! "DREAMS_AOT_KEEP_IR" { () => (), path => file.write! path (str.concat_all ir) };
     object_and_link! ir out payload interp
 };
 
@@ -72,8 +72,8 @@ let written! ir out payload interp = {
 /// compiler's 700 MB was one part, on one core, for twenty minutes; and at one for each 16 MB,
 /// every program the suites build -- four megabytes, most of it the runtime and the library --
 /// was still one, nine seconds of LLVM on one core where eight parts take two.
-let parts_for : :string -> :integer;
-let parts_for ir = num.min 256 (1 + len ir / 524288);
+let parts_for : [:string] -> :integer;
+let parts_for ir = num.min 256 (1 + list.fold_strict (fn !n piece -> n + len piece) 0 ir / 524288);
 
 /// `objects`, each written to `DREAMS_AOT_KEEP_OBJECTS/part-N.o` first when that is set, for the
 /// linker to be timed by itself.
@@ -88,13 +88,13 @@ let after_keeping! objects = {
 
 /// `parts_for`, or as many as `DREAMS_AOT_PARTS` says: a small program in several parts is how
 /// splitting and linking them again is tested.
-let parts_asked! : :string -> :integer;
+let parts_asked! : [:string] -> :integer;
 let parts_asked! ir = match os.env! "DREAMS_AOT_PARTS" {
     () => parts_for ir,
     n => match num.parse_int n { Option.some(k) if k >= 1 => k, _ => parts_for ir },
 };
 
-let object_and_link! : :string -> :string -> :string -> :string -> Result :integer [:string];
+let object_and_link! : [:string] -> :string -> :string -> :string -> Result :integer [:string];
 let object_and_link! ir out payload interp = match objects! ir opt_level (parts_asked! ir) {
     Result.error(why) => Result.error ["LLVM refused what was generated: " + why],
     Result.ok([objects, kept]) => match linked! (link.Options.make interp ["libm.so.6", "libc.so.6"] payload (os.env! "DREAMS_AOT_SYMBOLS" != ()))
@@ -160,41 +160,52 @@ let chosen! name = match name {
     },
 };
 
-/// Where native builds keep what they made once: `DREAMS_AOT_CACHE`, none when it is empty or `0`,
-/// or `$XDG_CACHE_HOME/dream/aot`, or `~/.cache/dream/aot` -- where `vm.llvm_objects!` keeps
-/// compiled parts too (dream/src/aot_object.cpp).
 /// The objects of `ir` in up to `units` parts, and how many of them, at the end, are kept parts
 /// (`parts.parts_of`). Built native, through LLVM as a library (`std.llvm`); on the VM, through the
 /// VM's own, which is linked into it for the JIT, unless `DREAMS_AOT_FFI` asks for the library.
-let objects! : :string -> :integer -> :integer -> Result [[:string], :integer] :string;
+let objects! : [:string] -> :integer -> :integer -> Result [[:string], :integer] :string;
 let objects! ir level units = if native_build || os.env! "DREAMS_AOT_FFI" != () { library_objects! ir level units }
-    else { vm.llvm_objects! ir level units };
+    else { vm.llvm_objects! (str.concat_all ir) level units };
 
 /// Whether this compiler was itself built native.
 let native_build : :bool;
 when native { let native_build = true; }
 when not native { let native_build = false; }
 
-/// `objects!` through `std.llvm`: the parts compiled twelve at a time, a process each, and a kept
-/// part read from the cache when this text was compiled before by this LLVM at this level.
-let library_objects! : :string -> :integer -> :integer -> Result [[:string], :integer] :string;
+/// `objects!` through `std.llvm`: the parts written and compiled twelve at a time, a process each,
+/// and a kept part read from the cache when this text was compiled before by this LLVM at this
+/// level. What the parts are written from is worked out once and put in the shared area
+/// (`vm.share!`), so that each process reads it where it lies rather than taking a copy of the
+/// whole IR: this is a build that runs once, and the shared area lasts as long as the runtime.
+let library_objects! : [:string] -> :integer -> :integer -> Result [[:string], :integer] :string;
 let library_objects! ir level units = {
     let trace = os.env! "DREAMS_AOT_TRACE" != ();
+    // Traced, the translation is made to finish first, which is otherwise forced by the plan.
+    if trace {
+        let translating = vm.now_ns! ();
+        let bytes = list.fold_strict (fn !n piece -> n + str.byte_length piece) 0 ir;
+        console.error! (str.concat_all ["aot: translated, ", to_string bytes, " bytes of IR in ", to_string (list.length ir),
+            " pieces, by ", to_string ((vm.now_ns! () - translating) / 1000000), " ms more"]);
+    };
     let started = vm.now_ns! ();
-    let cut = list.forced (parts.parts_of ir units);
-    let kept = list.length (list.filter parts.Part.cached cut);
-    if trace { console.error! (str.concat_all ["aot: cut into ", to_string (list.length cut), " parts, ", to_string kept, " kept, in ",
+    let plan0 = parts.plan_of ir units;
+    strict! plan0
+    let plan = vm.share! plan0;
+    let all = parts.Plan.all plan;
+    let kept = all - parts.Plan.units plan;
+    if trace { console.error! (str.concat_all ["aot: planned ", to_string all, " parts, ", to_string kept, " kept, in ",
         to_string ((vm.now_ns! () - started) / 1000000), " ms"]); };
-    // `DREAMS_AOT_KEEP_PARTS=DIR`: each part's text as `DIR/part-N.ll`.
-    match os.env! "DREAMS_AOT_KEEP_PARTS" {
-        () => (),
-        dir => strict! (list.map (fn! [i, part] -> file.write! (str.concat_all [dir, "/part-", to_string i, ".ll"]) (parts.Part.text part)) (list.enumerate cut)),
-    }
     let version = llvm.version! ();
     let dir = aot_cache! ();
+    // `DREAMS_AOT_KEEP_PARTS=DIR`: each part's text as `DIR/part-N.ll`.
+    let keep = os.env! "DREAMS_AOT_KEEP_PARTS";
     let compiling = vm.now_ns! ();
-    let made = proc.map_limit! 12 (fn! part -> part_object! dir version level part) cut;
-    if trace { console.error! (str.concat_all ["aot: compiled in ", to_string ((vm.now_ns! () - compiling) / 1000000), " ms"]); };
+    let made = proc.map_limit! 12 (fn! u -> {
+        let part = parts.part_of plan u;
+        match keep { () => (), d => file.write! (str.concat_all [d, "/part-", to_string u, ".ll"]) (parts.Part.text part) };
+        part_object! dir version level part
+    }) (list.range 0 all);
+    if trace { console.error! (str.concat_all ["aot: written and compiled in ", to_string ((vm.now_ns! () - compiling) / 1000000), " ms"]); };
     match list.filter (fn r -> not (Result.is_ok r)) made {
         [Result.error(why), ..] => Result.error why,
         _ => Result.ok [list.map (fn r -> Result.unwrap_or "" r) made, kept],
@@ -228,6 +239,9 @@ let part_object! dir version level part = {
     }
 };
 
+/// Where native builds keep what they made once: `DREAMS_AOT_CACHE`, none when it is empty or `0`,
+/// or `$XDG_CACHE_HOME/dream/aot`, or `~/.cache/dream/aot` -- where `vm.llvm_objects!` keeps
+/// compiled parts too (dream/src/aot_object.cpp).
 let aot_cache! : () -> :string | :unit;
 let aot_cache! () = match os.env! "DREAMS_AOT_CACHE" {
     () => match os.env! "XDG_CACHE_HOME" {
@@ -279,7 +293,7 @@ let build! bytes out lib_bytes rt_bytes target_name = match chosen! target_name 
             Result.ok(img) => if is_dialect img {
                 match dialect.to_ir img arch {
                     Result.error(why) => Result.error why,
-                    Result.ok(ir) => written! ir out "" interp,
+                    Result.ok(ir) => written! [ir] out "" interp,
                 }
             } else {
                 match [image.read lib_bytes, image.read rt_bytes] {

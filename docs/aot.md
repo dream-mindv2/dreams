@@ -36,6 +36,22 @@ Three decisions were made by asking:
 The VM's nodes are a program to be analysed, not a template to expand. Flags
 such as `STRICT` and hints such as `ITYP` are inputs to the analyses.
 
+Where the objects come from depends on what runs the compiler. On the VM they are the VM's
+LLVM's, the one linked in for the JIT (`vm.llvm_objects!`, dream/src/aot_object.cpp). A
+`dreams` built native has no VM to ask, and reaches LLVM through its C API and `std.ffi`
+(mind/std/src/llvm.dr; `DREAMS_AOT_FFI=1` takes that path on the VM too, which is how
+`just test-aot-llvm-library` tests it). The library it loads is the toolchain's
+`libdream_llvm.so`, in the installation's `lib`: the VM's own static LLVM linked a second time
+as just the C functions `std.llvm` names, needing nothing but the C library
+(`dream_llvm` in dream/CMakeLists.txt). Failing that, a system LLVM 19 to 21 (`$DREAM_LIB_LLVM`).
+
+The IR is the program's pieces as translation wrote them -- one function to most -- and through
+`std.llvm` never one string (the VM's native takes it joined): the splitter reads its items from
+them (`parts.tops_of_pieces`), works
+out once what every part is written from (`parts.Plan`), shares that (`vm.share!`), and each
+of twelve processes writes a part from it and compiles it. Joined first and then cut, the
+compiler's 1.2 GB of IR was four copies of itself at once and 90 seconds of one process.
+
 ## What a build keeps
 
 A native program is mostly the runtime and the library, and those are the same in every
