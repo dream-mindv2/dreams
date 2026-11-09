@@ -3305,6 +3305,36 @@ let rec has_unknowns t = match t {
     _ => false,
 };
 
+/// Every unsigned declaration, with the type its body says it has: what `dreams
+/// --suggest-signatures` prints, as the start of a signature for a person to
+/// finish. The parameters are `:any` -- nothing here knows what a caller
+/// passes -- and the answer is what the walk found, `answer_type`'s, after a
+/// few rounds of `inferring`, so that a function calling another unsigned one
+/// sees what that one answers. `[source, span, name, shown]` each.
+let suggestions : modules.Loader -> scope.Resolution -> [[:any]];
+let suggestions l r = {
+    let [k0, _] = prepared l r %{};
+    let bodies = scope.bodies r;
+    let rec rounds k n = if n == 0 { k } else {
+        match inferring k (list.map (fn b -> list.nth 1 (check_decl_inferring k b [])) bodies) {
+            () => k,
+            k2 => rounds k2 (n - 1),
+        }
+    };
+    let k = rounds k0 3;
+    Option.values (list.map (fn b -> {
+        let [mi, source, d, _] = b;
+        let n = scope.decl_name d;
+        let signed = match gi_of k mi n { () => true, gi => (Checker.sigs k).[gi else ()] != () };
+        if signed || scope.is_hidden_name n || named_body (scope.decl_body d) != () { Option.none } else {
+            let own = list.nth 1 (check_decl_inferring k b []);
+            let any_arrow = list.fold (fn t _ -> Ty.arrow :any t) :any (scope.decl_params d);
+            let t = match own { [_, found] => found, _ => any_arrow };
+            Option.some [source, scope.decl_span d, n, show t]
+        }
+    }) bodies)
+};
+
 /// The checker for the second check: every unsigned global the first check
 /// learnt something about, used as what its body answers. A global already
 /// in `uses` keeps what is there -- a signature, or what its `comp` came to

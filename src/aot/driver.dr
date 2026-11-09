@@ -20,6 +20,7 @@ import std.str;
 import std.vm;
 import std.wire;
 
+import dreams.aot.core;
 import dreams.aot.dialect;
 import dreams.aot.image;
 import dreams.aot.link;
@@ -281,6 +282,57 @@ let lib_part! lib rt lib_bytes rt_bytes arch = match aot_cache! () {
     },
 };
 
+/// `machine.to_ir_from`, the program's functions written a chunk to a process
+/// (`machine.chunks_of`) from a start shared with all of them, and the stages timed and reported
+/// apart when `DREAMS_AOT_TRACE` asks.
+let program_ir! : image.Image -> image.Image -> image.Image -> :integer -> machine.LibPart -> Result [:string] [:string];
+let program_ir! user lib rt arch part = {
+    let trace = os.env! "DREAMS_AOT_TRACE" != ();
+    let started = vm.now_ns! ();
+    let [lib_names, native_arity, lib_arity, _] = machine.library_setting lib rt;
+    let st = core.program %{"u" => user, "l" => lib} [["u", image.Image.entry user, :function]] lib_names native_arity lib_arity (machine.LibPart.st part);
+    if trace {
+        strict! (core.St.functions st)
+        console.error! (str.concat_all ["aot: core translation, ", to_string (list.length (core.St.functions st)), " functions, in ",
+            to_string ((vm.now_ns! () - started) / 1000000), " ms"]);
+    };
+    match machine.unit_checked st rt arch part {
+        Result.error(why) => Result.error why,
+        Result.ok(unit_) => {
+            let writing = vm.now_ns! ();
+            let g0 = machine.gen_start st unit_ lib_names arch true part;
+            let chunks = machine.chunks_of st part;
+            let outs = match chunks {
+                [one] => [machine.written g0 one],
+                _ => {
+                    // The start, which every process reads, put in the shared area; each chunk
+                    // forced and copied to its process, so that its copy dies with it -- shared,
+                    // the whole program's functions stayed there for the rest of the build, and
+                    // the native self-compile peaked at 22 GB. Handed over as they were made, a chunk
+                    // was a suspension of everything it was cut from, the translation's state
+                    // with it, and copying that went half a million frames deep.
+                    strict! g0
+                    strict! chunks
+                    let shared = vm.share! g0;
+                    proc.map_limit! 16 (fn! c -> {
+                        // Written here, not where it is next read.
+                        let out = machine.written shared c;
+                        strict! out
+                        out
+                    }) chunks
+                },
+            };
+            let pieces = machine.assembled user st unit_ (image.Image.entry user) arch true part g0 outs;
+            if trace {
+                strict! pieces
+                console.error! (str.concat_all ["aot: text written in ", to_string (list.length chunks), " chunks in ",
+                    to_string ((vm.now_ns! () - writing) / 1000000), " ms"]);
+            };
+            Result.ok pieces
+        },
+    }
+};
+
 /// Write `bytes`, an image, to `out` as an executable, given the two images that are
 /// the runtime: how to get those is the caller's, since it means building a program.
 let build! : :string -> :string -> :any -> :any -> :any -> Result :integer [:string];
@@ -302,7 +354,7 @@ let build! bytes out lib_bytes rt_bytes target_name = match chosen! target_name 
                     // measure against while the two both exist.
                     [Result.ok(lib), Result.ok(rt)] => match (if os.env! "DREAMS_AOT_CPS" != () { machine.to_ir img lib rt arch false } else {
                         match lib_part! lib rt lib_bytes rt_bytes arch {
-                            Result.ok(part) => machine.to_ir_from img lib rt arch part,
+                            Result.ok(part) => program_ir! img lib rt arch part,
                             Result.error(why) => Result.error why,
                         }
                     }) {

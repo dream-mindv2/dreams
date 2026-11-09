@@ -13,6 +13,7 @@
 
 import std.list;
 import std.map;
+import std.num;
 import std.str;
 
 import dreams.aot.core;
@@ -2553,8 +2554,15 @@ let names_of st lib_names unit_ = list.fold (fn m name -> m.["@lib_" + name => "
 
 /// The program translated, with the runtime and `part`, written.
 let finished : image.Image -> core.St -> :map -> image.Image -> :integer -> :bool -> LibPart -> Result [:string] [:string];
-let finished user st lib_names rt arch direct part = {
-    let entry = image.Image.entry user;
+let finished user st lib_names rt arch direct part = match unit_checked st rt arch part {
+    Result.ok(unit_) => Result.ok (assemble user st unit_ lib_names (image.Image.entry user) arch direct part),
+    Result.error(why) => Result.error why,
+};
+
+/// The runtime the program is linked with, or what the program asks of it that it has not got,
+/// and what translating it refused.
+let unit_checked : core.St -> image.Image -> :integer -> LibPart -> Result dialect.Unit [:string];
+let unit_checked st rt arch part = {
     let natives = map.keys (core.St.natives st);
     // The whole runtime, in the same order for every program, so that its text is the same and
     // its compiled parts are had again from the cache (`aot_objects` in dream/src/aot_object.cpp)
@@ -2571,7 +2579,7 @@ let finished user st lib_names rt arch direct part = {
     let missing = list.map (fn r -> "the runtime has no `" + r + "`")
         (list.filter (fn r -> not (map.has r (dialect.Unit.symbols unit_))) (list.append runtime_roots natives));
     match list.concat [list.reverse (core.St.refused st), dialect.Unit.refused unit_, missing] {
-        [] => Result.ok (assemble user st unit_ lib_names entry arch direct part),
+        [] => Result.ok unit_,
         why => Result.error (list.unique why),
     }
 };
@@ -2739,18 +2747,75 @@ let deep_c name = list.any (fn prefix -> str.starts_with prefix name) ["ffi_", "
 /// cutter takes them as they are (`parts.tops_of_pieces`), and nothing joins them all.
 let assemble : image.Image -> core.St -> dialect.Unit -> :map -> :integer -> :integer -> :bool -> LibPart -> [:string];
 let assemble user st unit_ lib_names entry arch direct part = {
+    let g0 = gen_start st unit_ lib_names arch direct part;
+    assembled user st unit_ entry arch direct part g0 (list.map (fn c -> written g0 c) (chunks_of st part))
+};
+
+// --- the program's functions, written in chunks --------------------------------------------
+//
+// Writing the program's functions was one fold through every one of them, a minute of the
+// native self-compile on one core. What one function's text takes from those before it is
+// little: the counter symbols are numbered from (`next`), and the bodies, continuations and
+// out-of-line `seq`s already written, which are only ever found again by what they are. So the
+// functions are cut into chunks, each written from the same start by itself -- the driver writes
+// them in processes of their own (`driver.written_in_parallel!`) -- with numbers of its own, ten
+// million apart, and a body the same as one in another chunk is written again rather than
+// named. How many chunks depends on the program alone, never on the machine, so that an
+// executable is the same bytes whatever wrote it; a program of a few thousand functions is one,
+// and is written as it always was.
+
+/// What every chunk is written from: nothing written yet, and what every function reads.
+let gen_start : core.St -> dialect.Unit -> :map -> :integer -> :bool -> LibPart -> Gen;
+let gen_start st unit_ lib_names arch direct part = {
+    let names = names_of st lib_names unit_;
+    let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
+        %{} (core.St.functions st);
+    let [once_vars, once_syms] = once_thunks_on (core.St.functions st) (LibPart.once part);
+    Gen.make (LibPart.next part) [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] (if direct { %{} } else { workers })
+        once_vars once_syms 0 %{} %{} direct "" arch false "" %{} %{} []
+};
+
+/// A chunk: the number its symbols start from, and its functions.
+group Chunk { !start : :integer, !functions : [core.Function] }
+
+/// The functions per chunk, about: a chunk is a process's work, and below this the copying
+/// to and from it costs more than it saves.
+let chunk_functions : :integer;
+let chunk_functions = 4096;
+
+/// How far apart the chunks' numbers start: more than any chunk counts to.
+let chunk_stride : :integer;
+let chunk_stride = 10000000;
+
+/// The program's functions in chunks, in order.
+let chunks_of : core.St -> LibPart -> [Chunk];
+let chunks_of st part = {
+    let fns = core.St.functions st;
+    let n = list.length fns;
+    let count = num.min 16 (1 + n / chunk_functions);
+    let each = n / count + 1;
+    let rec cut !i fs acc = if list.is_empty fs { list.reverse acc } else {
+        cut (i + 1) (list.drop each fs) (list.cons (Chunk.make (LibPart.next part + i * chunk_stride) (list.take each fs)) acc)
+    };
+    cut 0 fns []
+};
+
+/// What chunk `c` writes: its data, newest first, and its functions' text, in order.
+let written : Gen -> Chunk -> [[:string], [:string]];
+let written g0 c = {
+    let g = list.fold (fn g1 f -> if Gen.direct g1 { function_d f g1 } else { function f g1 })
+        (Gen.set_next (Chunk.start c) g0) (Chunk.functions c);
+    [Gen.data g, list.reverse (Gen.code g)]
+};
+
+/// The module from the chunks' text, in order: `assemble`, the writing done.
+let assembled : image.Image -> core.St -> dialect.Unit -> :integer -> :integer -> :bool -> LibPart -> Gen -> [[[:string]]] -> [:string];
+let assembled user st unit_ entry arch direct part g outs = {
     // The atoms the dialect asked for by name are numbered with the rest.
     let st_with = list.fold (fn s1 name -> list.nth 1 (core.intern_atom name s1)) st (dialect.Unit.atoms unit_);
     let atom_words = list.map (fn name ->
         str.concat_all ["@aw_", name, " = internal constant i64 ",
                         core.immediate_word 3 (core.St.atoms st_with).[name], "\n"]) (dialect.Unit.atoms unit_);
-    let names = names_of st lib_names unit_;
-    let workers = list.fold (fn m f -> match float_params f { [] => m, mask => m.[core.Function.symbol f => mask] })
-        %{} (core.St.functions st);
-    let [once_vars, once_syms] = once_thunks_on (core.St.functions st) (LibPart.once part);
-    let g0 = Gen.make (LibPart.next part) [] "entry" [] [] [] "null" (dialect.Unit.symbols unit_) names %{} "" [] (if direct { %{} } else { workers })
-        once_vars once_syms 0 %{} %{} direct "" arch false "" %{} %{} [];
-    let g = list.fold (fn g1 f -> if direct { function_d f g1 } else { function f g1 }) g0 (core.St.functions st);
     let strings = list.map (fn [text, symbol] -> string_object symbol text) (map.pairs (core.St.strings st));
     let atom_list = list.sort_on (fn p -> p.[1]) (map.pairs (core.St.atoms st_with));
     let atom_objects = list.map (fn [name, i] -> string_object ("@atom" + to_string i) name) atom_list;
@@ -2826,11 +2891,12 @@ let assemble user st unit_ lib_names entry arch direct part = {
         floats,
         closures,
         [atom_count, atom_table, types_table, display_table, world, cafs_table, tick_text, worker_text (dialect.Unit.symbols unit_).["worker_loop!"] (dialect.Unit.symbols unit_).["pool_loop!"], tls_text, stacks_text (dialect.Unit.symbols unit_).["run_process!"] arch, cold_text (dialect.Unit.symbols unit_), callback_text (dialect.Unit.symbols unit_).["cb_enter!"] arch],
-        Gen.data g,
+        // Newest first, as one fold through every function left it.
+        list.concat (list.reverse (list.map list.head outs)),
         // Between these, the runtime: the same text for every program, which the splitter puts in
         // parts of its own and compiles once (`aot_objects`, "Parts kept").
         ["; dream: cached\n", dialect.Unit.text unit_, LibPart.text part, "; dream: end cached\n"],
-        list.reverse (Gen.code g),
+        list.concat (list.map (fn o -> list.nth 1 o) outs),
         [main_],
     ]
 };
