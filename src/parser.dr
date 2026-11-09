@@ -86,9 +86,11 @@ let top = ctx true false 0;
 
 let at_end : [lexer.Token] -> :bool;
 let at_end ts = list.is_empty ts;
+let peek : [lexer.Token] -> :any;
 let peek ts = if at_end ts { () } else { list.head ts };
 let peek_kind : [lexer.Token] -> :atom;
 let peek_kind ts = if at_end ts { :eof } else { lexer.kind (list.head ts) };
+let peek_value : [lexer.Token] -> :any;
 let peek_value ts = if at_end ts { () } else { lexer.value (list.head ts) };
 let peek_span : [lexer.Token] -> ast.Span;
 let peek_span ts =
@@ -119,12 +121,14 @@ let token_continues c t =
 
 /// Keywords are ordinary identifiers that the parser recognises; the lexer has
 /// no idea they are special.
+let keywords : [:string];
 let keywords = ["let", "let?", "priv", "rec", "if", "else", "import", "as", "catch", "true", "false",
                 "not", "try!", "defer!", "fn", "virtual", "derive", "comp", "comp!", "when", "mod",
                 "match", "macro", "expand", "group", "struct", "mapping", "type", "union"];
 
 /// Those that can never begin an expression, so meeting one ends an argument
 /// list. `if`, `fn`, `match` and the rest are missing on purpose: they can.
+let non_starters : [:string];
 let non_starters = ["let", "let?", "priv", "rec", "else", "import", "as", "catch", "virtual", "derive",
                     "when", "mod", "macro", "type", "union"];
 
@@ -133,9 +137,12 @@ let non_starters = ["let", "let?", "priv", "rec", "else", "import", "as", "catch
 /// per candidate, and the parser asks it of every identifier in the program --
 /// it was a tenth of everything the compiler did. A map answers it in one
 /// hash; `comp` builds both sets into the compiler image.
+priv let set_of : :any -> :map;
 priv let set_of names = fold (fn m n -> m.[n => true]) %{} names;
 
+priv let keyword_set : :map;
 priv let keyword_set = comp set_of keywords;
+priv let non_starter_set : :map;
 priv let non_starter_set = comp set_of non_starters;
 
 let is_kw : [lexer.Token] -> :string -> :bool;
@@ -179,6 +186,7 @@ let describe ts =
         }
     };
 
+let expect : [lexer.Token] -> :atom -> :string -> [:any];
 let expect ts k what =
     if at ts k { ok () (list.tail ts) }
     else { err ("expected " + what + ", found " + describe ts) (peek_span ts) };
@@ -190,12 +198,14 @@ let parse_expr c ts = parse_pipe c ts;
 
 /// `x |> f a` feeds `x` in as the last argument. Left-associative, and looser
 /// than every other operator.
+let parse_pipe : Context -> [lexer.Token] -> [:any];
 let rec parse_pipe c ts =
     match parse_binary c 0 ts {
         [:error, m, s] => err m s,
         [:ok, lhs, rest] => pipe_tail c lhs rest,
     };
 
+let pipe_tail : Context -> ast.Expr -> [lexer.Token] -> [:any];
 let rec pipe_tail c lhs ts =
     // No indentation check: `|>` can never begin a statement, so a line that
     // starts with one continues the line above whatever its indentation.
@@ -211,12 +221,14 @@ let rec pipe_tail c lhs ts =
 /// Precedence climbing. Every infix operator but `::` is left-associative,
 /// which is why the right side is parsed at one level tighter; `::` parses its
 /// right side at its own level, so the next `::` joins the right (`ast.right_assoc`).
+let parse_binary : Context -> :integer -> [lexer.Token] -> [:any];
 let rec parse_binary c level ts =
     match parse_unary c ts {
         [:error, m, s] => err m s,
         [:ok, lhs, rest] => binary_tail c level lhs rest,
     };
 
+let binary_tail : Context -> :integer -> ast.Expr -> [lexer.Token] -> [:any];
 let rec binary_tail c level lhs ts = {
     // As with the pipe: an infix operator cannot start a statement, so meeting
     // one always continues the expression, however the line is indented.
@@ -243,6 +255,7 @@ let rec binary_tail c level lhs ts = {
 
 /// A leading `-`, `~` or `not`. Each binds tighter than any infix operator
 /// and looser than application, so `not f x` is `not (f x)`.
+let parse_unary : Context -> [lexer.Token] -> [:any];
 let rec parse_unary c ts = {
     let start = peek_span ts;
     let op = match peek_kind ts {
@@ -263,6 +276,7 @@ let rec parse_unary c ts = {
 /// Application is juxtaposition, and binds tighter than every operator: the
 /// arguments are however many postfix expressions follow, so `fac n - 1` is
 /// `(fac n) - 1`.
+let parse_apply : Context -> [lexer.Token] -> [:any];
 let rec parse_apply c ts =
     match parse_postfix c ts {
         [:error, m, s] => err m s,
@@ -282,10 +296,12 @@ let rec parse_apply c ts =
     };
 
 /// `e?`, as many times as it is written: see "`?`" below.
+let question_tail : ast.Expr -> [lexer.Token] -> [:any];
 let rec question_tail e ts =
     if at ts :question { question_tail [:question, e, peek_span ts] (list.tail ts) }
     else { ok e ts };
 
+let gather_args : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec gather_args c !acc ts =
     if not (can_start_arg c ts) { ok acc ts }
     else {
@@ -297,6 +313,7 @@ let rec gather_args c !acc ts =
 
 /// Can the next token begin another argument? A keyword that cannot start an
 /// expression ends the list, and so does a `{` where a brace means a block.
+let can_start_arg : Context -> [lexer.Token] -> :bool;
 let can_start_arg c ts = {
     let t = peek ts;
     // The old form asked its questions through the peekers -- did the line
@@ -319,12 +336,14 @@ let can_start_arg c ts = {
 
 /// `obj.field`. A `.` at the start of a line continues the expression whatever
 /// its indentation, since a line can never begin with one.
+let parse_postfix : Context -> [lexer.Token] -> [:any];
 let rec parse_postfix c ts =
     match parse_primary c ts {
         [:error, m, s] => err m s,
         [:ok, e, rest] => field_tail c e rest,
     };
 
+let field_tail : Context -> ast.Expr -> [lexer.Token] -> [:any];
 let rec field_tail c e ts =
     if not (at ts :dot) { ok e ts }
     else {
@@ -353,6 +372,7 @@ let rec field_tail c e ts =
 /// `f`, and `xs.[0]` reads one. Inside, the brackets group as every bracket in
 /// the language does. It is postfix, so it binds as tightly as `.field` and
 /// chains the same way: `grid.[y].[x]`.
+let parse_index : Context -> ast.Expr -> [lexer.Token] -> [:any];
 let rec parse_index c e ts =
     match parse_expr (grouped c) ts {
         [:error, m, s] => err m s,
@@ -375,6 +395,7 @@ let rec parse_index c e ts =
 
 /// What follows the `else` of `.[k else d]` or the `=>` of `.[k => v]`, up to
 /// the closing bracket.
+let index_operand : Context -> ast.Expr -> [lexer.Token] -> :any -> [:any];
 let rec index_operand c e ts build =
     match parse_expr (grouped c) ts {
         [:error, m, s] => err m s,
@@ -392,6 +413,7 @@ let rec index_operand c e ts build =
 /// and each `{..}` -- its tokens, lexed in place, and where its `}` is -- must
 /// be exactly one expression. Parsed as if parenthesised, since the braces
 /// already say where it ends.
+let parse_pieces : [:any] -> [:any] -> [:any];
 let rec parse_pieces parts !acc = match parts {
     [] => ok (list.reverse acc) [],
     [part, ..more] =>
@@ -411,6 +433,7 @@ let rec parse_pieces parts !acc = match parts {
         },
 };
 
+let parse_primary : Context -> [lexer.Token] -> [:any];
 let rec parse_primary c ts = {
     let t = peek ts;
     // One peek, once: kind, value and span all come from the token itself,
@@ -447,6 +470,7 @@ let rec parse_primary c ts = {
 };
 
 /// The keywords that begin an expression, and then plain names.
+let parse_ident : Context -> :string -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_ident c word sp rest =
     match word {
         "true" => ok (ast.bool_e true sp) rest,
@@ -477,6 +501,7 @@ let rec parse_ident c word sp rest =
 
 /// `()` is unit; `( e )` is grouping. Inside the brackets newlines stop
 /// ending statements.
+let parse_paren : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_paren c sp ts =
     if at ts :rparen { ok (ast.unit_e (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else {
@@ -491,6 +516,7 @@ let rec parse_paren c sp ts =
     };
 
 /// `[a, b]`, `#[a, b]` -- a comma-separated list, trailing comma allowed.
+let parse_sequence : Context -> ast.Span -> [lexer.Token] -> :atom -> :any -> :string -> [:any];
 let rec parse_sequence c sp ts closer build what =
     match comma_list (grouped c) [] ts closer what {
         [:error, m, s] => err m s,
@@ -500,6 +526,7 @@ let rec parse_sequence c sp ts closer build what =
         [:ok, [items, close], rest] => ok (build items (ast.span_to sp close)) rest,
     };
 
+let comma_list : Context -> [:any] -> [lexer.Token] -> :atom -> :string -> [:any];
 let rec comma_list c !acc ts closer what =
     if at ts closer { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else {
@@ -515,8 +542,10 @@ let rec comma_list c !acc ts closer what =
     };
 
 /// `%{ k => v, .. }`. Keys are forced; values stay lazy.
+let parse_map : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_map c sp ts = map_entries (grouped c) [] ts sp;
 
+let map_entries : Context -> [:any] -> [lexer.Token] -> ast.Span -> [:any];
 let rec map_entries c !acc ts sp =
     if at ts :rbrace { ok (ast.map_e (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else {
@@ -543,6 +572,7 @@ let rec map_entries c !acc ts sp =
     };
 
 /// `$( e )` -- suspends `e`. Newline-insensitive inside, like any bracket.
+let parse_thunk : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_thunk c sp ts =
     match parse_expr (grouped c) ts {
         [:error, m, s] => err m s,
@@ -557,6 +587,7 @@ let rec parse_thunk c sp ts =
 
 /// The condition is parsed with `{` meaning a block, so the brace that follows
 /// opens the branch rather than being read as one more argument.
+let parse_if : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_if c sp ts =
     match parse_expr (no_brace c) ts {
         [:error, m, s] => err m s,
@@ -573,6 +604,7 @@ let rec parse_if c sp ts =
 
 /// `else` continues the expression whatever its indentation, since a line can
 /// never begin with one.
+let parse_else : Context -> ast.Span -> :any -> :any -> [lexer.Token] -> [:any];
 let rec parse_else c sp cond then_e ts =
     if not (is_kw ts "else") { ok (ast.if_e cond then_e () (ast.span_to sp (ast.span then_e))) ts }
     else {
@@ -600,6 +632,7 @@ let rec parse_else c sp cond then_e ts =
 /// `fn a b -> e`, or `fn! a b -> e` for one that may perform effects. The body runs as
 /// far as the grammar allows, so a lambda passed as a non-final argument has to be
 /// parenthesised.
+let parse_lambda : Context -> ast.Span -> [lexer.Token] -> :bool -> [:any];
 let rec parse_lambda c sp ts impure =
     match lambda_params [] ts {
         [:error, m, s] => err m s,
@@ -614,6 +647,7 @@ let rec parse_lambda c sp ts impure =
             },
     };
 
+let lambda_params : [:any] -> [lexer.Token] -> [:any];
 let rec lambda_params !acc ts =
     if at ts :arrow { ok (list.reverse acc) (list.tail ts) }
     else if at ts :ident && not (is_keyword (peek_value ts)) {
@@ -645,6 +679,7 @@ let rec lambda_params !acc ts =
 
 /// `try! { body } catch e { handler }` -- the `catch` and its binder are both
 /// required, which is what makes the error land where the `try!` is.
+let parse_try : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_try c sp ts =
     match expect ts :lbrace "`{` after `try!`" {
         [:error, m, s] => err m s,
@@ -677,6 +712,7 @@ let rec parse_try c sp ts =
 
 /// `comp e` and `comp! e`. Both bind tighter than any operator and looser than
 /// application, so `comp f x` folds the whole call.
+let parse_comp : Context -> :bool -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_comp c impure sp ts =
     match parse_apply c ts {
         [:error, m, s] => err m s,
@@ -689,8 +725,10 @@ let rec parse_comp c impure sp ts =
 // is the last statement, or `()` when it is empty. A block may hold `let`
 // declarations, which scope to the statements after them.
 
+let parse_block : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_block c sp ts = block_stmts (allow_brace (ctx true (ctx_no_brace c) (ctx_indent c))) [] ts sp;
 
+let block_stmts : Context -> [:any] -> [lexer.Token] -> ast.Span -> [:any];
 let rec block_stmts c !acc ts sp =
     if at ts :semi { block_stmts c acc (list.tail ts) sp }
     else if at ts :rbrace {
@@ -709,6 +747,7 @@ let rec block_stmts c !acc ts sp =
     };
 
 /// A statement is a `let` declaration or an expression.
+let parse_statement : Context -> [lexer.Token] -> [:any];
 let rec parse_statement c ts = match peek_kind ts {
     :ident => match peek_value ts {
         "let" => parse_let c (peek_span ts) (list.tail ts),
@@ -722,6 +761,7 @@ let rec parse_statement c ts = match peek_kind ts {
 /// `let name params = body`, with `rec` optional. A block-local `let` that
 /// refers to itself needs `rec`; a top-level one does not, because every
 /// top-level binding is a global and they are all mutually visible.
+let parse_let : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_let c sp ts = {
     let is_rec = is_kw ts "rec";
     let after_rec = if is_rec { list.tail ts } else { ts };
@@ -791,6 +831,7 @@ let rec parse_let c sp ts = {
 /// The name the payload and the passed-on value are held by. Angle brackets
 /// cannot be written, so no name in the program can be it; a nested `let?`
 /// shadows the outer one, which is finished with by then.
+let let_try_name : :string;
 let let_try_name = "<let?>";
 
 /// Where each name the unfolding makes is written: a byte inside the `let?`
@@ -800,10 +841,12 @@ let let_try_name = "<let?>";
 /// bound on this path. Nothing the programmer wrote starts inside the keyword,
 /// so offsets 1 to 3 are free: 1 binds the payload, 2 binds what is passed on
 /// and reads it back (a binder and a use are kept apart), 3 reads the payload.
+let let_try_at : ast.Span -> :integer -> ast.Span;
 let let_try_at span k = [ast.span_start span + k, ast.span_start span + k + 1];
 
 /// Where the names that do not fit inside a keyword are written: in the
 /// generated offsets the keyword's own offset owns (`ast.generated_base`).
+let let_try_far : ast.Span -> :integer -> ast.Span;
 let let_try_far span k = [ast.generated_base + ast.span_start span * 128 + k,
                           ast.generated_base + ast.span_start span * 128 + k + 1];
 
@@ -816,6 +859,7 @@ let let_try_far span k = [ast.generated_base + ast.span_start span * 128 + k,
 /// the `match` it unfolds into starts at the keyword, and a `match` holds its
 /// subject in a slot keyed there, so a `let` starting there too would bind to
 /// the same slot and read itself.
+let parse_let_try : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_let_try c sp ts =
     match parse_let c (peek_span ts) ts {
         [:error, m, s] => err m s,
@@ -829,6 +873,7 @@ let rec parse_let_try c sp ts =
             err "`let?` binds one value: it takes no parameters, `rec` or signature" sp,
     };
 
+let let_try_else : Context -> [lexer.Token] -> :any -> [:any];
 let let_try_else c ts step =
     if not (is_kw ts "else") { ok (step + [()]) ts }
     else {
@@ -840,6 +885,7 @@ let let_try_else c ts step =
 
 /// A block's statements with every `let?` folded into the `match` it means,
 /// or `[:error, m, span]` for one with nothing after it to guard.
+let unfold_let_try : [:any] -> :any -> [:any];
 let rec unfold_let_try stmts end =
     match stmts {
         [] => [],
@@ -899,11 +945,13 @@ let rec unfold_let_try stmts end =
 // above it; and it only runs over a file that has a `?` in it at all.
 
 /// The name a `?`'s value is held by. Angle brackets cannot be written.
+let question_name : ast.Span -> :string;
 let question_name sp = "<?" + to_string (ast.span_start sp) + ">";
 
 /// `e` with each `?` in a position evaluated whenever `e` is replaced by the
 /// name of its value: `[e, steps]`, the steps reversed, each the `let?` that
 /// binds one. Everything else is left as it is.
+let hoist : ast.Expr -> [:any] -> [:any];
 let rec hoist e !steps = match e {
     [:question, inner, sp] => {
         let [held, before] = hoist inner steps;
@@ -957,6 +1005,7 @@ let rec hoist e !steps = match e {
     _ => [e, steps],
 };
 
+let hoist_all : [ast.Expr] -> [:any] -> [:any];
 let rec hoist_all es !steps = match es {
     [] => [[], steps],
     [x, ..rest] => {
@@ -967,6 +1016,7 @@ let rec hoist_all es !steps = match es {
 };
 
 /// A body with its `?`s pulled in front of it, as a block when there were any.
+let questions_body : ast.Expr -> ast.Expr;
 let questions_body e = {
     let done = questions e;
     let [held, steps] = hoist done [];
@@ -982,6 +1032,7 @@ let questions_body e = {
 /// A block's statements, each with its `?`s pulled in front of it. A `let`
 /// of no parameters is a statement whose value is pulled from; one with
 /// parameters is a function, whose body owns its own.
+let questions_block : [:any] -> ast.Span -> :any;
 let questions_block stmts span = {
     let stepped = list.concat (map (fn st -> {
         let [st1, steps] = match st {
@@ -1007,6 +1058,7 @@ let questions_block stmts span = {
 /// The module, or an expression, with every `?` pulled out to where it can
 /// answer from. Every node is rebuilt with its children done; the places a
 /// failure is answered -- blocks and bodies -- are where the pulling happens.
+let questions : :any -> :any;
 let rec questions e =
     if type_of e != :list { e }
     else {
@@ -1027,6 +1079,7 @@ let rec questions e =
 
 /// `questions`, but only for text that could hold a `?` at all: a search of
 /// the text is one machine pass, and nearly every file has none.
+let questions_in : :string -> ast.Expr -> ast.Expr;
 let questions_in src e = if str.contains_str "?" src { questions e } else { e };
 
 // --- signatures ---------------------------------------------------------------
@@ -1055,6 +1108,7 @@ let questions_in src e = if str.contains_str "?" src { questions e } else { e };
 // attached to one -- a `let` is the six-element node it always was.
 
 /// `let name params : type ..`, already past the `:`.
+let parse_annotated : Context -> ast.Span -> :string -> [ast.Param] -> :bool -> [lexer.Token] -> [:any];
 let rec parse_annotated c sp name params is_rec ts =
     match parse_type_expr c ts {
         [:error, m, s] => err m s,
@@ -1086,6 +1140,7 @@ let rec parse_annotated c sp name params is_rec ts =
 
 /// The type of a function whose parameters are untyped and whose answer is
 /// `annotation`: one `:any ->` per parameter in front of it.
+let answering : [ast.Param] -> :any -> :any;
 let answering params annotation = {
     let sp = ast.span annotation;
     fold (fn t p -> tagged "fn" [ast.atom_e "any" sp, t] sp) annotation params
@@ -1093,6 +1148,7 @@ let answering params annotation = {
 
 /// Put one parsed item or statement onto a reversed list, splitting a `let`
 /// that carried its own signature into the signature and the `let`.
+let spliced : :any -> [:any] -> [:any];
 let spliced item acc = match item {
     [:sigged, sg, d] => list.cons d (list.cons sg acc),
     _ => list.cons item acc,
@@ -1130,11 +1186,13 @@ let spliced item acc = match item {
 
 /// A description of a kind the parser builds: `[tag, ..parts]`, as a list
 /// expression, which is what `std.types` would have returned.
+priv let tagged : :string -> [:any] -> ast.Span -> ast.Expr;
 priv let tagged tag parts span = ast.list_e (list.cons (ast.atom_e tag span) parts) span;
 
 /// The whole of a type. `where` is last so that it refines everything in
 /// front of it, and its predicate is an *ordinary* expression -- a type
 /// grammar has no way to say `fn n -> n >= 0 && n <= 255`, and should not.
+let parse_type_expr : Context -> [lexer.Token] -> [:any];
 let rec parse_type_expr c ts =
     match parse_type_arrow c ts {
         [:error, m, s] => err m s,
@@ -1154,6 +1212,7 @@ let rec parse_type_expr c ts =
 /// argument answering a function of one argument -- which is what a curried
 /// language means by it, and what `:integer -> :integer -> :integer` says
 /// about a two-argument `min`.
+let parse_type_arrow : Context -> [lexer.Token] -> [:any];
 let rec parse_type_arrow c ts =
     match parse_type_union c ts {
         [:error, m, s] => err m s,
@@ -1171,6 +1230,7 @@ let rec parse_type_arrow c ts =
 /// `a | b | c`, flattened into one union rather than nested pairs: a union of
 /// unions accepts the same values, and one list is what a reader of the data
 /// and `accepts` both expect to find.
+let parse_type_union : Context -> [lexer.Token] -> [:any];
 let rec parse_type_union c ts =
     match parse_type_apply c ts {
         [:error, m, s] => err m s,
@@ -1179,6 +1239,7 @@ let rec parse_type_union c ts =
             else { type_union_tail c [first] rest },
     };
 
+let type_union_tail : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec type_union_tail c !acc ts =
     if not (at ts :bar) {
         let parts = list.reverse acc;
@@ -1195,6 +1256,7 @@ let rec type_union_tail c !acc ts =
 /// Application, as everywhere else in the language: `List :integer` calls the
 /// type function `List`. Its arguments are types, which is what makes a
 /// parameterised type read like the thing it describes.
+let parse_type_apply : Context -> [lexer.Token] -> [:any];
 let rec parse_type_apply c ts =
     match parse_type_postfix c ts {
         [:error, m, s] => err m s,
@@ -1210,6 +1272,7 @@ let rec parse_type_apply c ts =
             },
     };
 
+let gather_type_args : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec gather_type_args c !acc ts =
     if not (type_starts_arg c ts) { ok acc ts }
     else {
@@ -1222,6 +1285,7 @@ let rec gather_type_args c !acc ts =
 /// What can begin another argument. `where` has to end the list even though
 /// it is an ordinary identifier: it is contextual, so that a program is still
 /// free to bind the name everywhere a type is not being written.
+let type_starts_arg : Context -> [lexer.Token] -> :bool;
 let type_starts_arg c ts = {
     let t = peek ts;
     if t == () { false }
@@ -1237,6 +1301,7 @@ let type_starts_arg c ts = {
     }
 };
 
+let parse_type_postfix : Context -> [lexer.Token] -> [:any];
 let rec parse_type_postfix c ts =
     match parse_type_primary c ts {
         [:error, m, s] => err m s,
@@ -1245,6 +1310,7 @@ let rec parse_type_postfix c ts =
 
 /// `types.list_of` and the like: a dotted name reaches a type in another
 /// module, and means there exactly what it means in an expression.
+let type_field_tail : Context -> ast.Expr -> [lexer.Token] -> [:any];
 let rec type_field_tail c e ts =
     if not (at ts :dot) { ok e ts }
     else {
@@ -1268,6 +1334,7 @@ let rec type_field_tail c e ts =
 /// a map keyed by strings) or a *literal* (`%{:host => :string}`, a record with
 /// a field called `:host`). Both are written with the same bracket because
 /// both are maps, and what tells them apart is whether the key names a kind.
+priv let primitive_atoms : [:string];
 priv let primitive_atoms = [
     "any", "never",
     "integer", "float", "char", "bool", "unit", "string", "atom",
@@ -1275,11 +1342,13 @@ priv let primitive_atoms = [
     "pure_fn", "impure_fn", "bigstr", "tensor", "number",
 ];
 
+priv let primitive_atom_set : :map;
 priv let primitive_atom_set = comp set_of primitive_atoms;
 
 /// A single token that stands for a value, which is what a record's key is.
 /// A primitive atom is not one: `:string` names every string, and a map whose
 /// keys are strings is what `%{:string => :integer}` should mean.
+let type_key_is_literal : [lexer.Token] -> :bool;
 let type_key_is_literal ts =
     match peek_kind ts {
         :atom => not (map.has (peek_value ts) primitive_atom_set),
@@ -1287,6 +1356,7 @@ let type_key_is_literal ts =
         _ => false,
     };
 
+let parse_type_primary : Context -> [lexer.Token] -> [:any];
 let rec parse_type_primary c ts = {
     let sp = peek_span ts;
     if at_end ts { err "expected a type" sp }
@@ -1319,6 +1389,7 @@ let rec parse_type_primary c ts = {
 
 /// `( t )` groups, and `()` is the unit value -- which as a type accepts
 /// exactly unit, the same as `:unit`.
+let parse_type_paren : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_type_paren c sp ts =
     if at ts :rparen { ok (ast.unit_e (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else {
@@ -1340,6 +1411,7 @@ let rec parse_type_paren c sp ts =
 ///
 /// What cannot be written is a one-element tuple, since `[t]` has been spent
 /// on the commoner meaning. `types.tuple [t]` is that, spelled out.
+let parse_type_list : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_type_list c sp ts =
     match type_comma_list c [] ts :rbracket "]" {
         [:error, m, s] => err m s,
@@ -1354,6 +1426,7 @@ let rec parse_type_list c sp ts =
 
 /// `#[t]` and `#[a, b]`, which are to an array what the brackets above are to
 /// a list.
+let parse_type_array : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_type_array c sp ts =
     match type_comma_list c [] ts :rbracket "]" {
         [:error, m, s] => err m s,
@@ -1366,6 +1439,7 @@ let rec parse_type_array c sp ts =
         },
     };
 
+let type_comma_list : Context -> [:any] -> [lexer.Token] -> :atom -> :string -> [:any];
 let rec type_comma_list c !acc ts closer what =
     if at ts closer { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else {
@@ -1388,6 +1462,7 @@ let rec type_comma_list c !acc ts closer what =
 /// The question is settled by the first key alone, because a map that mixed
 /// the two would have no reading anybody could predict; a later key of the
 /// wrong sort is an error rather than a second rule.
+let parse_type_map : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_type_map c sp ts =
     if at ts :rbrace {
         ok (tagged "record" [ast.map_e [] (ast.span_to sp (peek_span ts))]
@@ -1397,6 +1472,7 @@ let rec parse_type_map c sp ts =
     else if type_key_is_literal ts { parse_type_record c sp [] ts }
     else { parse_type_map_of c sp ts };
 
+let parse_type_map_of : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_type_map_of c sp ts =
     match type_map_pair (grouped c) ts {
         [:error, m, s] => err m s,
@@ -1415,6 +1491,7 @@ let rec parse_type_map_of c sp ts =
             },
     };
 
+let parse_type_record : Context -> ast.Span -> [:any] -> [lexer.Token] -> [:any];
 let rec parse_type_record c sp !acc ts =
     if at ts :rbrace {
         let span = ast.span_to sp (peek_span ts);
@@ -1438,6 +1515,7 @@ let rec parse_type_record c sp !acc ts =
         }
     };
 
+let type_map_pair : Context -> [lexer.Token] -> [:any];
 let rec type_map_pair c ts =
     match parse_type_expr c ts {
         [:error, m, s] => err m s,
@@ -1462,6 +1540,7 @@ let rec type_map_pair c ts =
 ///
 /// The name is recorded so that a failed check can say which type was
 /// expected rather than quoting the data it expanded to.
+let parse_type : Context -> ast.Span -> [lexer.Token] -> [:any];
 let parse_type c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a name after `type`" (peek_span ts)
@@ -1491,6 +1570,7 @@ let parse_type c sp ts =
 
 /// What can begin the pattern of a destructuring `let`: a list, an array or a
 /// map, a parenthesised pattern, or a constructor -- `let Point(x, y) = p`.
+let starts_let_pattern : [lexer.Token] -> :bool;
 let starts_let_pattern ts =
     at ts :lbracket || at ts :hash_bracket || at ts :percent_brace || at ts :lparen ||
         (at ts :ident && starts_constructor (lexer.value (peek ts)) (peek ts) (list.tail ts));
@@ -1498,6 +1578,7 @@ let starts_let_pattern ts =
 /// `let [a, b] = pair`. Only the shape is read here. Which patterns a `let` may
 /// take is resolution's question, because a pattern that could fail to match
 /// has more to say about itself than a parse error can.
+let parse_let_pattern : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_let_pattern c sp ts =
     match parse_pattern (grouped c) ts {
         [:error, m, s] => err m s,
@@ -1536,6 +1617,7 @@ let rec parse_let_pattern c sp ts =
 /// missing one is an error either way -- but a record body is a list whose
 /// entries may be bare names, so `name` and `age` on two lines have to be two
 /// fields and not one field of one parameter.
+let let_params : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec let_params c !acc ts =
     if at_end ts || not (token_continues c (list.head ts)) { ok (list.reverse acc) ts }
     else if at ts :ident && not (is_keyword (peek_value ts)) {
@@ -1567,11 +1649,13 @@ let rec let_params c !acc ts =
 /// A strict parameter: `!acc`, or `(strict acc)` -- see `ast.strict_param`.
 /// The parenthesised spelling is exactly those four tokens, so `(strict)` and
 /// `(strict, x)` are still the parameter lists they always were.
+let starts_strict_param : [lexer.Token] -> :bool;
 let starts_strict_param ts =
     at ts :bang
     || (at ts :lparen && peek2_kind ts == :ident && peek_value (list.tail ts) == "strict"
         && peek_kind (list.drop 2 ts) == :ident && peek_kind (list.drop 3 ts) == :rparen);
 
+let strict_param : [lexer.Token] -> [:any];
 let strict_param ts =
     if at ts :bang {
         let after = list.tail ts;
@@ -1588,9 +1672,11 @@ let strict_param ts =
 
 /// Can this token begin a parameter that is a pattern? Only a bracketed shape:
 /// a name is already a parameter, and a `(` is the parenthesised list.
+let starts_param_pattern : [lexer.Token] -> :bool;
 let starts_param_pattern ts = at ts :lbracket || at ts :hash_bracket || at ts :percent_brace;
 
 /// A parameter that takes its argument apart: `[a, b]`, `#[a, b]`, `%{ :k => v }`.
+let param_pattern : [lexer.Token] -> [:any];
 let rec param_pattern ts =
     match parse_pattern_atom (grouped top) ts {
         [:error, m, s] => err m s,
@@ -1599,6 +1685,7 @@ let rec param_pattern ts =
 
 /// The inside of `(a, b, c)`, already past the `(`. Each element is a pattern,
 /// and a name or `_` is the parameter it always was.
+let paren_params : [:any] -> [lexer.Token] -> [:any];
 let rec paren_params !acc ts =
     match parse_pattern (grouped top) ts {
         [:error, m, s] => err m s,
@@ -1610,6 +1697,7 @@ let rec paren_params !acc ts =
         },
     };
 
+let param_of : :any -> ast.Param;
 let param_of p =
     match p {
         [:bind, n, sp]  => ast.param n sp,
@@ -1623,6 +1711,7 @@ let param_of p =
 // already the map separator and `{ }` already delimits every other control
 // form, so `match` introduces no new punctuation.
 
+let parse_match : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_match c sp ts =
     match parse_expr (no_brace c) ts {
         [:error, m, s] => err m s,
@@ -1647,6 +1736,7 @@ let rec parse_match c sp ts =
 
 /// `receive! { pattern => body, .., after ms => body }` -- see
 /// `syntax.receive_e`, which is what it becomes.
+let parse_receive : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_receive c sp ts =
     match receive_arms (grouped c) [] ts {
         [:error, m, s] => err m s,
@@ -1658,6 +1748,7 @@ let rec parse_receive c sp ts =
 /// Arms as `match_arms` reads them, and an `after ms => body` that must come
 /// last: `[arms, after or (), close]`. `after` is only that when what follows
 /// it is not `=>` or `if`; otherwise it is a pattern binding a name.
+let receive_arms : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec receive_arms c !acc ts =
     if at ts :rbrace { ok [list.reverse acc, (), peek_span ts] (list.tail ts) }
     else if at_end ts { err "unterminated `receive!`: expected `}`" (peek_span ts) }
@@ -1704,6 +1795,7 @@ let rec receive_arms c !acc ts =
 /// match ..` a declaration whose span covered its header and nothing else --
 /// invisible to anything that asks which declaration an offset is in, which
 /// is macro discovery, the outline, hover and go-to-definition.
+let match_arms : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec match_arms c !acc ts =
     if at ts :rbrace { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else if at_end ts { err "unterminated `match`: expected `}`" (peek_span ts) }
@@ -1726,6 +1818,7 @@ let rec match_arms c !acc ts =
 
 /// `pattern if guard => body`. The guard runs only after the pattern matched,
 /// so it can use what the pattern bound.
+let arm_guard_and_body : Context -> ast.Pattern -> [lexer.Token] -> [:any];
 let rec arm_guard_and_body c pat ts = {
     let guarded = is_kw ts "if";
     match (if guarded { parse_expr (no_brace c) (list.tail ts) } else { ok () ts }) {
@@ -1766,6 +1859,7 @@ let rec parse_pattern c ts =
 
 /// `::` associates right and binds tighter than `as`. Parentheses allow an
 /// alias or another pattern on either side without forcing the list's tail.
+let parse_cons_pattern : Context -> [lexer.Token] -> [:any];
 let rec parse_cons_pattern c ts =
     match parse_pattern_atom c ts {
         [:error, m, s] => err m s,
@@ -1781,6 +1875,7 @@ let rec parse_cons_pattern c ts =
             },
     };
 
+let parse_pattern_atom : Context -> [lexer.Token] -> [:any];
 let rec parse_pattern_atom c ts = {
     let t = peek ts;
     if t == () { err "unexpected end of file in a pattern" ast.no_span }
@@ -1849,6 +1944,7 @@ let rec parse_pattern_atom c ts = {
 /// touch the name so that a parameter list -- `let f P (x as y)` -- reads as
 /// it did. The same spelling declares a variant (`union Shape { circle(radius)
 /// }`), which is the point of choosing it.
+let starts_constructor : :string -> :any -> [lexer.Token] -> :bool;
 let starts_constructor name t rest =
     match peek rest {
         () => false,
@@ -1856,6 +1952,7 @@ let starts_constructor name t rest =
              (is_capitalised name && kind_of n == :lparen && lexer.span_start n == lexer.span_end t),
     };
 
+let is_capitalised : :string -> :bool;
 let is_capitalised name = {
     let c = str.byte 0 name;
     c >= 65 && c <= 90
@@ -1863,6 +1960,7 @@ let is_capitalised name = {
 
 /// The dotted path, as the expression parser would build it -- a `field`'s
 /// span starts where its base does -- then the fields, if there are any.
+let constructor_pattern : Context -> ast.Span -> lexer.Token -> [lexer.Token] -> [:any];
 let rec constructor_pattern c sp t rest = {
     let rec path e ts =
         if not (at ts :dot) { [e, ts] }
@@ -1896,6 +1994,7 @@ let rec constructor_pattern c sp t rest = {
 
 /// `p, q, r)`: the patterns of a constructor's fields, and the `)` that ends
 /// them. Answers `[:ok, fields, span of the paren, rest]`.
+let constructor_fields : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec constructor_fields c !acc ts =
     if at ts :rparen { [:ok, list.reverse acc, peek_span ts, list.tail ts] }
     else {
@@ -1910,8 +2009,10 @@ let rec constructor_fields c !acc ts =
 
 /// `[a, b]`, `[x, ..rest]`, `[x, ..]`. The rest is `()` when the length is
 /// fixed, `[name]` when it is bound, and `[()]` when it is ignored.
+let pattern_sequence : Context -> ast.Span -> [lexer.Token] -> :atom -> :any -> :string -> [:any];
 let rec pattern_sequence c sp ts closer build what = pattern_items c [] ts closer build what sp;
 
+let pattern_items : Context -> [:any] -> [lexer.Token] -> :atom -> :any -> :string -> ast.Span -> [:any];
 let rec pattern_items c !acc ts closer build what sp =
     if at ts closer { ok (build (list.reverse acc) () (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else if at ts :dot_dot {
@@ -1940,8 +2041,10 @@ let rec pattern_items c !acc ts closer build what sp =
     };
 
 /// `%{ :k => p }` -- keys the pattern does not mention are ignored.
+let pattern_map : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec pattern_map c sp ts = pattern_map_entries c [] ts sp;
 
+let pattern_map_entries : Context -> [:any] -> [lexer.Token] -> ast.Span -> [:any];
 let rec pattern_map_entries c !acc ts sp =
     if at ts :rbrace { ok (ast.map_p (list.reverse acc) (ast.span_to sp (peek_span ts))) (list.tail ts) }
     else {
@@ -2053,6 +2156,7 @@ let rec parse_item c ts = {
     }
 };
 
+let parse_record : Context -> :atom -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_record c kind sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a record name" (peek_span ts)
@@ -2092,6 +2196,7 @@ let rec parse_record c kind sp ts =
 /// `union Name {..}`, or `union struct Name {..}` for one whose variants with
 /// fields are arrays. `struct` here is only a word in front of a name, so it
 /// takes no name from anyone.
+let parse_union : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_union c sp ts =
     if at ts :ident && peek_value ts == "struct" && at (list.tail ts) :ident {
         match parse_union_named c sp (list.tail ts) {
@@ -2101,6 +2206,7 @@ let rec parse_union c sp ts =
     }
     else { parse_union_named c sp ts };
 
+let parse_union_named : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_union_named c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a union name" (peek_span ts)
@@ -2120,6 +2226,7 @@ let rec parse_union_named c sp ts =
     };
 
 /// A union's type parameters: plain names, which its fields may use as types.
+let union_params : [:any] -> [lexer.Token] -> [:any];
 let rec union_params !acc ts =
     if at ts :ident && not (is_keyword (peek_value ts)) {
         if str.ends_with "!" (peek_value ts) {
@@ -2129,6 +2236,7 @@ let rec union_params !acc ts =
     }
     else { ok (list.reverse acc) ts };
 
+let union_body : Context -> :string -> [ast.Param] -> ast.Span -> [:any] -> [:any] -> [lexer.Token] -> [:any];
 let rec union_body c name params sp variants members ts =
     if at ts :comma { union_body c name params sp variants members (list.tail ts) }
     else if at ts :rbrace {
@@ -2152,6 +2260,7 @@ let rec union_body c name params sp variants members ts =
 /// One entry: `name`, `name(field : t, ..)`, a member `name params = body`,
 /// or a member's signature `name : type`. A signature and its member share a
 /// name, so each is only checked against its own kind (and the variants).
+let union_entry : Context -> :string -> [:any] -> [:any] -> [lexer.Token] -> [:any];
 let union_entry c name variants members ts =
     if not (at ts :ident) {
         err ("expected a variant, a member or `}` in `" + name + "`, found " + describe ts) (peek_span ts)
@@ -2213,11 +2322,13 @@ let union_entry c name variants members ts =
         }
     };
 
+let union_taken : [:any] -> [:any] -> :any -> :bool;
 let union_taken variants members n =
     list.any (fn v -> ast.variant_name v == n) variants
     || list.any (fn m -> ast.member_name m == n) members;
 
 /// `field : t, field, ..)`, already past the `(`: `[[fields, close], rest]`.
+let variant_fields : Context -> [:any] -> [lexer.Token] -> [:any];
 let rec variant_fields c !acc ts =
     if at ts :rparen { ok [list.reverse acc, peek_span ts] (list.tail ts) }
     else if not (at ts :ident) || is_keyword (peek_value ts) {
@@ -2276,6 +2387,7 @@ let rec variant_fields c !acc ts =
 // embedded "sqlite"`), any expression in parentheses, or nothing, for the
 // running program. Entries are separated as a union's are.
 
+let parse_foreign : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_foreign c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a name for the library after `foreign`" (peek_span ts)
@@ -2296,6 +2408,7 @@ let rec parse_foreign c sp ts =
 
 /// `from "path"`, `from system "name"` (and its version), `from embedded
 /// "name"`, `from (expr)`, or nothing.
+let foreign_library : Context -> [lexer.Token] -> [:any];
 let foreign_library c ts =
     if not (is_kw ts "from") { ok () ts }
     else {
@@ -2350,6 +2463,7 @@ let foreign_library c ts =
         }
     };
 
+let foreign_body : Context -> :string -> :any -> ast.Span -> [:any] -> [lexer.Token] -> [:any];
 let rec foreign_body c name library sp entries ts =
     if at ts :comma { foreign_body c name library sp entries (list.tail ts) }
     else if at ts :rbrace {
@@ -2368,11 +2482,13 @@ let rec foreign_body c name library sp entries ts =
     };
 
 /// The name every kind of entry declares, for telling two apart.
+let foreign_entry_name : ast.Expr -> :string;
 let foreign_entry_name e = list.nth 1 e;
 
 /// `resource Name = destructor`, `struct Name { field : t, .. }`, or a
 /// function: `name : type`, and `= symbol` when the C name is not `name`
 /// without its `!`.
+let foreign_entry : Context -> :any -> [:any] -> [lexer.Token] -> [:any];
 let foreign_entry c lib entries ts =
     if not (at ts :ident) {
         err ("expected a function, `resource`, `struct` or `}` in `" + lib + "`, found " + describe ts)
@@ -2468,6 +2584,7 @@ let foreign_entry c lib entries ts =
 // "formatter"`), or any expression in parentheses (`std.image`'s `any_of`).
 // Unlike a C library there is no default: a program is not a library of itself.
 
+let parse_image : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_image c sp ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err "expected a name for the image after `image`" (peek_span ts)
@@ -2494,6 +2611,7 @@ let rec parse_image c sp ts =
     };
 
 /// What comes after `from` in an `image` block: an expression for the image.
+let image_source : Context -> [lexer.Token] -> [:any];
 let image_source c ts = {
     let sp = peek_span ts;
     let named word = {
@@ -2526,6 +2644,7 @@ let image_source c ts = {
     }
 };
 
+let image_body : Context -> :string -> :any -> ast.Span -> [:any] -> [lexer.Token] -> [:any];
 let rec image_body c name source sp entries ts =
     if at ts :comma { image_body c name source sp entries (list.tail ts) }
     else if at ts :rbrace {
@@ -2545,6 +2664,7 @@ let rec image_body c name source sp entries ts =
 
 /// `name : type`, and `= module.member` when the function is not the image's
 /// top-level `name`.
+let image_entry : Context -> :any -> [:any] -> [lexer.Token] -> [:any];
 let image_entry c img entries ts =
     if not (at ts :ident) || is_keyword (peek_value ts) {
         err ("expected a function or `}` in `" + img + "`, found " + describe ts) (peek_span ts)
@@ -2582,6 +2702,7 @@ let image_entry c img entries ts =
     };
 
 /// A C name: an identifier, or a string for one that is not a Dream identifier.
+let c_symbol : [lexer.Token] -> :any;
 let c_symbol ts = match peek_kind ts {
     :ident => ok [peek_value ts, peek_span ts] (list.tail ts),
     :str => ok [peek_value ts, peek_span ts] (list.tail ts),
@@ -2590,6 +2711,7 @@ let c_symbol ts = match peek_kind ts {
 
 /// `field : t, ..}`, already past the `{`: `[[fields, close], rest]`. Fields
 /// are separated by `,` or a line break, as a record's are.
+let c_struct_fields : Context -> :any -> [:any] -> [lexer.Token] -> [:any];
 let rec c_struct_fields c sname !acc ts =
     if at ts :comma { c_struct_fields c sname acc (list.tail ts) }
     else if at ts :rbrace { ok [list.reverse acc, peek_span ts] (list.tail ts) }
@@ -2617,6 +2739,7 @@ let rec c_struct_fields c sname !acc ts =
 /// A record specializes a behavior just as an ordinary module does, and
 /// `derive dyn path` also makes its values carry what it specialized, for the
 /// base's `dyn` virtuals to dispatch through.
+let record_base : Context -> [lexer.Token] -> [:any];
 let record_base c ts =
     if is_kw ts "derive" {
         let after = list.tail ts;
@@ -2632,6 +2755,7 @@ let record_base c ts =
 /// `dyn` is contextual: a word only before another name, so a module called
 /// `dyn` can still be derived (`derive dyn;`) and a virtual called `dyn` still
 /// declared (`virtual let dyn x`).
+let is_dyn : [lexer.Token] -> :bool;
 let is_dyn ts = is_kw ts "dyn" && at (list.tail ts) :ident;
 
 /// A record body is a list of entries, and it is newline-sensitive for the
@@ -2643,6 +2767,7 @@ let is_dyn ts = is_kw ts "dyn" && at (list.tail ts) :ident;
 ///
 /// Each entry is parsed at its own column, so a default or a member's body may
 /// run over as many lines as it is indented past.
+let record_body : Context -> :atom -> :string -> ast.Span -> [:any] -> [:any] -> [lexer.Token] -> [:any];
 let rec record_body c kind name sp fields members ts =
     if at ts :comma { record_body c kind name sp fields members (list.tail ts) }
     else if at ts :rbrace {
@@ -2662,6 +2787,7 @@ let rec record_body c kind name sp fields members ts =
 
 /// The keyword a backing kind was written with, for a diagnostic that quotes
 /// what the reader typed rather than what the compiler made of it.
+let record_keyword : :atom -> :string;
 let record_keyword kind = match kind { :list => "group", :array => "struct", :map => "mapping" };
 
 /// One entry: a field, a field with a default, or a member.
@@ -2672,6 +2798,7 @@ let record_keyword kind = match kind { :list => "group", :array => "struct", :ma
 /// is a place in a collection and places do not take arguments. So the
 /// parameters are parsed first and the answer follows from whether there were
 /// any -- no lookahead for `=`, and no keyword to introduce either form.
+let record_entry : Context -> :string -> [:any] -> [:any] -> [lexer.Token] -> [:any];
 let rec record_entry c name fields members ts =
     if starts_strict_param ts { strict_record_field c name fields members ts }
     else if not (at ts :ident) {
@@ -2698,6 +2825,7 @@ let rec record_entry c name fields members ts =
 /// map it was made from. A member cannot be strict, since a member is not
 /// stored anywhere; `!` before one is said to be a mistake rather than read as
 /// a field followed by something else.
+let strict_record_field : Context -> :string -> [:any] -> [:any] -> [lexer.Token] -> [:any];
 let strict_record_field c name fields members ts =
     match strict_param ts {
         [:error, m, s] => err m s,
@@ -2716,6 +2844,7 @@ let strict_record_field c name fields members ts =
 
 /// A field, which may be given a default: what reading it answers when the
 /// collection has nothing at that key or position.
+let record_field_entry : Context -> :string -> [:any] -> [:any] -> :any -> :any -> :bool -> [lexer.Token] -> [:any];
 let record_field_entry c name fields members entry at_name strict ts =
     if at ts :colon {
         match parse_type_expr c (list.tail ts) {
@@ -2728,6 +2857,7 @@ let record_field_entry c name fields members entry at_name strict ts =
         }
     } else { record_field_default c name fields members entry at_name strict ts };
 
+let record_field_default : Context -> :string -> [:any] -> [:any] -> :any -> :any -> :bool -> [lexer.Token] -> [:any];
 let record_field_default c name fields members entry at_name strict ts = {
     let param = if strict { ast.strict_param entry at_name } else { ast.param entry at_name };
     if str.ends_with "!" entry {
@@ -2748,6 +2878,7 @@ let record_field_default c name fields members entry at_name strict ts = {
 /// becomes. Its body may name anything that module holds -- the accessors, the
 /// setters, `make`, `new`, another member -- which is the whole point of
 /// writing it there. A default may too (`syntax.record`).
+let record_member_entry : Context -> :string -> [:any] -> [:any] -> :any -> :any -> [ast.Param] -> [lexer.Token] -> [:any];
 let record_member_entry c name fields members entry at_name params ts =
     if taken name fields members entry {
         err ("record member `" + entry + "` conflicts with a generated helper") at_name
@@ -2765,12 +2896,14 @@ let record_member_entry c name fields members entry at_name params ts =
 /// constructors, every field's accessor and setter, and every member so far.
 /// Checking against what came *before* is what blames the later of two names
 /// and leaves the first where it was written.
+let taken : :string -> [:any] -> [:any] -> :any -> :bool;
 let taken name fields members n =
     n == "make" || n == "new" || n == "type"
     || list.any (fn f -> ast.field_name f == n || "set_" + ast.field_name f == n) fields
     || list.any (fn m -> ast.member_name m == n) members;
 
 /// A dotted path: `std.list`. Answers `[segments, rest]`.
+let dotted_path : [:any] -> [lexer.Token] -> [:any];
 let rec dotted_path !acc ts =
     if not (at ts :ident) { err ("expected a module name, found " + describe ts) (peek_span ts) }
     else {
@@ -2787,6 +2920,7 @@ let rec dotted_path !acc ts =
 /// The alias defaults to the last segment. A member list binds the members
 /// unqualified, and each one resolves exactly as `path.name` would -- which is
 /// what stops the two spellings ever disagreeing, including about purity.
+let parse_import : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_import c sp ts =
     match dotted_path [] ts {
         [:error, m, s] => err m s,
@@ -2813,6 +2947,7 @@ let rec parse_import c sp ts =
 
 /// `{ map, filter, sum as total }`
 /// Leave the closing brace for the caller to include in the import's span.
+let import_names : [:any] -> [lexer.Token] -> [:any];
 let rec import_names !acc ts =
     if at ts :rbrace { ok (list.reverse acc) ts }
     else if not (at ts :ident) {
@@ -2832,6 +2967,7 @@ let rec import_names !acc ts =
     };
 
 /// `mod name { items }` -- a module written inside another.
+let parse_mod : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_mod c sp ts =
     if not (at ts :ident) { err ("expected a name after `mod`, found " + describe ts) (peek_span ts) }
     else {
@@ -2847,6 +2983,7 @@ let rec parse_mod c sp ts =
     };
 
 /// `derive shapes.shape;` -- fills the holes a base module declared.
+let parse_derive : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_derive c sp ts =
     match dotted_path [] ts {
         [:error, m, s] => err m s,
@@ -2857,10 +2994,12 @@ let rec parse_derive c sp ts =
 /// it is optional. A virtual needs at least one parameter, because one without
 /// would be a constant rather than a hole. `virtual dyn let` is one that
 /// dispatches on its last argument when called in the module declaring it.
+let parse_virtual : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_virtual c sp ts =
     if is_dyn ts && is_kw (list.tail ts) "let" { parse_virtual_as c sp true (list.tail ts) }
     else { parse_virtual_as c sp false ts };
 
+let parse_virtual_as : Context -> ast.Span -> :bool -> [lexer.Token] -> [:any];
 let rec parse_virtual_as c sp dyn ts =
     match expect ts :ident "`let` after `virtual`" {
         [:error, m, s] => err m s,
@@ -2899,6 +3038,7 @@ let rec parse_virtual_as c sp dyn ts =
 ///
 /// A `when` is resolved before anything is loaded, so an import inside a false
 /// branch is never even followed.
+let parse_when : Context -> ast.Span -> [lexer.Token] -> [:any];
 let rec parse_when c sp ts =
     match parse_cfg_or c ts {
         [:error, m, s] => err m s,
@@ -2921,6 +3061,7 @@ let rec parse_when c sp ts =
 // The condition vocabulary is deliberately the language's own: `&&`, `||`,
 // `not`, parentheses, `true`, `false`, a bare flag, or `setting == "value"`.
 
+let parse_cfg_or : Context -> [lexer.Token] -> [:any];
 let rec parse_cfg_or c ts =
     match parse_cfg_and c ts {
         [:error, m, s] => err m s,
@@ -2934,6 +3075,7 @@ let rec parse_cfg_or c ts =
             },
     };
 
+let parse_cfg_and : Context -> [lexer.Token] -> [:any];
 let rec parse_cfg_and c ts =
     match parse_cfg_unary c ts {
         [:error, m, s] => err m s,
@@ -2947,6 +3089,7 @@ let rec parse_cfg_and c ts =
             },
     };
 
+let parse_cfg_unary : Context -> [lexer.Token] -> [:any];
 let rec parse_cfg_unary c ts =
     if is_kw ts "not" {
         match parse_cfg_unary c (list.tail ts) {
@@ -2980,6 +3123,7 @@ let rec parse_cfg_unary c ts =
     else { err ("expected a `when` condition, found " + describe ts) (peek_span ts) };
 
 /// `a.b.c` in a condition, as `["a.b.c", rest]`.
+let cfg_name : :string -> [lexer.Token] -> [:any];
 let rec cfg_name name ts =
     if at ts :dot && peek_kind (list.tail ts) == :ident {
         cfg_name (name + "." + peek_value (list.tail ts)) (list.tail (list.tail ts))
@@ -2987,6 +3131,7 @@ let rec cfg_name name ts =
     else { [name, ts] };
 
 /// The items of a file, or of a `mod`/`when` body when `braced` is true.
+let item_list : Context -> [:any] -> [lexer.Token] -> :bool -> [:any];
 let rec item_list c !acc ts braced =
     if at ts :semi { item_list c acc (list.tail ts) braced }
     else if braced && at ts :rbrace { ok (list.reverse acc) (list.tail ts) }
@@ -3024,6 +3169,7 @@ let rec item_list c !acc ts braced =
 /// The other direction would lose an expansion silently, which is why the
 /// caller checks that the offsets and the declaration spans agree before
 /// trusting them.
+let expand_sites : :any -> [lexer.Token] -> [:any] -> [lexer.Token];
 let rec expand_sites prev ts !acc = match ts {
     [] => acc,
     [t, ..rest] => {
@@ -3067,6 +3213,7 @@ when test {
     import std.test;
 
     /// An expression's tree, written on one line without spans.
+    let shape : :string -> :any;
     let shape src =
         match parse_expression src {
             Result.ok(e) => ast.show e,
@@ -3074,6 +3221,7 @@ when test {
         };
 
     /// A whole module's items, one line each.
+    let items : :string -> :any;
     let items src =
         match parse_module src {
             [:ok, its, _] => str.join_str " " (list.map (fn i -> ast.show i) its),
@@ -3081,6 +3229,7 @@ when test {
         };
 
     /// The message of a module that must not parse.
+    let fails_module : :string -> :string;
     let fails_module src =
         match parse_module src {
             [:ok, _, _] => "parsed when it should not have",
@@ -3097,6 +3246,7 @@ when test {
     /// nothing else. Anything that asks which declaration an offset is in --
     /// macro discovery, the outline, hover, completion's locals -- was told
     /// that most of this compiler is in no declaration at all.
+    let decl_span : :string -> :any;
     let decl_span src =
         match parse_module src {
             [:ok, [it], _] => ast.span it,
@@ -3104,12 +3254,14 @@ when test {
         };
 
     /// The message of a source that must not parse.
+    let fails : :string -> :string;
     let fails src =
         match parse_expression src {
             Result.ok(e) => "parsed when it should not have",
             Result.error([m, _]) => m,
         };
 
+    let tests : [:any];
     let tests = [
         test.case "a declaration reaches the end of the match that is its body"
             $( test.eq! [0, 36] (decl_span "let f x = match x { 0 => 1, _ => 2 };") ),

@@ -29,15 +29,19 @@ import dreams.aot.parts;
 import dreams.aot.target;
 
 /// The host module a dialect program imports; a build has to be told it exists.
+let primitives : :string;
 let primitives = "rt.prim";
 
 /// What the runtime's Dream half reaches its dialect half through.
+let natives : :string;
 let natives = "rt.native";
 
 /// What a `-O2` is worth keeping out of a debugging session is a later question;
 /// this is the level everything is built at.
+let opt_level : :integer;
 let opt_level = 2;
 
+let default_loader : :string;
 let default_loader = "/lib64/ld-linux-x86-64.so.2";
 
 /// The `PT_INTERP` of an ELF executable, or `()` if it has none.

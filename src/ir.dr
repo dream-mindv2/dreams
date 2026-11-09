@@ -33,6 +33,7 @@ import dreams.ast;
 // missing name rather than a wrong integer. The numbers are the VM's and must
 // not be renumbered: they are what an image stores.
 
+let ops : [[:nop, :integer, :string], [:const_int, :integer, :string], [:const_float, :integer, :string], [:const_str, :integer, :string], [:const_char, :integer, :string], [:const_bool, :integer, :string], [:const_atom, :integer, :string], [:unit, :integer, :string], [:local, :integer, :string], [:capture, :integer, :string], [:global, :integer, :string], [:builtin, :integer, :string], [:field, :integer, :string], [:apply, :integer, :string], [:if, :integer, :string], [:block, :integer, :string], [:bind, :integer, :string], [:make_closure, :integer, :string], [:make_thunk, :integer, :string], [:try, :integer, :string], [:force, :integer, :string], [:add, :integer, :string], [:sub, :integer, :string], [:mul, :integer, :string], [:div, :integer, :string], [:mod, :integer, :string], [:eq, :integer, :string], [:ne, :integer, :string], [:lt, :integer, :string], [:le, :integer, :string], [:gt, :integer, :string], [:ge, :integer, :string], [:and, :integer, :string], [:or, :integer, :string], [:neg, :integer, :string], [:not, :integer, :string], [:make_list, :integer, :string], [:make_array, :integer, :string], [:make_map, :integer, :string], [:get, :integer, :string], [:set, :integer, :string], [:switch_head, :integer, :string], [:switch_atom, :integer, :string], [:type_is, :integer, :string], [:cons, :integer, :string], [:list_tail, :integer, :string], [:list_is_empty, :integer, :string], [:str_chars, :integer, :string], [:error_new, :integer, :string], [:error_kind, :integer, :string], [:error_payload, :integer, :string], [:str_slice, :integer, :string], [:str_find, :integer, :string], [:str_byte, :integer, :string], [:str_le, :integer, :string], [:str_span, :integer, :string], [:str_upto, :integer, :string], [:char_code, :integer, :string], [:char_of_code, :integer, :string], [:to_float, :integer, :string], [:float_bytes, :integer, :string], [:float_of_bytes, :integer, :string], [:to_int, :integer, :string], [:parse_int, :integer, :string], [:parse_float, :integer, :string], [:to_existing_atom, :integer, :string], [:array_new, :integer, :string], [:array_to_list, :integer, :string], [:map_has, :integer, :string], [:map_remove, :integer, :string], [:map_pairs, :integer, :string], [:data_count, :integer, :string], [:data_at, :integer, :string], [:compare, :integer, :string], [:str_interp, :integer, :string], [:band, :integer, :string], [:bor, :integer, :string], [:bxor, :integer, :string], [:bnot, :integer, :string], [:shl, :integer, :string], [:shr, :integer, :string], [:record_make, :integer, :string], [:set_many, :integer, :string], [:ensure, :integer, :string], [:list_is_cons, :integer, :string], [:list_head, :integer, :string]];
 let ops = [
     [:nop, 0, "nop"],
 
@@ -151,8 +152,10 @@ let ops = [
 ];
 
 /// `record_make`'s `c`: the top bit says the id names a variant.
+let record_variant : :integer;
 let record_variant = 2147483648;
 
+priv let nth : :any;
 priv let nth = list.nth;
 
 // The table above is the readable form; these are the three ways it is
@@ -169,11 +172,15 @@ priv let nth = list.nth;
 // `check_expr` before that, and `check_expr` was not the problem.)
 // The tables depend only on the bytecode vocabulary, so build them into the
 // compiler image. Destructuring makes each column's meaning explicit.
+let op_codes : :any;
 let op_codes = comp fold (fn m [op, code, _] -> m.[op => code]) %{} ops;
+priv let op_names : :any;
 priv let op_names = comp fold (fn m [op, _, name] -> m.[op => name]) %{} ops;
+priv let op_of_codes : :any;
 priv let op_of_codes = comp fold (fn m [op, code, _] -> m.[code => op]) %{} ops;
 
 /// The VM's number for an opcode, or `()` if it is not one.
+let opcode : :any -> :any;
 let opcode op = op_codes.[op else ()];
 
 /// The short name an opcode dumps as.
@@ -181,32 +188,43 @@ let op_name : :atom -> :string;
 let op_name op = op_names.[op else "?"];
 
 /// The opcode a number stands for, for reading an image back.
+let op_of_code : :any -> :any;
 let op_of_code n = op_of_codes.[n else ()];
 
 // --- function flags -------------------------------------------------------------
 
+let fn_impure : :integer;
 let fn_impure = 1;
+let fn_rec : :integer;
 let fn_rec = 2;
 /// A parameterless binding: a zero-arity function.
+let fn_thunk : :integer;
 let fn_thunk = 4;
 /// ..and a pure one is a value the VM forces once and remembers, where an
 /// impure one is an action that has to run again on every call.
+let fn_global_value : :integer;
 let fn_global_value = 8;
 
 // --- global flags ---------------------------------------------------------------
 
+let g_exported : :integer;
 let g_exported = 1;
+let g_impure : :integer;
 let g_impure = 2;
 
 /// What a global points at.
+let global_function : :integer;
 let global_function = 0;
+let global_module : :integer;
 let global_module = 1;
 
 /// A module with a hole in it: it declares a virtual nobody filled.
+let m_abstract : :integer;
 let m_abstract = 2;
 
 /// How a capture says where the enclosing frame keeps the value. The high bit
 /// means "in that frame's captures" rather than "in one of its slots".
+let cap_from_capture : :integer;
 let cap_from_capture = 2147483648;
 
 let encode_capture : :bool -> :integer -> :integer;
@@ -216,10 +234,13 @@ let encode_capture from_capture index =
 // --- node flags ------------------------------------------------------------------
 
 /// Must be forced where it appears; its effects are ordered.
+let f_strict : :integer;
 let f_strict = 1;
 /// Performs, or may perform, effects.
+let f_impure : :integer;
 let f_impure = 2;
 /// In tail position of its enclosing function.
+let f_tail : :integer;
 let f_tail = 4;
 
 let has_flag : :integer -> :integer -> :bool;
@@ -230,6 +251,7 @@ let add_flag flags f = if has_flag flags f { flags } else { flags + f };
 /// Sentinel for an absent edge. The VM spells it as an all-ones word; a
 /// distinct atom is safer here, where a stray arithmetic slip on a large
 /// integer would be silent and this is loud.
+let no_node : :none;
 let no_node = :none;
 
 let is_node : :any -> :bool;
@@ -680,12 +702,14 @@ let dump img =
 when test {
     import std.test;
 
+    let built : :any;
     let built = {
         let a = push_node (leaf :unit) program;
         let b = push_node (node :force (nth 1 a) no_node no_node) (list.head a);
         list.head b
     };
 
+    let tests : [:any];
     let tests = [
         test.case "an opcode knows its number and its name"
             $( test.eq! [13, "apply", :apply]

@@ -81,6 +81,7 @@ union Role {
     sink(tag, arity, strict)
 }
 
+let roles : %{"range" => :any, "replicate" => :any, "enumerate" => :any, "zip" => :any, "map" => :any, "filter" => :any, "fold" => :any, "fold_lazy" => :any, "fold_strict" => :any, "sum" => :any, "product" => :any, "any" => :any, "all" => :any, "none" => :any, "find" => :any, "count" => :any, "length" => :any, "reverse" => :any, "concat" => :any, "last" => :any};
 let roles = %{
     // `range from until` counts up to but not including `until`.
     "range" => Role.source :range 2,
@@ -123,6 +124,7 @@ let roles = %{
 /// `map` and `filter` go through a list and keep their elements lazy, as
 /// `std.list`'s do, which is what lets a stage of one be substituted where
 /// its element is read.
+let array_roles : %{"map" => :any, "filter" => :any, "fold" => :any, "sum" => :any, "product" => :any, "any" => :any, "all" => :any, "find" => :any, "count" => :any, "length" => :any};
 let array_roles = %{
     "map" => Role.step :map 2,
     "filter" => Role.step :filter 2,
@@ -138,6 +140,7 @@ let array_roles = %{
 
 /// `std.map`'s: building a map from a list of pairs is a fold whose step
 /// nobody wrote down, as `sum` is.
+let map_roles : %{"from_pairs" => :any};
 let map_roles = %{
     "from_pairs" => Role.sink :pairs 1 false,
 };
@@ -279,6 +282,7 @@ let as_lambda arity e = match e {
 };
 
 /// `fn <0> <1> .. -> e <0> <1> ..`.
+let calling : :any -> :any -> ast.Span -> [:lambda, :any, [:apply, :any, :any, :any], :any];
 let calling arity e sp = {
     let start = ast.span_start sp;
     let names = map (fn i -> "<arg " + to_string i + ">") (list.range 0 arity);
@@ -399,6 +403,7 @@ let uses name e = list.length (filter (fn n -> n == name) (mentioned e));
 /// and `if`, or `-1` when it is built from anything else. One walk answers
 /// both questions this asks, because they are asked together: is this cheap
 /// enough to write down twice, and is it small enough to want to.
+let arith_size : :any -> :any;
 let rec arith_size e =
     match e {
         [:name, _, _] => 1,
@@ -411,9 +416,11 @@ let rec arith_size e =
     };
 
 /// One more than the parts, or `-1` if any part was not arithmetic.
+let grown : :any -> :any;
 let grown parts =
     if list.any (fn n -> n < 0) parts { 0 - 1 } else { 1 + list.sum parts };
 
+let is_literal : :any -> :bool;
 let is_literal e =
     match e {
         [:int, _, _]   => true,
@@ -430,7 +437,9 @@ let is_literal e =
 /// written out more than once may be. Both are judgement rather than theory:
 /// the thing being saved is a cons cell, a tail thunk and a frame, so a couple
 /// of extra multiplications are a bargain and a couple of extra calls are not.
+let max_duplication : :integer;
 let max_duplication = 8;
+let max_repeated_size : :integer;
 let max_repeated_size = 12;
 
 /// Can the loop these stages describe be written out at a sensible size?
@@ -528,6 +537,7 @@ let mentioned e = mentioned_in true e;
 let mentioned_here : ast.Expr -> [:string];
 let mentioned_here e = mentioned_in false e;
 
+let mentioned_in : :any -> :any -> :any;
 let rec mentioned_in deep e =
     match e {
         [:name, n, _] => [n],
@@ -569,6 +579,7 @@ let rec mentioned_in deep e =
         _ => [],
     };
 
+let mentioned_all : :any -> :any -> :any;
 let mentioned_all deep es = list.concat (map (fn e -> mentioned_in deep e) es);
 
 /// A parameter is `[name, span]`, or `[(), span, pattern]` when it is written
@@ -578,6 +589,7 @@ let mentioned_all deep es = list.concat (map (fn e -> mentioned_in deep e) es);
 let param_name_of : ast.Param -> :string;
 let param_name_of p = match list.nth 0 p { () => "", n => n };
 
+let mentioned_stmts : :any -> :any -> :any;
 let rec mentioned_stmts deep stmts =
     list.concat (map (fn st ->
         match st {
@@ -596,6 +608,7 @@ let rec mentioned_stmts deep stmts =
             _ => mentioned_in deep st,
         }) stmts);
 
+let mentioned_arms : :any -> :any -> :any;
 let rec mentioned_arms deep arms =
     list.concat (map (fn a ->
         list.append (pattern_names (list.nth 0 a))
@@ -623,6 +636,7 @@ let rec pattern_names p =
         _ => [],
     };
 
+let rest_name : :any -> [:any] | [:never];
 let rest_name rest = match rest { [n, _] => [n], _ => [] };
 
 // --- a stage that was given a name -------------------------------------------
@@ -674,6 +688,7 @@ let stmt_binds st =
 /// The distinction is the whole point of counting. `mentioned` of a `let`
 /// includes the name being defined, so a binding counted that way looks like a
 /// use of itself and nothing would ever have exactly one.
+let stmt_reads : :any -> :any -> :any;
 let stmt_reads deep st =
     match st {
         [:let, _, ps, body, _, _] =>
@@ -754,6 +769,7 @@ struct Staged { name, body, span }
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a source is recognised by name"
             $( test.eq! (Role.source :range 2) (role_of "range") ),
@@ -801,9 +817,14 @@ when test {
                                           nm "xs"]) ),
     ];
 
+    let nowhere : [:integer, :integer];
     let nowhere = [0, 0];
+    let nm : :any -> [:name, :any, :any];
     let nm n = [:name, n, nowhere];
+    let call : :any -> :any -> [:apply, [:name, :any, :any], :any, :any];
     let call f args = [:apply, [:name, f, nowhere], args, nowhere];
+    let bind : :any -> :any -> [:let, :any, [:never], :any, :bool, :any];
     let bind n body = [:let, n, [], body, false, nowhere];
+    let staged_names : :any -> :any;
     let staged_names stmts = list.map (fn st -> Staged.name st) (staged_lets (fn _ -> true) stmts);
 }

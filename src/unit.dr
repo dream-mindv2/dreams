@@ -141,9 +141,12 @@ let shifted by pairs = map (fn pair -> list.cons (list.head pair + by) (list.tai
 when test {
     import std.test;
 
+    let base : %{:envs => %{0 => :string}, :refs => %{1 => :a}, :count => :integer, :bodies => [:never]};
     let base = %{ :envs => %{ 0 => "declared" }, :refs => %{ 1 => :a }, :count => 3, :bodies => [] };
+    let walked : :any;
     let walked = base.[:refs => (base.[:refs]).[2 => :b]].[:count => 5].[:bodies => [[0, :body]]].[:new => true];
 
+    let tests : [:any];
     let tests = [
         test.case "a part's difference is only what it added"
             $( test.eq! %{ :refs => Change.entries [[2, :b]], :count => Change.is 5,

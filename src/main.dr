@@ -51,18 +51,22 @@ import dreams.typecheck;
 import std.map;
 import std.num;
 
+let version : :string;
 let version = "0.2.11";
 
 /// What `--shebang` writes when it is not given a line. `env` so that it finds
 /// whichever `dream` is on the PATH rather than one fixed place.
+let default_shebang : :string;
 let default_shebang = "#!/usr/bin/env dream";
 
 // --- reporting --------------------------------------------------------------
 
+let report! : :string -> :string -> :string -> :any -> :any;
 let report! file src message offset =
     console.error! (diag.position file src offset + ": error: " + message);
 
 /// Print what a pass had to say, and answer the exit code it earns.
+let print_diags! : :any -> [:any] -> :integer;
 let print_diags! sources ds = {
     if list.is_empty ds { () }
     else { console.error! (diag.render_all sources ds) }
@@ -71,6 +75,7 @@ let print_diags! sources ds = {
 
 // --- one file at a time -------------------------------------------------------
 
+let describe : :any -> :any;
 let describe t =
     match lexer.value t {
         () => to_string (lexer.kind t),
@@ -78,6 +83,7 @@ let describe t =
     };
 
 /// Tokenize, and print one token per line with where it came from.
+let tokenize! : :string -> :string -> :integer;
 let tokenize! file src = {
     let rec put! ts !n =
         match ts {
@@ -103,6 +109,7 @@ let tokenize! file src = {
 };
 
 /// Parse, and print the syntax tree one item per line.
+let ast! : :string -> :string -> :integer;
 let ast! file src =
     match parser.parse_module src {
         [:ok, items, _] => {
@@ -120,11 +127,13 @@ let ast! file src =
 /// file that does not parse is reported as a parse error and left as it is,
 /// and the rest are still done; the exit code says whether any went wrong --
 /// or, checking, whether any would change.
+let format_files! : :any -> :any -> :integer;
 let format_files! files checking = {
     let failed = list.fold (fn! !n file -> n + format_one! file checking) 0 files;
     if failed > 0 { 1 } else { 0 }
 };
 
+let format_one! : :string -> :any -> :any;
 let format_one! file checking =
     with_source! file (fn! src ->
         match fmt.format src {
@@ -154,6 +163,7 @@ let format_one! file checking =
 /// Parse without printing: the exit code is the whole answer. File-local, so it
 /// says nothing about imports -- which is exactly what a check on every keypress
 /// wants, and why it is worth keeping separate from `--check`.
+let parse_only! : :string -> :string -> :integer;
 let parse_only! file src =
     match parser.parse_module src {
         [:ok, _, _] => 0,
@@ -167,10 +177,12 @@ let parse_only! file src =
 
 /// Resolve and purity-check everything the root file reaches, and hold it
 /// to its signatures.
+let check_program! : modules.Loader -> :map -> :any;
 let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 
 /// `--suggest-signatures`: every declaration with no signature, as `FILE:LINE|TYPE`, the type
 /// what its body says it answers (`typecheck.suggestions`), for a person to make a signature of.
+let suggest_signatures! : modules.Loader -> :map -> :integer;
 let suggest_signatures! l o = {
     let r = compile.resolve! l o;
     let files = modules.file_map l;
@@ -186,6 +198,7 @@ let suggest_signatures! l o = {
 
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
+let compile_options : :map -> :any;
 let compile_options o =
     compile.Options.make true (opt o :no_opt != true) [] true [] (opt o :units) (opt o :test != true)
                          (list.map remap_spec (o.[:remaps else []])) (supercompiling o) (opt o :debug_info == true);
@@ -196,6 +209,7 @@ let compile_options o =
 /// time is not; it costs a large program several times its compile.
 /// `--no-supercompile` turns it off, and so does `--no-opt`, whose point is
 /// the arena exactly as lowered.
+let supercompiling : :map -> :any;
 let supercompiling o = match [opt o :supercompile, opt o :no_opt] {
     [_, true] => (),
     [:none, _] => (),
@@ -205,6 +219,7 @@ let supercompiling o = match [opt o :supercompile, opt o :no_opt] {
 
 /// `FROM=TO` as `[from, to]`. The split is at the last `=`, since a path may
 /// hold one and a package name never does.
+let remap_spec : :string -> [:any, :string] | [:any, :any];
 let remap_spec text = match str.split_last "=" text {
     Option.none => [text, ""],
     Option.some([from, to]) => [from, to],
@@ -212,6 +227,7 @@ let remap_spec text = match str.split_last "=" text {
 
 /// The modules a program pulls in, in the order a later pass must walk them:
 /// dependencies before whatever uses them.
+let show_modules! : modules.Loader -> :any;
 let show_modules! l = {
     let width = fold (fn w m -> num.max w (str.byte_length (modules.module_name m)))
                                  0 (modules.modules l);
@@ -225,6 +241,7 @@ let show_modules! l = {
 
 /// The packages a program can see, and what each provides. What to look at when
 /// an import cannot be resolved.
+let show_packages! : package.Packages -> :integer;
 let show_packages! ps = {
     match package.current ps {
         () => console.print! "current package: none",
@@ -239,6 +256,7 @@ let show_packages! ps = {
 };
 
 /// The execution trees the program lowers to.
+let show_ir! : modules.Loader -> :any;
 let show_ir! l = {
     let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] () false);
     let low = lower.lower_program r;
@@ -266,6 +284,7 @@ let show_ir! l = {
 /// file system: a spec that names a file as written is that file, which is
 /// how a file whose own name has an `=` in it still works, and anything else
 /// is split at its first `=`.
+let payload_spec! : :any -> [:any, :any];
 let payload_spec! spec = {
     let at = str.find "=" spec;
     if at > 0 && not (file.is_file! spec) {
@@ -275,12 +294,14 @@ let payload_spec! spec = {
 
 /// How much of a payload is in memory at once. Anything would do; a megabyte
 /// is large enough that the loop is not the cost and small enough to be free.
+let payload_chunk : :integer;
 let payload_chunk = 1048576;
 
 /// How many bytes are in this file, or `()` if it cannot be read.
 ///
 /// Asked before anything is laid out, because the answer is what the `LDAT`
 /// record will say -- the image commits to a length before a byte is written.
+let payload_size! : :string -> :any;
 let payload_size! path =
     match try! { io.open! path :read } catch e { () } {
         () => (),
@@ -295,6 +316,7 @@ let payload_size! path =
 /// The first bytes of a payload, which say whether it is a native binary and
 /// for what (`target.sniff`). Empty when it cannot be read, which `sniff`
 /// takes as data -- an unreadable payload is reported on its own.
+let payload_head! : :string -> :any;
 let payload_head! path =
     match try! { io.open! path :read } catch e { () } {
         () => "",
@@ -313,6 +335,7 @@ let payload_head! path =
 /// has grown since would run past the length the image records, and one that
 /// has shrunk cannot fill it -- which is the case this answers `false` for,
 /// rather than writing a short payload nothing would notice until it was read.
+let copy_payload! : :any -> :string -> :any -> :any;
 let copy_payload! out path n =
     match try! { io.open! path :read } catch e { () } {
         () => false,
@@ -358,6 +381,7 @@ let make_escaped p =
 /// package on the search path can change what a name resolves to, and listing
 /// one too many costs a rebuild when it changes, where one too few costs a
 /// stale image.
+let files_read : modules.Loader -> :any -> :any;
 let files_read l payloads = {
     let sources = map diag.source_path (modules.files l);
     let manifests = filter (fn m -> not (str.is_empty m))
@@ -370,6 +394,7 @@ let depfile_text out read =
     str.join_str " \\\n  " (list.cons (make_escaped out + ":") (map make_escaped read)) + "\n";
 
 /// Write the depfile, when one was asked for. Answers whether that went well.
+let write_depfile! : :string -> :any -> modules.Loader -> :any -> :bool;
 let write_depfile! path out l payloads =
     match path {
         () => true,
@@ -391,6 +416,7 @@ let write_depfile! path out l payloads =
 /// This is the point of the whole front end: what comes out is a file the VM
 /// can map and run. Nothing is written when anything went wrong, so a failed
 /// build leaves the last good image where it was rather than a half-written one.
+let build! : modules.Loader -> :any -> :any -> :any -> :any -> :any -> :any -> :any -> :map -> :any;
 let build! l out shebang depfile specs said stats kept o = {
     let named = list.map payload_spec! specs;
     strict! named
@@ -504,6 +530,7 @@ let build! l out shebang depfile specs said stats kept o = {
 
 /// What the program contains, counted. Useful on its own, and the quickest way
 /// to see that a change to the front end did not quietly change its output.
+let show_stats! : modules.Loader -> :any;
 let show_stats! l = {
     let r = compile.resolve! l (compile.Options.make false false [] true [] () false [] () false);
     let lowered = lower.image (lower.lower_program r);
@@ -559,6 +586,7 @@ let show_stats! l = {
 /// `strict!` finds every thunk already forced and does nothing but walk, which
 /// is what the first one spent on ground already covered. The difference is
 /// this stage's own work, and it is the column to read.
+let timed! : :any -> [:any, :any, :any];
 let timed! value = {
     let before = os.monotonic! ();
     strict! value
@@ -568,16 +596,21 @@ let timed! value = {
     [value, forced - before, walked - forced]
 };
 
+let value_of : :any -> :any;
 let value_of t = list.head t;
+let work_of : :any -> :any;
 let work_of t = list.nth 1 t;
+let walk_of : :any -> :any;
 let walk_of t = list.nth 2 t;
 /// What this stage did that no stage before it had done.
+let own_of : :any -> :any;
 let own_of t = {
     let d = work_of t - walk_of t;
     if d < 0 { 0 } else { d }
 };
 
 /// Time the whole pipeline, stage by stage, and write nothing.
+let show_time! : :map -> :string -> :any;
 let show_time! o file = {
     let read = timed! (read! o file);
     // Ask expansion to charge its own phases while it runs. `--time` is the
@@ -681,6 +714,7 @@ let show_time! o file = {
 /// what a macro costs a large program, at which point "which of the two?" was
 /// the only question left and the meter could not answer it. Staging rewrites
 /// every module's items; `snapshot` is `scope.declare!`.
+let show_macros! : modules.Loader -> :any;
 let show_macros! l = match modules.macro_meter l {
     () => (),
     meter => {
@@ -731,6 +765,7 @@ let show_macros! l = match modules.macro_meter l {
 // one position, not an image.
 
 /// Which loaded module came from this file, or `()`.
+let module_of! : modules.Loader -> :string -> :any;
 let module_of! l file = {
     let want = path.absolute! file;
     let hits = filter (fn! i -> path.absolute! (modules.module_path (modules.module_at l i))
@@ -740,6 +775,7 @@ let module_of! l file = {
 };
 
 /// What a file defines, one per line: the outline of a document.
+let show_symbols! : modules.Loader -> :string -> :integer;
 let show_symbols! l file = {
     let r = scope.resolve! l;
     match module_of! l file {
@@ -762,12 +798,14 @@ let show_symbols! l file = {
 
 /// Is this byte the middle of a name? Used to find where the name under a
 /// cursor begins, which is what the resolution table is keyed by.
+let is_name_byte : :any -> :bool;
 let is_name_byte b =
     (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
     || b == 95 || b == 33;
 
 /// The start of the name containing `offset`. A cursor rests *in* a word, and
 /// the table is keyed by where the word starts, so this walks back to it.
+let name_start : :string -> :any -> :any;
 let name_start src offset = {
     let rec back i =
         if i <= 0 { 0 }
@@ -777,6 +815,7 @@ let name_start src offset = {
 };
 
 /// The identifier that begins at this offset, or `""`.
+let name_at : :string -> :any -> :any;
 let name_at src at = {
     let rec forward i =
         if i >= str.byte_length src { i }
@@ -787,6 +826,7 @@ let name_at src at = {
 
 /// Say what is at a position, and where it came from. The primitive an editor
 /// needs for go-to-definition and for hover.
+let show_at! : modules.Loader -> :string -> :any -> :any -> :integer;
 let show_at! l file line col = {
     let r = typecheck.select_overloads l (scope.resolve! l);
     match module_of! l file {
@@ -843,6 +883,7 @@ let show_at! l file line col = {
 };
 
 /// One resolution, in the terms a person reading it would use.
+let describe_resolution : modules.Loader -> scope.Resolution -> :any -> :any;
 let describe_resolution l r found =
     match found {
         scope.Meaning.local(slot, span) => "local, slot " + to_string slot
@@ -864,16 +905,21 @@ let describe_resolution l r found =
 
 // --- the command line -----------------------------------------------------------
 
+let defaults : :map;
 let defaults = %{ :command => :check, :file => (), :roots => [], :includes => [],
                   :defines => [], :hosts => [], :test => false, :quiet => false,
                   :position => (), :output => (), :shebang => (), :payloads => [],
                   :targets => [], :said => (), :depfile => (), :error => () };
 
+let opt : :any -> :any -> :any;
 let opt o k = o.[k else ()];
+let with_opt : :any -> :any -> :map -> :any;
 let with_opt k v o = o.[k => v];
+let append_opt : :any -> :any -> :map -> :any;
 let append_opt k v o = o.[k => (list.append (o.[k else []]) [v])];
 
 /// `LINE:COL`, as `--at` takes it.
+let parse_position : :string -> :any;
 let parse_position text = {
     let parts = str.split ":" text;
     if list.length parts != 2 { () }
@@ -888,6 +934,7 @@ let parse_position text = {
 /// Read the arguments. A flag that takes a value consumes the next argument,
 /// and running out is an error rather than a silent default: `-L` with nothing
 /// after it is a mistake worth naming.
+let parse_args : :any -> :map -> :any;
 let rec parse_args args o =
     match args {
         [] => o,
@@ -987,6 +1034,7 @@ let rec parse_args args o =
             else { parse_args rest (with_opt :file arg o) },
     };
 
+let usage! : :unit -> :integer;
 let usage! () = {
     map (fn! line -> console.error! line) [
         "dreams " + version + " -- the Dream compiler, in Dream",
@@ -1060,6 +1108,7 @@ let usage! () = {
 /// Read the file and hand its text to `k`, or fail saying so. The parameter is
 /// `file` rather than `path` because `path` is a module here, and a parameter of
 /// that name would shadow it.
+let with_source! : :any -> :any -> :any;
 let with_source! filename k =
     match file.read! filename {
         Option.none => {
@@ -1072,6 +1121,7 @@ let with_source! filename k =
 /// The configuration a compile starts from: the machine, then the target if
 /// one was named (so `when os` follows a cross-build), then `-D`, which is the
 /// most specific thing anyone said and so wins.
+let configured! : :integer -> :any;
 let configured! o = {
     let base = if opt o :test { config.define "test" (config.defaults! ()) }
                else { config.defaults! () };
@@ -1087,15 +1137,18 @@ let configured! o = {
 /// expanding it to different lines. They used to be one stage called `parse`,
 /// and the question "what do the macros cost?" then had no answer short of
 /// writing the program twice.
+let read! : :any -> :string -> :any;
 let read! o file =
     modules.load_shared_with_hosts! file (list.append (opt o :roots) (opt o :includes)) (configured! o)
                          (opt o :test == true) (opt o :units) (opt o :hosts);
 
+let load! : :any -> :string -> :any;
 let load! o file = expansion.expand! (read! o file);
 
 /// A build, or the one already made of the same program from the same files
 /// (`--cache`, dreams/src/cache.dr): the image put where it was asked for,
 /// what the build printed printed again, its depfile written.
+let cached_build! : :map -> :string -> :any;
 let cached_build! o src = {
     let built! kept = build! (load! o src) (opt o :output) (opt o :shebang) (opt o :depfile)
                             (opt o :payloads) (opt o :said) (opt o :sc_stats == true) kept (compile_options o);
@@ -1127,6 +1180,7 @@ let cached_build! o src = {
 
 /// An image of `src`, by the ordinary build, kept nowhere: its bytes, or `()` with the
 /// reasons already printed.
+let image_of! : :map -> :string -> :any -> :any;
 let image_of! o src image = {
     // The file goes in the options because they are the cache's key: three builds from one set
     // of options would otherwise be one entry, and the runtime the library's image.
@@ -1140,6 +1194,7 @@ let image_of! o src image = {
 
 /// The runtime's source, found as `std` is. It sits beside `std`'s modules and not among
 /// them, because `import std;` takes every module in `src`, and a program should not.
+let runtime_file! : :map -> :any -> :any;
 let runtime_file! o name = {
     let found = list.filter (fn! dir -> io.exists! dir)
         (list.flat_map (fn root -> [path.join root ("std/rt/" + name), path.join root ("rt/" + name)])
@@ -1159,6 +1214,7 @@ let aot_target targets = {
 /// A native executable, from an image: the one named, or the one this builds first.
 /// The images are made as any build makes one, beside where the executable is going,
 /// and are not kept. See dreams/docs/aot.md.
+let native_build! : :map -> :string -> :integer;
 let native_build! o src = {
     let out = opt o :output;
     let hosts = o |> append_opt :hosts aot.primitives |> append_opt :hosts aot.natives;
@@ -1193,6 +1249,7 @@ let native_build! o src = {
     }
 };
 
+let run_command! : :map -> :string -> :any;
 let run_command! o file =
     match opt o :command {
         :tokens    => with_source! file (fn! src -> tokenize! file src),
@@ -1215,6 +1272,7 @@ let run_command! o file =
         _ => usage! (),
     };
 
+let run! : :any -> :any;
 let run! args = {
     let parsed = parse_args args defaults;
     let o = match target.parse_all (opt parsed :targets) {
@@ -1256,11 +1314,13 @@ let run! args = {
     }
 };
 
+let main! : :any;
 let main! = os.exit! (run! (os.args! ()));
 
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a depfile is a make rule, one file to a line"
             $( test.eq! "out.dream: \\\n  a.dr \\\n  b/mind.toml\n"

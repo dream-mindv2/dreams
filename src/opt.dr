@@ -81,6 +81,7 @@ import std.map;
 // operands are numbered 0, 1, 2 for `a`, `b`, `c`.
 
 /// Which operands are edges to other nodes.
+let node_edges : [[:field, [:integer]], [:apply, [:integer]], [:if, [:integer, :integer, :integer]], [:bind, [:integer]], [:try, [:integer, :integer]], [:ensure, [:integer, :integer]], [:force, [:integer]], [:type_is, [:integer]], [:cons, [:integer, :integer]], [:list_tail, [:integer]], [:list_is_empty, [:integer]], [:list_is_cons, [:integer]], [:list_head, [:integer]], [:neg, [:integer]], [:not, [:integer]], [:add, [:integer, :integer]], [:sub, [:integer, :integer]], [:mul, [:integer, :integer]], [:div, [:integer, :integer]], [:mod, [:integer, :integer]], [:eq, [:integer, :integer]], [:ne, [:integer, :integer]], [:lt, [:integer, :integer]], [:le, [:integer, :integer]], [:gt, [:integer, :integer]], [:ge, [:integer, :integer]], [:and, [:integer, :integer]], [:or, [:integer, :integer]], [:band, [:integer, :integer]], [:bor, [:integer, :integer]], [:bxor, [:integer, :integer]], [:shl, [:integer, :integer]], [:shr, [:integer, :integer]], [:bnot, [:integer]], [:get, [:integer, :integer, :integer]], [:set, [:integer, :integer, :integer]], [:set_many, [:integer]], [:switch_head, [:integer]], [:switch_atom, [:integer]]];
 let node_edges = [
     /// `a` is the object; `b` is the string constant naming the field.
     [:field, [0]],
@@ -116,6 +117,7 @@ let node_edges = [
 /// Which opcodes address a run of children, as `[op, offset operand, count
 /// operand, kids per count]`. The multiplier is for `map`, whose count is a
 /// number of pairs and whose run is two kids each.
+let node_runs : [[:str_chars, :integer, :integer, :integer], [:error_new, :integer, :integer, :integer], [:error_kind, :integer, :integer, :integer], [:error_payload, :integer, :integer, :integer], [:str_slice, :integer, :integer, :integer], [:str_find, :integer, :integer, :integer], [:str_byte, :integer, :integer, :integer], [:str_le, :integer, :integer, :integer], [:str_span, :integer, :integer, :integer], [:str_upto, :integer, :integer, :integer], [:char_code, :integer, :integer, :integer], [:char_of_code, :integer, :integer, :integer], [:to_float, :integer, :integer, :integer], [:float_bytes, :integer, :integer, :integer], [:float_of_bytes, :integer, :integer, :integer], [:to_int, :integer, :integer, :integer], [:parse_int, :integer, :integer, :integer], [:parse_float, :integer, :integer, :integer], [:to_existing_atom, :integer, :integer, :integer], [:array_new, :integer, :integer, :integer], [:array_to_list, :integer, :integer, :integer], [:map_has, :integer, :integer, :integer], [:map_remove, :integer, :integer, :integer], [:map_pairs, :integer, :integer, :integer], [:data_count, :integer, :integer, :integer], [:data_at, :integer, :integer, :integer], [:compare, :integer, :integer, :integer], [:str_interp, :integer, :integer, :integer], [:apply, :integer, :integer, :integer], [:block, :integer, :integer, :integer], [:make_list, :integer, :integer, :integer], [:make_array, :integer, :integer, :integer], [:record_make, :integer, :integer, :integer], [:make_map, :integer, :integer, :integer], [:set_many, :integer, :integer, :integer], [:switch_head, :integer, :integer, :integer], [:switch_atom, :integer, :integer, :integer]];
 let node_runs = [
     [:str_chars, 1, 2, 1],
     [:error_new, 1, 2, 1],
@@ -160,8 +162,10 @@ let node_runs = [
 // Asked once per node of the program, which is the shape of question that has
 // twice been the most expensive thing in a self-compile when it was answered by
 // walking a list. Both tables are built once, at module level.
+let edge_map : :any;
 let edge_map = fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
                          (%{}) node_edges;
+let run_map : :any;
 let run_map = fold (fn m e -> m.[(list.nth 0 e) => [list.nth 1 e, list.nth 2 e, list.nth 3 e]])
                         (%{}) node_runs;
 
@@ -175,6 +179,7 @@ let run_of op = run_map.[op else ()];
 /// `local`, `builtin`, `global`, `atom`, `int` -- and the walk below treats
 /// them differently, so the question is asked once per node and gets its own
 /// table rather than two misses on the two above.
+let leaf_map : :any;
 let leaf_map = fold (fn m e -> m.[(list.nth 0 e) => false])
                          (fold (fn m e -> m.[(list.nth 0 e) => false])
                                     (%{}) node_edges)
@@ -304,10 +309,12 @@ let node_at i s = (src s).[i else ir.leaf :nop];
 // most of what a merge cost.
 
 /// Node `i` of part `k` is `k * part_base + i` wherever a function names it.
+let part_base : :integer;
 let part_base = 134217728;
 
 let memo_base : State -> :integer;
 let memo_base s = State.memo_base s;
+let remap : :any -> :any;
 let remap s = State.remap s;
 let memo_leaves : State -> :bool;
 let memo_leaves s = State.memo_leaves s;
@@ -347,6 +354,7 @@ let remap_leaf n s = match remap s {
 /// A leaf of a part, kept -- or, when it is a `comp` placeholder whose value
 /// has been settled, the part-0 node that value was lowered to, rebuilt in its
 /// place. See "running what was lowered in parts" in dreams/src/lower.dr.
+let rebuild_leaf : :any -> :any -> :any;
 let rebuild_leaf n s =
     match (if ir.node_op n == :unit && ir.is_node (ir.node_a n) { (State.filled s).[ir.node_a n else ()] }
            else { () }) {
@@ -374,15 +382,18 @@ let remap_field n s = match remap s {
         _ => n,
     },
 };
+let kid_at : :any -> :any -> :any;
 let kid_at i s = (src_kids s).[i else ir.no_node];
 
 // These are runtime representation tests, not signature assumptions. Gradual
 // callers and integer overflow must still be observed as they are at runtime.
 // The numbers match dream_type in dream/include/dream/h.
+let type_codes : %{"integer" => :integer, "float" => :integer, "char" => :integer, "bool" => :integer, "unit" => :integer, "string" => :integer, "atom" => :integer, "list" => :integer, "array" => :integer, "map" => :integer};
 let type_codes = %{ "integer" => 0, "float" => 1, "char" => 2,
     "bool" => 3, "unit" => 4, "string" => 5, "atom" => 6,
     "list" => 7, "array" => 8, "map" => 9 };
 
+let type_test : :any -> :any -> :any -> :any -> :any -> :any;
 let type_test call written invert flags s = {
     // The atom as the program numbers it, when this is one part of several:
     // `type_ids` is keyed by the merged pool.
@@ -398,6 +409,7 @@ let type_test call written invert flags s = {
 
 /// Fuse before rebuilding children, so the unused call, atom and argument run
 /// never enter the new image. A literal on either side has no forcing effect.
+let primitive_ops : %{19 => [:str_chars, :integer], 23 => [:error_new, :integer], 24 => [:error_kind, :integer], 25 => [:error_payload, :integer], 26 => [:str_slice, :integer], 27 => [:str_find, :integer], 28 => [:str_byte, :integer], 29 => [:str_le, :integer], 30 => [:str_span, :integer], 31 => [:str_upto, :integer], 32 => [:char_code, :integer], 33 => [:char_of_code, :integer], 34 => [:to_float, :integer], 35 => [:float_bytes, :integer], 36 => [:float_of_bytes, :integer], 37 => [:to_int, :integer], 38 => [:parse_int, :integer], 39 => [:parse_float, :integer], 40 => [:to_existing_atom, :integer], 41 => [:array_new, :integer], 43 => [:array_to_list, :integer], 44 => [:map_has, :integer], 45 => [:map_remove, :integer], 46 => [:map_pairs, :integer], 47 => [:data_count, :integer], 48 => [:data_at, :integer], 49 => [:compare, :integer], 52 => [:str_interp, :integer]};
 let primitive_ops = %{
     19 => [:str_chars, 1],
     23 => [:error_new, 2],
@@ -435,6 +447,7 @@ let primitive_ops = %{
 /// hundred million steps, each an opcode now. Looked up per `apply` the pass
 /// rebuilds, so the IDs are settled here once rather than asked of
 /// `builtins.id` three times a node.
+let list_ops : %{:any => [:cons, :integer] | [:list_tail, :integer] | [:list_is_empty, :integer] | [:list_is_cons, :integer] | [:list_head, :integer]};
 let list_ops = %{
     builtins.id "_list_cons" => [:cons, 2],
     builtins.id "_list_tail" => [:list_tail, 1],
@@ -444,6 +457,7 @@ let list_ops = %{
     builtins.id "_match_tail" => [:list_tail, 1],
 };
 
+let type_of_id : :any;
 let type_of_id = builtins.id "type_of";
 
 let specialize : ir.Node -> State -> ir.Node;
@@ -488,6 +502,7 @@ let specialize n s = match ir.node_op n {
 /// keys are compared by identity, and two equal lists are two objects -- so the
 /// five fields become a string, which can. That is one native call and a short
 /// string per node, against a trie walk per field for the nested-map form.
+let keep : :any -> :any -> [:any, :any];
 let keep n s =
     if not (shareable n) {
         let i = count s;
@@ -513,6 +528,7 @@ let keep n s =
 /// one machine walk. Reversing it to key it and reversing it again to place it
 /// was two Dream loops per run for nothing -- the key only has to be the same
 /// for the same run, and every run is keyed the same way.
+let keep_run : :any -> :any -> [:any, :any];
 let keep_run rev s = {
     let key = to_string rev;
     match (runs s).[key else ()] {
@@ -549,6 +565,7 @@ let keep_run rev s = {
 /// the memo would have been consulted for -- and the memo is kept for nodes
 /// with children, where a shared subtree could otherwise be copied once per
 /// path to it and a deep enough DAG could take exponential time.
+let rebuild : :any -> :any -> :any;
 let rec rebuild i s =
     if not (ir.is_node i) { [s, i] }
     else {
@@ -570,6 +587,7 @@ let rec rebuild i s =
     };
 
 /// The rebuild proper, for a node with children that has not been met before.
+let rebuild_node : :any -> :any -> :any;
 let rec rebuild_node n s = {
     // A part was specialized by its own rebuild; sharing parts only renames.
     let n = if memo_leaves s { remap_field n s } else { specialize n s };
@@ -588,6 +606,7 @@ let rec rebuild_node n s = {
 /// Rebuild each edge operand in turn: `[state, node]`, with the node's
 /// operands renumbered. A loop of its own rather than a fold, which paid for a
 /// closure call and a pair per edge.
+let rebuild_edges : :any -> :any -> :any -> :any;
 let rec rebuild_edges ks n s = match ks {
     [] => [s, n],
     [k, ..rest] => {
@@ -598,6 +617,7 @@ let rec rebuild_edges ks n s = match ks {
 
 /// Rebuild one node's run of children and point the node at the new run:
 /// `[state, node]`.
+let rebuild_run : :any -> :any -> :any -> [:any, :any];
 let rec rebuild_run spec n s = {
     let off = operand (list.nth 0 spec) n;
     let many = operand (list.nth 1 spec) n * list.nth 2 spec;
@@ -608,6 +628,7 @@ let rec rebuild_run spec n s = {
 
 /// Rebuild `many` children from `off`, collecting the new indices in reverse:
 /// `[state, reversed]`.
+let rebuild_kids : :any -> :any -> :any -> :any -> :any -> :any;
 let rec rebuild_kids off k many !acc s =
     if k >= many { [s, acc] }
     else {
@@ -632,6 +653,7 @@ let rec rebuild_kids off k many !acc s =
 /// through `keep_run`, which is sound for the same reason sharing an argument
 /// run is: the pool is a flat array of numbers, and two runs holding the same
 /// numbers are the same run to everyone who reads it.
+let place_captures : :any -> :any -> :any;
 let place_captures f s = {
     let off = f.[:captures_off else 0];
     let many = f.[:n_captures else 0];
@@ -754,6 +776,7 @@ let optimize_parts_by_hand img parts invented_from filled = {
 
 /// Rebuild each function's body and captures, in order: `[state, functions]`,
 /// the functions rebuilt and reversed.
+let walk_funcs : :any -> :any -> :any;
 let walk_funcs fs s0 =
     list.fold (fn acc f -> {
         let got = rebuild (f.[:body else ir.no_node]) (list.head acc);
@@ -791,6 +814,7 @@ when test {
         %{ :nodes => nodes, :kids => kids,
            :funcs => list.map (fn b -> %{ :body => b }) bodies };
 
+    let with_caps : :any -> :any -> :any -> :any -> %{:nodes => :any, :kids => :any, :funcs => :any};
     let with_caps nodes kids bodies caps =
         %{ :nodes => nodes, :kids => kids,
            :funcs => list.map (fn pair ->
@@ -812,10 +836,12 @@ when test {
                                (ir.Image.funcs img);
 
     /// `local 0` twice over, as two bodies.
+    let two_locals : :any;
     let two_locals = optimize (image [ir.node :local 0 ir.no_node ir.no_node,
                                       ir.node :local 0 ir.no_node ir.no_node] [] [0, 1]);
 
     /// The same one-argument negation written twice.
+    let two_trees : :any;
     let two_trees = optimize (image [ir.node :local 0 ir.no_node ir.no_node,
                                      ir.node :local 0 ir.no_node ir.no_node,
                                      ir.node :neg 0 ir.no_node ir.no_node,
@@ -827,8 +853,11 @@ when test {
     /// renamed and never shared, a call with a run of arguments, a settled
     /// `comp` placeholder read from part 0, captures, and a node two parts
     /// both have.
+    let none : :any;
     let none = ir.no_node;
+    let pools : :any -> :any -> %{:ints => :any, :floats => #[], :strs => :any, :atoms => #[]};
     let pools ints strs = %{ :ints => array.of_list ints, :floats => #[], :strs => array.of_list strs, :atoms => #[] };
+    let parts : :any;
     let parts = array.of_list [
         %{ :nodes => array.of_list [[:const_int, 0, 1, none, none], [:local, 0, 2, none, none]],
            :kids => array.of_list [4, 5] },
@@ -840,13 +869,16 @@ when test {
                                     [:add, 0, 2, 2, none], [:make_closure, 0, 1, none, none]],
            :kids => array.of_list [2, 3], :remap => pools [3] [6], :fo => 10, :go => 7 },
     ];
+    let parted : %{:funcs => [%{:body => :any}, %{:body => :any, :n_captures => :integer, :captures_off => :integer}, %{:body => :any}, %{:body => :any}, %{:body => :any}]};
     let parted = %{ :funcs => [%{ :body => part_base + 0 },
                                %{ :body => 2 * part_base + 0, :n_captures => 2, :captures_off => 0 },
                                %{ :body => 2 * part_base + 5 },
                                %{ :body => part_base + 3 },
                                %{ :body => none }] };
+    let filled : %{10 => :integer};
     let filled = %{ 10 => 0 };
 
+    let tests : [:any];
     let tests = [
         test.case "the VM shares parts as the walk written here does"
             $( test.eq! (optimize_parts_by_hand parted parts 60 filled)

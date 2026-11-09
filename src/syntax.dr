@@ -40,6 +40,7 @@ let rec fresh tree next =
     };
 
 /// A value represented as an expression that constructs it, without evaluation.
+let literal : :any -> ast.Span -> :any;
 let rec literal value span = match type_of value {
     :integer => ast.int_e value span,
     :float => ast.float_e value span,
@@ -115,6 +116,7 @@ let record kind name fields members span = record_derived "" kind name fields me
 /// mistake this keeps anyone from having to write. A dotted name through the
 /// declaration's own name becomes the name it reaches, keeping the dotted
 /// span, which starts where the `Shape` did and so names nothing else.
+let own_names : :any -> :any -> :any;
 let rec own_names owner e =
     match e {
         [:field, [:name, n, _], member, sp] if n == owner => [:name, member, sp],
@@ -341,6 +343,7 @@ let record_parts owner kind name fields0 members bases span = {
 /// A `mapping`'s accessor asks only for the field it reads, and for any map
 /// at all when that field has a default: `Config.retries %{}` is `3`. A
 /// `group`'s or a `struct`'s reads by position, so it takes the record.
+let record_sigs : :any -> :any -> :any -> ast.Span -> :any;
 let record_sigs kind name fields span =
     if kind == :map && list.all (fn f -> ast.field_type f == ()) fields { [] }
     else {
@@ -373,9 +376,11 @@ let record_sigs kind name fields span =
 /// to resolve and the wrong thing to print: `circle : :float -> type` says
 /// nothing a reader can use. `[:named, name, t]` is what a `type` declaration
 /// is, and both the checker and a signature's printer read the name from it.
+let shown_as : :any -> :any -> ast.Span -> :any;
 let shown_as name t span = ast.list_e [ast.atom_e "named" span, ast.str_e name span, t] span;
 
 /// `a -> b` as the type grammar builds it.
+let arrow : :any -> :any -> :any;
 let arrow a b = ast.list_e [ast.atom_e "fn" (ast.span b), a, b] (ast.span b);
 
 // --- receive! ------------------------------------------------------------------
@@ -612,6 +617,7 @@ let foreign_decl name library entries span = {
 /// `Point.new!` is a zeroed one, `read!` and `write!` go through a map of its
 /// fields, and `layout` is there for `foreign.read_struct!` at an offset --
 /// an array of them.
+priv let c_struct_module : :any -> :any -> :any -> :any;
 priv let c_struct_module s fields at_ = {
     let name_ n = ast.name_e n at_;
     let apply f args = ast.apply_e f args at_;
@@ -641,6 +647,7 @@ priv let c_struct_module s fields at_ = {
 };
 
 /// What every entry of one `foreign` block can see of the others.
+priv let foreign_env : :any -> :any -> %{:lib => :any, :resources => :any, :structs => :any};
 priv let foreign_env lib entries = %{
     :lib => lib,
     :resources => list.fold (fn m e -> match e { [:resource, r, d, _] => m.[r => [d]], _ => m }) %{} entries,
@@ -649,7 +656,7 @@ priv let foreign_env lib entries = %{
 
 /// The first thing wrong with a `foreign` block's entries, as `[message,
 /// span]`, or `()`. The parser asks, because only it can report one.
-let foreign_problem : ast.Expr | :unit -> [[:any]] -> [:string, ast.Span] | :unit;
+let foreign_problem : :any -> [[:any]] -> [:string, ast.Span] | :unit;
 let foreign_problem lib entries = {
     let env = foreign_env lib entries;
     let problem r = match r { [:error, m, sp] => [m, sp], _ => () };
@@ -668,6 +675,7 @@ let foreign_problem lib entries = {
 /// dream]`: the argument and result expressions `std.ffi` reads, and the Dream
 /// type of the function it makes. An `out` is not an argument on this side,
 /// so it leaves the Dream arrow and joins the result: `[result, out, ..]`.
+let c_function : :any -> :any -> [:error, :string, :any] | [:error, :any, :any] | [:ok, :any, :any, :any];
 let c_function env t = {
     let sp = ast.span t;
     match arrow_parts t {
@@ -695,11 +703,15 @@ let c_function env t = {
     }
 };
 
+priv let is_void : :any -> :bool;
 priv let is_void t = match t { [:atom, "void", _] => true, [:unit, _] => true, _ => false };
+priv let is_out : :any -> :bool;
 priv let is_out t = match t { [:apply, [:name, "out", _], _, _] => true, _ => false };
+priv let is_unit_type : :any -> :bool;
 priv let is_unit_type t = match t { [:atom, "unit", _] => true, [:unit, _] => true, _ => false };
 
 /// `a -> b -> c` as `[[a, b], c]`; a type that is no arrow is `[[], t]`.
+priv let arrow_parts : :any -> [:any, :any] | [[:never], :any];
 priv let rec arrow_parts t = match t {
     [:list, [[:atom, "fn", _], a, b], _] => {
         let [rest, result] = arrow_parts b;
@@ -708,8 +720,10 @@ priv let rec arrow_parts t = match t {
     _ => [[], t],
 };
 
+priv let arrows : [:any] -> :any -> :any;
 priv let arrows ts result = fold (fn acc t -> arrow t acc) result (list.reverse ts);
 
+priv let c_types : :any -> :any -> [:any] -> [:ok, [:never], [:never]] | [:error, :any, :any] | [:ok, :any, :any];
 priv let rec c_types env place ts = match ts {
     [] => [:ok, [], []],
     [t, ..rest] => match c_type env place t {
@@ -724,6 +738,7 @@ priv let rec c_types env place ts = match ts {
 /// The C numbers, as `std.foreign` names them (`foreign.Scalar`) and the VM
 /// reads them (`scalar_types` in dream/src/ffi.cpp). The compiler cannot
 /// import the library it would be checking against, so the list is here too.
+priv let c_scalars : [:string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string];
 priv let c_scalars = ["bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
                       "char", "uchar", "short", "ushort", "int", "uint", "long", "ulong",
                       "longlong", "ulonglong", "size", "ssize", "intptr", "uintptr", "double"];
@@ -736,6 +751,7 @@ priv let c_scalars = ["bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u6
 ///
 /// Answers `[:ok, ffi, dream]`: the expression of what `std.ffi` reads, and
 /// the Dream type of the value on this side.
+let c_type : :any -> :any -> :any -> :any;
 let rec c_type env place t = {
     let sp = ast.span t;
     let atom a = ast.atom_e a sp;
@@ -808,6 +824,7 @@ let rec c_type env place t = {
     }
 };
 
+priv let owned : :any -> :any -> :any -> ast.Span -> [:error, :any, :any] | [:ok, :any, :any];
 priv let owned lib r dtor sp = match dtor {
     () => [:error, "`" + r + "` has no destructor, so C cannot hand one over; `borrow " + r
                    + "` is a pointer C keeps", sp],
@@ -815,6 +832,7 @@ priv let owned lib r dtor sp = match dtor {
           ast.name_e r sp],
 };
 
+priv let c_atom : :any -> :any -> ast.Span -> [:ok, :any, :any] | [:error, :any, :any];
 priv let c_atom place a sp = {
     let atom x = ast.atom_e x sp;
     let fail m = [:error, m, sp];
@@ -842,9 +860,13 @@ priv let c_atom place a sp = {
 
 // Validate returned data before any compiler pass assumes an AST shape. Spans
 // are replaced, but requiring their usual shape catches accidental values.
+let sequence : :any -> :any -> :bool;
 let sequence check xs = type_of xs == :list && list.all check xs;
+let pair : :any -> :any -> :any -> :bool;
 let pair check_a check_b p = match p { [a, b] => check_a a && check_b b, _ => false };
+let string : :any -> :bool;
 let string x = type_of x == :string;
+let optional : :any -> :any -> :bool;
 let optional check x = x == () || check x;
 let parameter : :any -> :bool;
 let rec parameter p = match p {
@@ -866,6 +888,7 @@ let rec pattern p = match p {
     [:record_p, ctor, fs, sp] => expression ctor && sequence pattern fs && is_span sp,
     _ => false,
 };
+let rest_pattern : :any -> :bool;
 let rest_pattern p = match p {
     () => true, [()] => true, [n, sp] => string n && is_span sp, _ => false,
 };
@@ -910,6 +933,7 @@ let rec expression e = match e {
     [:set, x, k, v, sp] => expression x && expression k && expression v && is_span sp,
     _ => false,
 };
+let arm : :any -> :bool;
 let arm a = match a {
     [p, g, b, sp] => pattern p && optional expression g && expression b && is_span sp,
     _ => false,
@@ -987,4 +1011,5 @@ let image_problem img entries =
         }
     }) () entries;
 
+priv let is_arrow : :any -> :bool;
 priv let is_arrow t = match t { [:list, [[:atom, "fn", _], _, _], _] => true, _ => false };

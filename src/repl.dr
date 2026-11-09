@@ -35,7 +35,9 @@ import std.str;
 import dreams.parser;
 import dreams.session as session_mod;
 
+let prompt : :string;
 let prompt = "dream> ";
+let continued : :string;
 let continued = "  ...> ";
 
 // --- the session --------------------------------------------------------------
@@ -48,41 +50,54 @@ let continued = "  ...> ";
 // compile-time state the previous entry left behind, and how many of the root
 // module's items it already declared. `()` and 0 are "nothing carried yet".
 
+let base_imports : [:string];
 let base_imports = ["import std.console;"];
 
+let session : :any -> :any -> :any -> :any -> %{:imports => :any, :defs => :any, :engine => :any, :base => :any};
 let session imports defs engine base =
     %{ :imports => imports, :defs => defs, :engine => engine, :base => base };
+let imports : :any -> :any;
 let imports s = s.[:imports else base_imports];
+let defs : :any -> :any;
 let defs s    = s.[:defs else []];
+let engine : :any -> :any;
 let engine s  = s.[:engine else ()];
+let base : :any -> :any;
 let base s    = s.[:base else 0];
 
+let empty_session : :any;
 let empty_session = session base_imports [] () 0;
 
+let with_engine : :any -> :any -> :any -> :any;
 let with_engine e b s = ((s.[:engine => e])).[:base => b];
 
 /// An import already in the session is not added twice -- a module imported
 /// twice is an error, and typing the same line again is not a mistake worth
 /// ending the session over.
+let with_import : :any -> :any -> :any;
 let with_import i s =
     if list.contains i (imports s) { s }
     else { s.[:imports => (list.append (imports s) [i])] };
 
+let with_def : :any -> :any -> :any;
 let with_def d s = s.[:defs => (list.append (defs s) [d])];
 
 /// Everything before the entry point: the imports and the definitions. This is
 /// the prefix a session grows, and `dreams.session` carries it so it can tell
 /// "an entry added a line after the definitions" from "one was inserted before
 /// them" -- the first proceeds, the second re-reads the whole program.
+let base_text : :any -> :any;
 let base_text s = str.join_str "\n" (list.concat [imports s, defs s]) + "\n";
 
 /// The program the session currently is, with `body` as its entry point.
+let program : :any -> :any -> :any;
 let program s body = base_text s + body + "\n";
 
 /// What an entry that is an expression compiles to. The value is bound and then
 /// matched rather than printed directly, so that `()` -- what an entry made
 /// only of effects answers -- prints nothing. A REPL that echoes `()` after
 /// every `console.print!` is reporting on itself rather than on the program.
+let echo : :any -> :any;
 let echo expr =
     "let main! = {\n    let it = (" + expr + ");\n"
     + "    match it {\n        () => (),\n        v => console.print! (to_string v),\n    }\n};";
@@ -90,11 +105,13 @@ let echo expr =
 /// What an entry that is a definition compiles to. There is nothing to run --
 /// the point is whether it compiles at all -- but a program needs an entry
 /// point to be a program.
+let quiet_main : :string;
 let quiet_main = "let main! = ();";
 
 // --- reading an entry -----------------------------------------------------------
 
 /// Share console's bounded, CRLF-aware line reader without reading past an entry.
+let read_line! : :any -> :any;
 let read_line! h = console.read_line_from! 1048576 h;
 
 /// Whether the parser's complaint is "there is more of this to come".
@@ -103,24 +120,28 @@ let read_line! h = console.read_line_from! 1048576 h;
 /// rather than a second one: a bracket counter here would be a small parser
 /// that disagrees with the real one about strings and comments. Running out of
 /// input is the only error that more input can fix.
+let unfinished : :string -> :bool;
 let unfinished message =
     str.find "end of file" message >= 0
     || str.find "unterminated" message >= 0;
 
 /// The first word, which is what decides whether an entry is read as a
 /// declaration or as an expression.
+let first_word : :string -> :any;
 let first_word text =
     match str.split " " (str.trim text) {
         [] => "",
         [w, .._] => w,
     };
 
+let declarative : :string -> :any;
 let declarative text =
     list.contains (first_word text)
                   ["let", "priv", "import", "mod", "when", "virtual", "derive", "macro", "group", "struct",
                    "mapping", "//", "///"];
 
 /// Parse an entry the way it will be compiled: `[:ok]`, or `[:error, message]`.
+let parsed : :string -> :any;
 let parsed text =
     if declarative text {
         match parser.parse_module text {
@@ -134,6 +155,7 @@ let parsed text =
         }
     };
 
+let complete : :string -> :bool;
 let complete text =
     match parsed text {
         Result.ok(_) => true,
@@ -143,6 +165,7 @@ let complete text =
 /// Read until the entry is something the parser can finish reading. An empty
 /// line ends a continuation whatever the parser thinks, because otherwise a
 /// missing brace is a prompt with no way out.
+let read_entry! : :any -> :any -> :any;
 let rec read_entry! h acc =
     match read_line! h {
         Option.none => if str.is_empty (str.trim acc) { () } else { acc },
@@ -162,11 +185,13 @@ let rec read_entry! h acc =
 
 /// The VM to run an image with. The same variable `mind` reads, because a
 /// session started from a build should reach the same VM the build did.
+let vm! : :unit -> :any;
 let vm! () = match os.env! "DREAM" { () => "dream", v => path.expand_home! v };
 
 /// Run the image and relay what it said. Its stderr is our stderr and its
 /// stdout is our stdout -- the program's output is the answer, and a REPL that
 /// reformats it is showing something the same program in a file would not.
+let run! : :any -> :any;
 let run! image = {
     match try! { os.exec! (vm! ()) [image] } catch e { [:failed, e] } {
         [:failed, e] => console.error! ("dreams: cannot run " + vm! () + ": " + to_string e),
@@ -181,6 +206,7 @@ let run! image = {
 
 // --- the commands ---------------------------------------------------------------
 
+let help : :string;
 let help = "
   :help          this message
   :list          the session so far, as the program it is
@@ -196,18 +222,21 @@ An error says `session:LINE:COL`, counting through the program `:list` prints:
 the session is compiled whole, so that is where the compiler was reading.
 ";
 
+let show_session! : :any -> :any;
 let show_session! s = {
     list.map (fn! line -> console.print! line) (imports s) |> strict!
     list.map (fn! line -> console.print! line) (defs s) |> strict!
     if list.is_empty (defs s) { console.print! "// (nothing defined yet)" } else { () }
 };
 
+let is_command : :string -> :any;
 let is_command text = str.starts_with ":" (str.trim text);
 
 /// `:load` enters a file's declarations as though they had been typed. It reads
 /// the text rather than importing the file, because a REPL wants what is *in*
 /// the file at the top level, and an import would only bring the module in
 /// under a name.
+let command_argument : :string -> :any;
 let command_argument text = str.trim (str.slice (str.find " " text)
                                                 (str.byte_length text - str.find " " text)
                                                 text);
@@ -216,6 +245,7 @@ let command_argument text = str.trim (str.slice (str.find " " text)
 
 /// Where this session's scratch files go. One pair per process, so two sessions
 /// on one machine do not compile over each other.
+let scratch! : :any -> :any;
 let scratch! name =
     (match os.env! "TMPDIR" {
         () => match os.env! "TEMP" { () => match os.platform () { :windows => ".", _ => "/tmp" }, d => d },
@@ -230,6 +260,7 @@ let scratch! name =
 /// after it, and the line that broke things would be long gone. Failure leaves
 /// the session exactly as it was; success joins the new text to it and carries
 /// the compile-time state `dreams.session` produced.
+let define! : :any -> :string -> :any -> :any -> :integer -> :any -> :any;
 let define! s text roots cfg source image = {
     let grown = if declarative text && first_word text == "import" { with_import (str.trim text) s }
                 else { with_def text s };
@@ -248,6 +279,7 @@ let define! s text roots cfg source image = {
 /// carried state and thrown away -- an expression changes what the session
 /// *prints*, not what it means -- so the session comes back only with the
 /// state a definition-less entry leaves.
+let evaluate! : :any -> :string -> :any -> :any -> :integer -> :any -> :any;
 let evaluate! s text roots cfg source image =
     match session_mod.compile! roots cfg source image (program s (echo text))
                                (base_text s) (engine s) (base s) {
@@ -261,6 +293,7 @@ let evaluate! s text roots cfg source image =
         },
     };
 
+let load_lines! : :any -> [:string] -> :any -> :any -> :integer -> :any -> :any;
 let rec load_lines! s lines roots cfg source image =
     match lines {
         [] => s,
@@ -276,6 +309,7 @@ let rec load_lines! s lines roots cfg source image =
 /// A file's declarations, entered as though typed. Items are separated by blank
 /// lines rather than parsed apart: a file written for this is a file of
 /// definitions, and anything more elaborate belongs in a module and an import.
+let load_file! : :any -> :string -> :any -> :any -> :integer -> :any -> :any;
 let load_file! s path roots cfg source image =
     match try! { io.open! path :read } catch e { () } {
         () => {
@@ -301,6 +335,7 @@ union Next {
 }
 
 /// One entry.
+let step! : :any -> :string -> :any -> :any -> :integer -> :any -> :any;
 let step! s text roots cfg source image =
     if is_command text {
         match first_word text {
@@ -348,6 +383,7 @@ let step! s text roots cfg source image =
         Next.go e
     };
 
+let loop! : :any -> :any -> :any -> :any -> :integer -> :any -> :any;
 let rec loop! h s roots cfg source image = {
     console.write! prompt
     match read_entry! h "" {
@@ -368,6 +404,7 @@ let rec loop! h s roots cfg source image = {
     }
 };
 
+let banner : :any -> :any;
 let banner version =
     "dreams " + version + " -- the Dream compiler, interactively.\n"
     + "Definitions are remembered, values are printed, `:help` explains the rest.";
@@ -375,6 +412,7 @@ let banner version =
 /// Start a session. `roots` and `cfg` are the ones the command line asked for,
 /// so a REPL started with `-L` can import what a build with the same `-L`
 /// could.
+let start! : :any -> :any -> :any -> :any;
 let start! roots cfg version = {
     console.error! "dreams: warning: the REPL is deprecated; use source files with `just run FILE` or `mind run` instead."
     console.print! (banner version)
@@ -388,8 +426,10 @@ when test {
 
     /// The parser's verdict on an entry, as the loop reads it: whether it is
     /// finished, and whether it is a declaration or something to evaluate.
+    let reading : :string -> [:any, :any];
     let reading text = [complete text, declarative text];
 
+    let tests : [:any];
     let tests = [
         // --- what an entry is ---
         test.case "an expression is complete and is not a declaration"

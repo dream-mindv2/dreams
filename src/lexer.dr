@@ -80,20 +80,32 @@ let text_of s t = str.slice (span_start t) (Token.byte_length t) s;
 // falls out of every range test below as "not that", so the end of the file
 // needs no special case in any of them.
 
+let tab : :integer;
 let tab     = 9;
+let newline : :integer;
 let newline = 10;
+let ff : :integer;
 let ff      = 12;
+let cr : :integer;
 let cr      = 13;
+let space : :integer;
 let space   = 32;
+let eof : :integer;
 let eof     = 0 - 1;
 
+priv let is_digit : :any -> :bool;
 priv let is_digit b = b >= 48 && b <= 57;
+priv let is_lower : :any -> :bool;
 priv let is_lower b = b >= 97 && b <= 122;
+priv let is_upper : :any -> :bool;
 priv let is_upper b = b >= 65 && b <= 90;
+priv let is_alpha : :any -> :bool;
 priv let is_alpha b = is_lower b || is_upper b || b == 95;
+priv let is_alnum : :any -> :bool;
 priv let is_alnum b = is_alpha b || is_digit b;
 
 /// The value of one digit in `radix`, or `-1` if it is not one.
+priv let digit_value : :any -> :any -> :any;
 priv let digit_value b radix = {
     let v = match b {
         _ if is_digit b => b - 48,
@@ -105,12 +117,14 @@ priv let digit_value b radix = {
 };
 
 /// Does `s` carry the bytes of `word` at `i`?
+priv let starts_at : :any -> :any -> :any -> :any -> :any;
 priv let rec starts_at s i word j =
     if j >= str.byte_length word { true }
     else if str.byte (i + j) s != str.byte j word { false }
     else { starts_at s i word (j + 1) };
 
 /// How many bytes the character starting at `i` occupies.
+let char_bytes : :any -> :any -> :integer;
 let char_bytes s i = {
     let b = str.byte i s;
     match b { _ if b < 128 => 1, _ if b < 224 => 2, _ if b < 240 => 3, _ => 4 }
@@ -118,6 +132,7 @@ let char_bytes s i = {
 
 /// Characters, not bytes, between two offsets. A UTF-8 continuation byte is
 /// `10xxxxxx`: the middle of a character rather than one of its own.
+let char_len : :any -> :any -> :any -> :any -> :any;
 let rec char_len s i stop !acc =
     if i >= stop { acc }
     else if str.byte i s >= 128 && str.byte i s < 192 { char_len s (i + 1) stop acc }
@@ -135,11 +150,13 @@ let rec char_len s i stop !acc =
 /// One scan, in the runtime: `_str_upto` answers the end of the string when
 /// there is no newline left, which is exactly where an unterminated last line
 /// ends.
+let drop_line : :any -> :any -> :any;
 let drop_line s i = str.upto "\n" i s;
 
 /// A `/* */` comment, which does not nest. An unterminated one is an error
 /// naming where it opened -- the alternative is to lex the `/` and the `*` as
 /// operators and report something baffling much further down the file.
+let drop_block : :any -> :any -> :any -> :any -> :any;
 let rec drop_block s i col opened =
     if str.byte i s == eof { [:error, "unterminated block comment", opened] }
     else if str.byte i s == newline { drop_block s (i + 1) 1 opened }
@@ -149,8 +166,10 @@ let rec drop_block s i col opened =
 /// The bytes that are whitespace within a line. A newline is not one of them:
 /// it resets the column and records that a break was crossed, which is the one
 /// thing trivia carries to the parser.
+let inline_space : :string;
 let inline_space = " \t\r\u{c}";
 
+let skip_trivia : :any -> :any -> :any -> :any -> :any;
 let rec skip_trivia s i col nl = match str.byte i s {
     10 => skip_trivia s (i + 1) 1 true,
     b if b == space || b == tab || b == cr || b == ff => {
@@ -184,6 +203,7 @@ let rec skip_trivia s i col nl = match str.byte i s {
 /// to `0xDFFF`, half of a UTF-16 pair), and `_char_of_code` would raise on
 /// either -- which a pure lexer may not do -- so the range is checked here and
 /// a bad one is reported like any other malformed escape.
+let hex_body : :any -> :any -> :any -> :any -> :any;
 let rec hex_body s i acc seen =
     if str.byte i s == 125 {
         if seen == 0 || acc > 1114111 || (acc >= 55296 && acc <= 57343) { () }
@@ -196,6 +216,7 @@ let rec hex_body s i acc seen =
 
 /// What the escape after a backslash at `i` stands for: `[text, next]`, or
 /// `()` if the file ends mid-escape.
+let escape_at : :any -> :any -> :any;
 let escape_at s i = {
     let b = str.byte i s;
     if b == 110 { ["\n", i + 1] }
@@ -218,6 +239,7 @@ let escape_at s i = {
 
 /// A run of ordinary string bytes: everything up to a quote, a backslash, or
 /// the end of the file.
+let plain_run : :any -> :any -> :any;
 let rec plain_run s i =
     if str.byte i s == eof || str.byte i s == 34 || str.byte i s == 92 { i }
     else { plain_run s (i + 1) };
@@ -225,6 +247,7 @@ let rec plain_run s i =
 /// The body of a `"..."`. Pieces are accumulated and joined rather than built
 /// character by character, so a run of ordinary text costs one slice however
 /// long it is.
+let string_body : :any -> :any -> :any -> :any -> :any;
 let rec string_body s i pieces opened =
     if str.byte i s == eof { [:error, "unterminated string", opened] }
     else if str.byte i s == 34 { [:ok, str.join_str "" (list.reverse pieces), i + 1] }
@@ -252,6 +275,7 @@ let rec string_body s i pieces opened =
 /// The offset of the `}` that closes a `{` whose body starts at `i`:
 /// `[:ok, offset]`, or an error. Braces nest, and a string or character
 /// literal inside is stepped over whole, so a `"}"` in one closes nothing.
+let brace_end : :any -> :any -> :any -> :any;
 let rec brace_end s i depth = {
     let b = str.byte i s;
     if b == eof { [:error, "unterminated `{` in an interpolated string", i] }
@@ -269,23 +293,27 @@ let rec brace_end s i depth = {
 };
 
 /// The tokens of `ts` that start before `end`.
+let tokens_before : [Token] -> :any -> :any;
 let rec tokens_before ts end = match ts {
     [] => [],
     [t, ..rest] => if span_start t >= end { [] } else { list.cons t (tokens_before rest end) },
 };
 
 /// Literal text gathered so far, as one piece in front of `parts`.
+let flush_text : :any -> :any -> :any;
 let flush_text pieces parts =
     if list.is_empty pieces { parts } else { list.cons (str.join_str "" (list.reverse pieces)) parts };
 
 /// A run of interpolated-string text: up to a quote, a backslash, a `{`, or
 /// the end of the file.
+let interp_run : :any -> :any -> :any;
 let rec interp_run s i = {
     let b = str.byte i s;
     if b == eof || b == 34 || b == 92 || b == 123 { i } else { interp_run s (i + 1) }
 };
 
 /// The body of a `$"..."`: `[:ok, pieces, next]` or an error.
+let interp_body : :any -> :any -> :any -> :any -> :any -> :any;
 let rec interp_body s i pieces parts opened = {
     let b = str.byte i s;
     if b == eof { [:error, "unterminated string", opened] }
@@ -316,6 +344,7 @@ let rec interp_body s i pieces parts opened = {
 };
 
 /// A `'c'` literal: one character, or one escape, then a closing quote.
+let char_literal : :any -> :any -> [:error, :string, :any] | [:ok, :any, :any];
 let char_literal s i = {
     let inner = if str.byte (i + 1) s == 92 { escape_at s (i + 2) }
                 else if str.byte (i + 1) s == eof { () }
@@ -335,6 +364,7 @@ let char_literal s i = {
 
 /// Digits of `radix`, with `_` as a separator. `[value, next, seen]`; `seen`
 /// counts the digits, so a bare `0x` can be told from `0x0`.
+let digits : :any -> :any -> :any -> :any -> :any -> :any;
 let rec digits s i radix acc seen = {
     let b = str.byte i s;
     if b == 95 { digits s (i + 1) radix acc seen }
@@ -345,6 +375,7 @@ let rec digits s i radix acc seen = {
 };
 
 /// Past the digits and separators of a decimal run.
+let float_run : :any -> :any -> :any;
 let rec float_run s i =
     if is_digit (str.byte i s) || str.byte i s == 95 { float_run s (i + 1) }
     else { i };
@@ -352,6 +383,7 @@ let rec float_run s i =
 /// The exponent of a float, if one starts here: `e` or `E`, an optional sign,
 /// then at least one digit. Answers the offset after it, or `i` if absent --
 /// so `1e` is the number `1` followed by the name `e`.
+let exponent : :any -> :any -> :any;
 let exponent s i = {
     let b = str.byte i s;
     if b != 101 && b != 69 { i }
@@ -362,6 +394,7 @@ let exponent s i = {
     }
 };
 
+let radix_literal : :any -> :any -> :any -> [:error, :string, :any] | [:int, :any, :any];
 let radix_literal s i radix = {
     let d = digits s (i + 2) radix 0 0;
     if list.nth 2 d == 0 { [:error, "a number with no digits", i] }
@@ -372,6 +405,7 @@ let radix_literal s i radix = {
 ///
 /// A float needs a digit on both sides of its point, so `1..2` lexes as `1`,
 /// `..`, `2` rather than as a malformed float, and `x.field` is never a number.
+let number : :any -> :any -> :any;
 let number s i = {
     let b1 = str.byte (i + 1) s;
     if str.byte i s == 48 && (b1 == 120 || b1 == 88) { radix_literal s i 16 }
@@ -398,8 +432,10 @@ let number s i = {
 /// Every byte an identifier may hold, as a set for `_str_span`. Spelled out
 /// rather than tested with `is_alnum`, because the point is to hand the whole
 /// run to the runtime instead of asking about one byte at a time.
+let ident_bytes : :string;
 let ident_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
 
+let ident_run : :any -> :any -> :any;
 let ident_run s i = str.span ident_bytes i s;
 
 /// An identifier, including a trailing `!` when there is one -- the `!` is part
@@ -408,6 +444,7 @@ let ident_run s i = str.span ident_bytes i s;
 ///
 /// `let?` is the one word that ends in `?`, and only that word: `x?` is the
 /// name `x` and then the postfix `?` (see "`?`" in the parser).
+let identifier : :any -> :any -> :any;
 let identifier s i = {
     let j = ident_run s i;
     match str.byte j s {
@@ -422,6 +459,7 @@ let identifier s i = {
 // Longest first: `..` must be tried before `.`, and `$(` before a bare `$`,
 // which is not a token at all.
 
+let operators : [[:string, :dollar_paren], [:string, :hash_bracket], [:string, :percent_brace], [:string, :pipe_into], [:string, :arrow], [:string, :fat_arrow], [:string, :eq_eq], [:string, :bang_eq], [:string, :le], [:string, :ge], [:string, :lt_lt], [:string, :gt_gt], [:string, :and_and], [:string, :or_or], [:string, :dot_dot], [:string, :lparen], [:string, :rparen], [:string, :lbracket], [:string, :rbracket], [:string, :lbrace], [:string, :rbrace], [:string, :lt], [:string, :gt], [:string, :eq], [:string, :plus], [:string, :minus], [:string, :star], [:string, :slash], [:string, :percent], [:string, :at], [:string, :amp], [:string, :caret], [:string, :tilde], [:string, :colon_colon], [:string, :dot], [:string, :comma], [:string, :semi], [:string, :colon], [:string, :bar], [:string, :question]];
 let operators = [
     ["$(", :dollar_paren], ["#[", :hash_bracket], ["%{", :percent_brace],
     ["|>", :pipe_into], ["->", :arrow], ["=>", :fat_arrow],
@@ -454,6 +492,7 @@ let operators = [
 /// Grouping by first byte is also what makes "longest first" structural instead
 /// of a property of the table's order: the two-byte forms are tested inside the
 /// branch their first byte selects, so `..` cannot lose to `.`.
+let operator_at : :any -> :any -> :any;
 let operator_at s i = {
     let a = str.byte i s;
     let b = str.byte (i + 1) s;
@@ -495,6 +534,7 @@ let operator_at s i = {
 
 /// The token at `i`, which is known not to be trivia: `[kind, value, next]`,
 /// or `[:error, message, offset]`.
+let token_at : :any -> :any -> :any;
 let token_at s i = {
     let b = str.byte i s;
     if is_digit b { number s i }
@@ -532,8 +572,10 @@ let token_at s i = {
 // cell scans one token and leaves the rest of the file untouched.
 
 /// An `:error` token, which is always the last cell of a stream.
+let error_token : :string -> :any -> :any -> :any -> [:any];
 let error_token message at nl col = [make :error message at at nl col];
 
+let stream : :any -> :any -> :any -> :any -> :any;
 let rec stream s i col nl = {
     let t = skip_trivia s i col nl;
     if list.head t == :error { error_token (list.nth 1 t) (list.nth 2 t) nl col }
@@ -560,6 +602,7 @@ let tokens s = stream s 0 1 false;
 
 // --- the strict form --------------------------------------------------------
 
+let find_error : [Token] -> :any;
 let rec find_error ts = match ts {
     [] => (),
     [t, ..rest] => if is_error t { t } else { find_error rest },
@@ -611,11 +654,13 @@ let lex s = {
 // from an impure context is a module that cannot be reused.
 
 /// Whether a source lexes: `()` if it does, `[message, offset]` if it does not.
+let verdict : :any -> :any;
 let verdict s = match lex s { Result.ok(_) => (), Result.error(why) => why };
 
 /// Check several sources, in order. Pure, sequential, and the one to reach for
 /// by default -- it works anywhere, including from inside a pure function,
 /// where nothing may spawn.
+let lex_errors : :any -> :any;
 let lex_errors sources = list.map (fn s -> verdict s) sources;
 
 /// The same answer, one process per source.
@@ -633,6 +678,7 @@ let lex_errors sources = list.map (fn s -> verdict s) sources;
 ///   later and somewhere that has no idea it is waiting on a process. An
 ///   impure function should hand back an answer, not an effect still waiting
 ///   to happen.
+let lex_errors! : :any -> :any;
 let lex_errors! sources = {
     let running = strict! (list.map (fn! s -> spawn! $( strict! (verdict s) )) sources);
     strict! (list.map (fn! p -> join! p) running)
@@ -644,22 +690,28 @@ when test {
     import std.test;
 
     /// The kinds of every token, which is what most of these want to check.
+    let kinds : :string -> :any;
     let kinds src = list.map (fn t -> kind t) (lex_ok src);
 
     /// The values of every token.
+    let values : :string -> :any;
     let values src = list.map (fn t -> value t) (lex_ok src);
 
     /// Tokens of a source that must lex cleanly.
+    let lex_ok : :string -> :any;
     let lex_ok src = match lex src { Result.ok(ts) => ts, Result.error(_) => [] };
 
     /// The message of a source that must not.
+    let lex_error : :string -> :any;
     let lex_error src = match lex src {
         Result.ok(_) => "lexed when it should not have",
         Result.error([message, _]) => message,
     };
 
+    let one : :string -> :any;
     let one src = list.head (lex_ok src);
 
+    let tests : [:any];
     let tests = [
         test.case "token range behavior preserves lazy payloads"
             $( test.eq! [[2, 7], 5, true, false]

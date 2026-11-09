@@ -615,10 +615,12 @@ let discover! file extra_roots = {
 when test {
     import std.test;
 
+    let doc : :string -> :any;
     let doc text = match toml.parse text { Result.ok(d) => d, _ => %{} };
 
     // `load_manifest!` reads a file, so what is tested here is everything that
     // does not: the naming rules, and the shapes read back out of a manifest.
+    let parsed : :string -> :any;
     let parsed text = {
         let d = doc text;
         make (toml.get "" d "package" "name") (toml.get "0.0.0" d "package" "version")
@@ -628,16 +630,20 @@ when test {
              "/pkg/mind.toml"
     };
 
+    let two! : :any;
     let two! = {
         let a = make "a" "1.0.0" "/a" "/a" [] "/a/mind.toml";
         let b = make "b" "0.1.0" "/b" "/b" [] "/b/mind.toml";
         list.head (add! b (list.head (add! a empty)))
     };
 
+    let find_index : :any -> :any -> :any;
     let find_index s n = ((by_name s)).[n else ()];
 
+    let vm_of : :string -> :any;
     let vm_of text = vm_settings (toml.entries (doc text) "vm");
 
+    let tests : [:any];
     let tests = [
         test.case "no [vm] table leaves every setting to the VM"
             $( test.eq! (Result.ok (Vm.new ())) (vm_of "[package]\nname = \"a\"") ),

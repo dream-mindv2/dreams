@@ -35,6 +35,7 @@ let rec has_expansion_in trees = match trees {
     [] => false,
     [tree, ..rest] => has_expansion tree || has_expansion_in rest,
 };
+let macro_let : :any -> :any;
 let macro_let item = match item {
     [:macro, n, ps, b, sp] => ast.let_d n ps b false sp,
     _ => item,
@@ -52,8 +53,11 @@ let replace_module : modules.Loader -> :integer -> modules.Module -> modules.Loa
 let replace_module l mi m = modules.set_module mi m l;
 let with_items : modules.Module -> [ast.Decl] -> modules.Module;
 let with_items m items = m.[:items => items];
+let loader : :any -> :any;
 let loader s = s.[:loader else ()];
+let next : :any -> :any;
 let next s = s.[:next else 3221225472];
+let put_loader : modules.Loader -> :any -> :any;
 let put_loader l s = s.[:loader => l];
 
 // --- what a round of expansion costs -------------------------------------------
@@ -80,9 +84,13 @@ let put_loader l s = s.[:loader => l];
 // image and so never builds one, which is deliberate; a meter that charged the
 // image would have to build it first.
 
+let no_meter : %{:phases => %{}, :counts => %{}};
 let no_meter = %{ :phases => %{}, :counts => %{} };
+let metering : :any -> :any;
 let metering s = modules.metering (loader s);
+let meter_of : :any -> :any;
 let meter_of s = s.[:meter else no_meter];
+let put_meter : :any -> :any -> :any;
 let put_meter m s = s.[:meter => m];
 
 /// The clock, the reduction count and the bytes allocated, as one reading, so
@@ -92,6 +100,7 @@ let put_meter m s = s.[:meter => m];
 /// list literal's elements are thunks and a reading taken when somebody gets
 /// round to looking at it is not a reading. An impure `let` is a statement, so
 /// these three happen here, in this order.
+let reading! : :any -> [:any, :any, :any];
 let reading! u = {
     let ns = vm.now_ns! ();
     let reductions = vm.reductions! ();
@@ -100,12 +109,14 @@ let reading! u = {
 };
 /// `a - b`, elementwise and never below zero -- used twice, first to turn two
 /// readings into an interval and then to take the walk back off the work.
+let minus : :any -> :any -> :any;
 let minus a b = map (fn [x, y] -> if x > y { x - y } else { 0 }) (list.zip a b);
 
 /// Force `value` and answer `[value, [ns, reductions, bytes]]`.
 ///
 /// The value arrives unevaluated -- an argument is a thunk -- which is the
 /// whole of the trick and the reason there is no lambda here.
+let charge! : :any -> :any -> [:any, [:integer, :integer, :integer]] | [:any, :any];
 let charge! on value =
     if not on { [value, [0, 0, 0]] }
     else {
@@ -117,6 +128,7 @@ let charge! on value =
         [value, minus (minus forced before) (minus walked forced)]
     };
 
+let add_reading : :any -> :any -> :any -> :any;
 let add_reading meter name r = {
     let phases = meter.[:phases else %{}];
     let cur = phases.[name else [0, 0, 0, 0]];
@@ -126,9 +138,11 @@ let add_reading meter name r = {
 
 /// Charge a reading already taken to `s`, for the phases whose value *is* the
 /// next state and so cannot be handed back beside one.
+let charged : :any -> :any -> scope.Resolution -> :any;
 let charged s name r = if metering s { put_meter (add_reading (meter_of s) name r) s } else { s };
 
 /// Force `value`, charge what that cost to `name`, and answer `[state, value]`.
+let phase! : :any -> :any -> :any -> [:any, :any];
 let phase! s name value = {
     let r = charge! (metering s) value;
     [charged s name (list.nth 1 r), list.head r]
@@ -136,6 +150,7 @@ let phase! s name value = {
 
 /// Count something a phase cannot time: images built, wrappers run, calls
 /// answered, times a fallback was taken.
+let counted : :any -> :any -> :any -> :any;
 let counted s name n = if not (metering s) { s } else {
     let meter = meter_of s;
     let tallies = meter.[:counts else %{}];
@@ -143,13 +158,17 @@ let counted s name n = if not (metering s) { s } else {
 };
 /// Several at once. The counts arrive as thunks and a meter that is off never
 /// forces one, so a round pays nothing for being countable.
+let counts : :any -> :any -> :any;
 let counts s pairs = list.fold (fn acc [name, n] -> counted acc name n) s pairs;
+let tally : :any -> :any -> :any;
 let tally s name = ((meter_of s).[:counts else %{}]).[name else 0];
+let vm_starts : :any -> :any;
 let vm_starts s = tally s :vm_starts;
 
 /// Two meters added together, which the fallback paths need: a batch that
 /// failed spent its phases before the path that answered spent its own, and a
 /// reader wants the compile rather than the half of it that worked.
+let merge_meter : :any -> :any -> %{:phases => :any, :counts => :any};
 let merge_meter a b = {
     let join key combine = fold (fn m [k, v] -> m.[k => (combine (m.[k else ()]) v)])
                                      (a.[key else %{}]) (map.pairs (b.[key else %{}]));
@@ -162,8 +181,10 @@ let merge_meter a b = {
 
 /// The meter, on the loader, for a tool to read. `modules.macro_meter` is the
 /// other end and says why it is kept there.
+let publish_meter : :any -> modules.Loader -> :any;
 let publish_meter s l =
     if not (metering s) { l } else { modules.Loader.set_macro_meter (meter_of s) l };
+let fail : :any -> :integer -> ast.Span -> :string -> :any;
 let fail s mi sp message =
     put_loader (modules.complain sp message (modules.module_source (modules.module_at (loader s) mi))
                                 (loader s)) s;
@@ -181,6 +202,7 @@ let fail s mi sp message =
 /// the reference alone, because by the time anything reads this the macro is an
 /// ordinary global -- `macro_let` has rewritten the declaration -- and the
 /// wrapper is the only thing left saying it was ever anything else.
+let note_macro : :any -> :integer -> :any -> :any -> :any;
 let note_macro s mi start reference = {
     let l = loader s;
     put_loader (modules.with_expansion
@@ -195,6 +217,7 @@ let note_macro s mi start reference = {
 /// to enter. A module index and a name answer both, because the image records
 /// a module's name and the contiguous range of globals that belong to it --
 /// which is the only statement in the container of which globals are whose.
+let macro_target : :any -> :any;
 let macro_target reference = match reference {
     scope.Meaning.global(mi, name, _) => [mi, name],
     scope.Meaning.member(scope.Ref.dream(mi), name, _) => [mi, name],
@@ -204,6 +227,7 @@ let macro_target reference = match reference {
 /// Only a declaration marked `macro` may be the target of `expand`. Use the
 /// normal resolver so aliases and selective imports mean exactly what they do
 /// for ordinary functions.
+let macro_definition : modules.Loader -> :any -> :any;
 let macro_definition l reference = {
     match macro_target reference {
         () => (),
@@ -263,6 +287,7 @@ let prepare! l = prepare_work! l (work_of l);
 /// survives the rewrite is the span, which is why a root is named by where it
 /// was written rather than by what it is called -- and a name would not do
 /// anyway, since two modules may each declare `twice`.
+let transformer_roots : modules.Loader -> :any;
 let transformer_roots l =
     fold (fn acc mi -> {
         let m = modules.module_at l mi;
@@ -285,6 +310,7 @@ let transformer_roots l =
 /// said so the moment it could: staging is where the program is first walked
 /// -- and so where a lazy parse is finally paid -- and declaring is the walk
 /// for names that `scope.resolve!` makes again afterwards.
+let stage_program : modules.Loader -> :any -> :any;
 let stage_program l work = {
     let replaced = apply_items l (map (fn [mi, i, tree] ->
         [mi, i, stage tree]) work);
@@ -343,10 +369,12 @@ let invocation_image ld resolved = {
 /// nothing to quote. What is left is the callee, which is the occurrence the
 /// resolver has to answer about, and the arguments, which are ordinary Dream
 /// data and cross into the macro VM as they stand.
+let call_callee : :any -> :any;
 let call_callee call = match call {
     [:apply, callee, _, _] => callee,
     x => x,
 };
+let call_args : :any -> :any;
 let call_args call = match call {
     [:apply, _, args, _] => args,
     _ => [],
@@ -359,6 +387,7 @@ let call_args call = match call {
 ///
 /// `session` is the open image, or `()` for "there is not one yet"; it comes
 /// back either way, so a caller with several rounds to make opens one.
+let evaluate! : :any -> :any -> :any -> :integer -> :any -> [:any, :any, :any];
 let evaluate! base s session mi calls = {
     let got = evaluate_round! base s session [[mi, calls]];
     [list.head got, list.nth 1 got, list.head (list.nth 2 got)]
@@ -404,6 +433,7 @@ let evaluate! base s session mi calls = {
 /// every round, since every round stages the same program. So the session is
 /// passed in and handed back rather than opened and closed here, and the
 /// caller that owns the rounds owns it.
+let evaluate_round! : :any -> :any -> :any -> :any -> [:any, :any, :any];
 let evaluate_round! base s session0 jobs = {
     let l = loader s;
     let staged = base.[:loader];
@@ -659,6 +689,7 @@ let evaluate_round! base s session0 jobs = {
 /// is a hole and an argument may name what does not exist, perform an effect,
 /// or be another `expand` the macro discards. What a macro *returns* is punched
 /// again on the next round, which is where a nested call is found.
+let punch : :any -> :any -> [[:expansion_hole, :any, :any], [:any, :any]] | [:any, :any];
 let rec punch tree !acc = match tree {
     [:expand, call, sp] => {
         let [calls, n] = acc;
@@ -674,6 +705,7 @@ let rec punch tree !acc = match tree {
          },
 };
 
+let fill : :any -> :any -> :any;
 let rec fill tree values = match tree {
     [:expansion_hole, n, _] => list.nth n values,
     _ => if type_of tree != :list { tree }
@@ -689,6 +721,7 @@ let rec fill tree values = match tree {
 /// This is the one-declaration form, which is what the fallback below uses
 /// when a whole-program round could not answer. `rounds_all!` is the ordinary
 /// path and expands every declaration together.
+let rounds! : :any -> :any -> :any -> :integer -> :any -> :any -> :any;
 let rec rounds! base s session mi tree depth = {
     let punched = punch tree [[], 0];
     let calls = list.reverse (list.head (list.nth 1 punched));
@@ -727,6 +760,7 @@ let rec rounds! base s session mi tree depth = {
 ///
 /// `items` is `[module, index, tree]` for every declaration that had an
 /// `expand` in it. What comes back is the same list with the trees expanded.
+let rounds_all! : :any -> :any -> :any -> :any -> :any -> :any;
 let rec rounds_all! base s session items depth = {
     let punched = list.map (fn it -> {
         let got = punch (list.nth 2 it) [[], 0];
@@ -778,19 +812,24 @@ let rec rounds_all! base s session items depth = {
     }
 };
 
+let base_of : :any -> :any;
 let base_of s  = s.[:base else ()];
+let put_base : :any -> :any -> :any;
 let put_base b s = s.[:base => b];
 
 /// How many declarations `sequential!` has expanded, and how many it had when
 /// its snapshot was prepared: the snapshot can be stale only if the first has
 /// moved on from the second.
+let succeeded : :any -> :any;
 let succeeded s = s.[:succeeded else 0];
+let base_at : :any -> :any;
 let base_at s = s.[:base_at else (0 - 1)];
 
 /// Declaration `i` of module `mi`, expanded and put back where it was.
 ///
 /// `with_new_items` for the reason `apply_items` gives: what a transformer
 /// hands back may name `core` where the source did not.
+let expand_item! : :any -> :any -> :integer -> :any -> :any -> :any;
 let expand_item! base s mi i item = {
     let result = rounds! base s () mi item 0;
     strict! result
@@ -803,6 +842,7 @@ let expand_item! base s mi i item = {
             ((modules.module_items current).[i => expanded]))) state
 };
 
+let complaints : :any -> :any;
 let complaints s = list.length (modules.diags (loader s));
 
 // Which declarations hold which `expand` offsets is a question of spans
@@ -851,6 +891,7 @@ let covers_all at items = {
 /// its declarations numbered, and the ones an offset falls inside. Separate
 /// from `work_of` because the decision those feed is the *file's* and not this
 /// module's -- see there.
+let picks_of : modules.Loader -> :integer -> [:any, :any, :any, [:never], [:never]] | [:any, :any, :any, :any, :any];
 let picks_of l mi = {
     let m = modules.module_at l mi;
     let source = modules.module_source m;

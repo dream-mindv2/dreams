@@ -1604,6 +1604,7 @@ let frame_for x live rest env sp g = {
     [below, "@k" + to_string n, store_live below live env g4]
 };
 
+let inline_budget : :integer;
 let inline_budget = 64;
 
 /// What is left of `budget` after `e`, below zero when it does not fit. It stops counting there,

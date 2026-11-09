@@ -104,16 +104,20 @@ let func_bodies l = Lowering.func_bodies l;
 /// and that frame holds this state -- which holds the arena as it stood when
 /// the function's body was finished. One per function is not many, but it is
 /// one *whole arena* apiece.
+let set_func_body : :integer -> :any -> Lowering -> :any;
 let set_func_body fi n l =
     if ir.settled n {
         (l |> Lowering.set_func_bodies ((func_bodies l).[fi => n]))
     } else { l };
 
+let subst : Lowering -> :any;
 let subst l = Lowering.subst l;
+let set_subst : :any -> Lowering -> :any;
 let set_subst m l = (l |> Lowering.set_subst m);
 
 let pending_comp : Lowering -> [[:any]];
 let pending_comp l = Lowering.pending_comp l;
+let add_comp : :any -> :integer -> ast.Span -> Lowering -> :any;
 let add_comp node fi span l =
     (l |> Lowering.set_pending_comp (list.append (pending_comp l) [[node, fi, source l, span]]));
 
@@ -130,9 +134,11 @@ let comp_values l = Lowering.comp_values l;
 let comp_key : :integer -> ast.Span -> :integer;
 let comp_key source span = source * 4294967296 + ast.span_start span;
 
+let complain : ast.Span -> :string -> Lowering -> :any;
 let complain span message l =
     (l |> Lowering.set_diags (list.append (l_diags l) [diag.in_source (source l) (diag.error span message)]));
 
+let warn : ast.Span -> :string -> :any -> Lowering -> :any;
 let warn span message note l =
     (l |> Lowering.set_diags (list.append (l_diags l)
                      [diag.in_source (source l) (diag.with_note note (diag.warning span message))]));
@@ -153,24 +159,30 @@ let kids xs l = {
     [set_prog program l, offset]
 };
 
+let set_flag : :any -> :any -> Lowering -> :any;
 let set_flag i f l = set_prog (ir.set_node_flag i f (prog l)) l;
 
+let is_impure_node : :any -> Lowering -> :any;
 let is_impure_node i l = ir.node_is_impure (ir.node_at i (prog l));
 
 /// Effects are visible through any enclosing node, so the flag travels up.
+let inherit : :any -> :any -> Lowering -> :any;
 let inherit i children l =
     if ir.has_impure (prog l) && any_impure children (prog l) { set_flag i ir.f_impure l }
     else { l };
 
+let any_impure : :any -> :any -> :bool;
 let rec any_impure ks p = match ks {
     [] => false,
     [k, ..rest] => (ir.is_node k && ir.node_is_impure (ir.node_at k p)) || any_impure rest p,
 };
 
 /// What `scope` recorded for the name at this span.
+let lookup : ast.Span -> Lowering -> :any;
 let lookup span l = scope.resolution (res l) (ctx l) (source l) span;
 
 /// The slot a binder at this span was given.
+let slot_at : ast.Span -> Lowering -> :any;
 let slot_at span l =
     expand macros.with_some binding (scope.binding (res l) (ctx l) (source l) span)
         (list.nth 1 binding);
@@ -258,6 +270,7 @@ let lower_apply callee args span l = {
     }
 };
 
+let lower_call : :any -> :any -> :any -> ast.Span -> Lowering -> :any;
 let lower_call found callee args span l =
     match unwrap found args 8 l {
         // ..and a wrapper around a `get` or a `set` is that operation.
@@ -299,6 +312,7 @@ let lower_record id variant fields l = {
 /// What the constructor a pattern names makes: `[id, variant, arity]`, or
 /// `()` when it names no constructor. Read from the resolver's wrappers,
 /// where every constructor is filed with the id it stamps (`scope.wrapper_of`).
+let constructor_of : :any -> Lowering -> :any;
 let constructor_of ctor l =
     match callee_resolution ctor l {
         scope.Meaning.global(_, _, g) => constructor_at g l,
@@ -306,29 +320,35 @@ let constructor_of ctor l =
         _ => (),
     };
 
+let constructor_at : :any -> Lowering -> :any;
 let constructor_at g l =
     match (scope.wrappers (res l)).[g else ()] {
         scope.Wrapper(scope.Inline.record(id, variant, _, fields), _, _) => [id, variant, fields],
         _ => (),
     };
 
+let builtin_ref : :any -> Lowering -> :any;
 let builtin_ref name l =
     match builtins.id name {
         () => emit_leaf :unit l,
         b  => emit (ir.node :builtin b ir.no_node ir.no_node) l,
     };
 
+let call_builtin : :any -> :any -> Lowering -> :any;
 let call_builtin name args l = {
     let got = builtin_ref name l;
     emit_apply (list.nth 1 got) args (list.head got)
 };
 
+let binary : :any -> :any -> :any -> Lowering -> [:any, :any];
 let binary op a b l = {
     let made = emit (ir.node op a b ir.no_node) l;
     [inherit (list.nth 1 made) [a, b] (list.head made), list.nth 1 made]
 };
 
+let bool_and : :any -> :any -> Lowering -> :any;
 let bool_and a b l = binary :and a b l;
+let eq_const : :any -> :any -> Lowering -> :any;
 let eq_const v k l = binary :eq v k l;
 
 // --- names ----------------------------------------------------------------------
@@ -346,6 +366,7 @@ let eq_const v k l = binary :eq v k l;
 // program that will not run.
 
 /// What the callee of an application resolves to, when it is a name at all.
+let callee_resolution : :any -> Lowering -> :any;
 let callee_resolution callee l =
     match callee {
         [:name, _, span]     => lookup span l,
@@ -362,6 +383,7 @@ let callee_resolution callee l =
     };
 
 /// The call site's arguments, rebuilt as the wrapper's body arranged them.
+let wrapper_actuals : :any -> :any -> :any;
 let wrapper_actuals plan args =
     list.map (fn step ->
         match step {
@@ -372,6 +394,7 @@ let wrapper_actuals plan args =
 /// The container operation a wrapper stands for, rebuilt around a call's own
 /// arguments. They are syntax rather than nodes, so each is lowered exactly
 /// where it would have been -- the same promise the call rewrite makes.
+let op_expr : :any -> :any -> ast.Span -> :any;
 let op_expr kind operands span =
     match kind {
         :get => ast.get_e (list.nth 0 operands) (list.nth 1 operands)
@@ -384,6 +407,7 @@ let op_expr kind operands span =
 /// The arguments are syntax, not nodes: they are lowered at the call site
 /// exactly as they would have been, which is what keeps every one of them the
 /// same thunk in the same place.
+let unwrap : :any -> :any -> :any -> Lowering -> :any;
 let rec unwrap found args fuel l =
     if fuel <= 0 { () }
     else {
@@ -394,6 +418,7 @@ let rec unwrap found args fuel l =
         }
     };
 
+let unwrap_global : :any -> :any -> :any -> :any -> Lowering -> :any;
 let unwrap_global found g args fuel l =
     match (scope.wrappers (res l)).[g else ()] {
         () => (),
@@ -424,12 +449,14 @@ let unwrap_global found g args fuel l =
 /// value of their own, and are left as the wrapper. Only a bare reference is
 /// rewritten: a call of a wrapper with too few or too many arguments still
 /// calls the wrapper.
+let as_value : :any -> Lowering -> :any;
 let as_value found l =
     match builtin_alias found 8 l {
         () => found,
         b  => b,
     };
 
+let builtin_alias : :any -> :any -> Lowering -> :any;
 let rec builtin_alias found fuel l =
     if fuel <= 0 { () }
     else {
@@ -441,6 +468,7 @@ let rec builtin_alias found fuel l =
         }
     };
 
+let builtin_alias_global : :any -> :any -> Lowering -> :any;
 let builtin_alias_global g fuel l =
     match (scope.wrappers (res l)).[g else ()] {
         scope.Wrapper(target, plan, arity) =>
@@ -453,6 +481,7 @@ let builtin_alias_global g fuel l =
 /// The callee of an application, given what it resolved to. A name or a member
 /// whose resolution is already in hand skips the second lookup; anything else
 /// is an ordinary expression.
+let lower_callee : :any -> :any -> Lowering -> :any;
 let lower_callee callee found l =
     match callee {
         [:name, n, span] =>
@@ -471,6 +500,7 @@ let lower_callee callee found l =
 
 /// The node for a wrapper's target, marked impure when the name it ends in
 /// says so -- the same rule `lower_name` applies to a name written by hand.
+let emit_target : :any -> Lowering -> :any;
 let emit_target found l = {
     let got = emit_resolution found l;
     if builtins.is_impure_name (resolved_name found) {
@@ -480,6 +510,7 @@ let emit_target found l = {
 };
 
 /// The name a resolution ends in, which is what says whether it is impure.
+let resolved_name : :any -> :any;
 let resolved_name found =
     match found {
         scope.Meaning.builtin(name) => name,
@@ -493,6 +524,7 @@ let resolved_name found =
 /// that the VM sequences the effect rather than only the compiler knowing about
 /// it. `scope` refused the pure functions that reach an effect; this records
 /// which nodes *are* one.
+let lower_name : :any -> ast.Span -> Lowering -> :any;
 let lower_name name span l = {
     let found = lookup span l;
     // An import may rename `f!` to a name without `!`. Retain its effect
@@ -504,6 +536,7 @@ let lower_name name span l = {
 /// The same, for a caller that has already asked what the name resolves to.
 /// Applications ask, because a call of a wrapper is rewritten and one that is
 /// not should not pay for the question twice.
+let lower_resolved : :any -> :any -> ast.Span -> Lowering -> :any;
 let lower_resolved name found span l = {
     let got = emit_resolution_or found span l;
     if builtins.is_impure_name name || builtins.is_impure_name (resolved_name found) {
@@ -512,6 +545,7 @@ let lower_resolved name found span l = {
     else { got }
 };
 
+let emit_name : ast.Span -> Lowering -> :any;
 let emit_name span l = emit_resolution (lookup span l) l;
 
 /// A local, or -- when nothing ever writes that slot -- the expression it
@@ -519,6 +553,7 @@ let emit_name span l = emit_resolution (lookup span l) l;
 /// its own expression is lowered, so a table that somehow named itself would
 /// stop rather than spin; nothing builds one, and a compiler must terminate on
 /// a program that will not run.
+let emit_local : :any -> Lowering -> :any;
 let emit_local slot l =
     match (subst l).[slot else ()] {
         () => emit (ir.node :local slot ir.no_node ir.no_node) l,
@@ -530,10 +565,12 @@ let emit_local slot l =
 
 /// A recorded resolution, or -- when there is none -- whatever `emit_resolution`
 /// makes of that, which is the same unit placeholder it always was.
+let emit_resolution_or : :any -> ast.Span -> Lowering -> :any;
 let emit_resolution_or found span l = emit_resolution found l;
 
 /// One resolution, as the node that fetches it. Separate from `emit_name`
 /// because a wrapper's call site emits a resolution it did not read off a name.
+let emit_resolution : :any -> Lowering -> :any;
 let emit_resolution found l =
     match found {
         scope.Meaning.local(slot, _) => emit_local slot l,
@@ -563,6 +600,7 @@ let emit_resolution found l =
 /// The resolver reserves one scratch slot for each saturated prelude member.
 /// Identity comes from its resolved global, so a user's `Result.map` is left
 /// alone. Partial applications keep their ordinary call frames.
+let result_call : :any -> Lowering -> :any;
 let result_call e l = match e {
     [:pipe, x, rhs, sp] => match rhs {
         [:apply, f, args, _] => result_call (ast.apply_e f (list.append args [x]) sp) l,
@@ -584,6 +622,7 @@ let result_call e l = match e {
     _ => (),
 };
 
+let result_id : :any -> :any -> :any;
 let result_id kind ok = "std.prelude." + kind + "." +
     if kind == "Result" { if ok { "ok" } else { "error" } }
     else { if ok { "some" } else { "none" } };
@@ -591,6 +630,7 @@ let result_id kind ok = "std.prelude." + kind + "." +
 /// A prelude `Result` or `Option` built in place, as its constructor would
 /// build it: `ok`'s variant around `payload`, or -- for `Option.none`, which
 /// carries nothing -- no fields at all.
+let make_variant : :any -> :any -> :any -> Lowering -> :any;
 let make_variant kind ok payload l = {
     let placed = kids (if kind == "Option" && not ok { [] } else { [payload] }) l;
     let [program, id] = ir.intern_atom (result_id kind ok) (prog (list.head placed));
@@ -598,12 +638,14 @@ let make_variant kind ok payload l = {
                  (id + ir.record_variant)) (set_prog program (list.head placed))
 };
 
+let node_block : :any -> Lowering -> [:any, :any];
 let node_block nodes l = {
     let placed = kids nodes l;
     let made = emit (ir.node :block (list.nth 1 placed) (list.length nodes) ir.no_node) (list.head placed);
     [inherit (list.nth 1 made) nodes (list.head made), list.nth 1 made]
 };
 
+let node_if : :any -> :any -> :any -> Lowering -> [:any, :any];
 let node_if cond yes no l = {
     let made = emit (ir.node :if cond yes no) l;
     [inherit (list.nth 1 made) [cond, yes, no] (list.head made), list.nth 1 made]
@@ -612,6 +654,7 @@ let node_if cond yes no l = {
 /// Peel maps of this union into each region. A stage that can choose another
 /// variant starts a new region, so its following stages are emitted once.
 /// A stage is [tag, argument node (or absent), scratch slot].
+let lower_result_chain : :any -> :any -> :any -> Lowering -> :any;
 let rec lower_result_chain e kind stages l = match result_call e l {
     [k, tag, args, slot] if k == kind && (list.is_empty stages || fuse.result_maps tag) => {
         let argument = if list.length args == 1 { [l, ir.no_node] }
@@ -627,6 +670,7 @@ let rec lower_result_chain e kind stages l = match result_call e l {
 };
 
 /// Evaluate a union once, checking both ids just as the original match did.
+let result_branch : :any -> :any -> :any -> :any -> Lowering -> :any;
 let rec result_branch value kind stages slot l = {
     let bound = emit (ir.node :bind slot value ir.no_node) l;
     let sequenced = set_flag (list.nth 1 bound) ir.f_strict (inherit (list.nth 1 bound) [value] (list.head bound));
@@ -649,6 +693,7 @@ let rec result_branch value kind stages slot l = {
 /// `original` is the whole union when no mapping has changed its payload.
 /// Passing that node through preserves the input record on either untouched
 /// branch, including the differently typed failure of `Result.map`.
+let result_continue : :any -> :any -> :any -> :any -> :any -> Lowering -> :any;
 let rec result_continue kind ok payload original stages l = match stages {
     [] => if ir.is_node original { [l, original] } else { make_variant kind ok payload l },
     [[tag, arg, slot], ..rest] => match tag {
@@ -933,6 +978,7 @@ let constant_key i p = match ir.node_op (ir.node_at i p) {
 
 /// A nested function: lower its body, remember which node that was, and emit
 /// the instruction that builds the closure or thunk.
+let lower_function : ast.Span -> :any -> :any -> :any -> Lowering -> :any;
 let rec lower_function span op ps body l =
     match function_at (lookup span l) {
         () => emit_leaf :unit l,
@@ -959,6 +1005,7 @@ let rec lower_function span op ps body l =
     };
 
 /// The function a closure or a thunk was resolved to, or `()`.
+let function_at : :any -> :any;
 let function_at found = match found {
     scope.Meaning.closure(fi) => fi,
     scope.Meaning.thunk(fi) => fi,
@@ -979,6 +1026,7 @@ let function_at found = match found {
 /// that slot before the body runs. They are bound lazily, as a destructuring
 /// `let` binds them, so naming an argument's parts makes a function no stricter
 /// in it.
+let lower_body : :any -> :any -> Lowering -> :any;
 let lower_body ps body l =
     if not (list.any (fn p -> has_pattern p || ast.param_strict p) ps) { lower_expr body l }
     else {
@@ -1006,15 +1054,18 @@ let lower_body ps body l =
         [inherit (list.nth 1 made) stmts (list.head made), list.nth 1 made]
     };
 
+let has_pattern : :any -> :bool;
 let has_pattern p = match ast.param_pattern p { () => false, _ => true };
 
 /// Lower a list of expressions, keeping their order: `[lowering, indices]`.
+let lower_all : :any -> Lowering -> :any;
 let rec lower_all es l =
     list.fold (fn acc e -> {
         let got = lower_expr e (list.head acc);
         [list.head got, list.append (list.nth 1 acc) [list.nth 1 got]]
     }) [l, []] es;
 
+let lower_seq : :any -> :any -> Lowering -> [:any, :any];
 let rec lower_seq op items l = {
     let done = lower_all items l;
     let placed = kids (list.nth 1 done) (list.head done);
@@ -1025,6 +1076,7 @@ let rec lower_seq op items l = {
 
 /// A runtime field read: the object is a value and the field is looked up on
 /// it when the program runs.
+let lower_value_field : :any -> :any -> Lowering -> [:any, :any];
 let lower_value_field obj field l = {
     let o = lower_expr obj l;
     let named = ir.intern_str field (prog (list.head o));
@@ -1044,6 +1096,7 @@ let lower_value_field obj field l = {
 /// the *base's* resolution rather than the member's. Only a namespace member's
 /// resolution names the field it ends in; a resolution naming anything else is
 /// the base value leaking through, and the field is read at run time.
+let lower_field : :any -> ast.Span -> Lowering -> :any;
 let rec lower_field e span l =
     match lookup span l {
         () =>
@@ -1061,12 +1114,14 @@ let rec lower_field e span l =
     };
 
 /// Only a direct statement registers cleanup; aliases and nested calls do not.
+let deferred : :any -> Lowering -> [:any] | [:never];
 let deferred st l = match st {
     [:apply, callee, [body], _] =>
         if callee_resolution callee l == scope.Meaning.builtin "defer!" { [body] } else { [] },
     _ => [],
 };
 
+let cleanup_block : :any -> Lowering -> :any;
 let rec cleanup_block pairs l = match pairs {
     [] => emit_leaf :unit l,
     [pair, ..rest] => {
@@ -1085,6 +1140,7 @@ let rec cleanup_block pairs l = match pairs {
     },
 };
 
+let lower_block : :any -> ast.Span -> Lowering -> :any;
 let rec lower_block stmts span l = {
     // A statement lowers to one node, except a destructuring `let`, which
     // lowers to several binds. So each node travels with the statement it came
@@ -1170,6 +1226,7 @@ let rec lower_block stmts span l = {
 /// A block's bind: `[lowering, node]`. Lazy, unless the value has effects --
 /// binding an effectful expression sequences it here rather than at first use,
 /// so effects happen in written order.
+let bind_value : :any -> :any -> Lowering -> [:any, :any];
 let bind_value slot value l = {
     let made = emit (ir.node :bind slot value ir.no_node) l;
     let i = list.nth 1 made;
@@ -1197,6 +1254,7 @@ let bind_value slot value l = {
 // have to keep -- and a global callee is the only self call it recognises at
 // all (`check_self_call` in dream/src/jit.cpp).
 
+let local_node : :any -> Lowering -> :any;
 let local_node slot l = emit (ir.node :local slot ir.no_node ir.no_node) l;
 
 /// The call that enters the loop: the producer's arguments, in the order they
@@ -1204,6 +1262,7 @@ let local_node slot l = emit (ir.node :local slot ir.no_node ir.no_node) l;
 /// pipeline was written in, which is where they were always going to be
 /// evaluated -- and so with whatever substitution was already in force, which
 /// is how a pipeline written inside another one's stage still works.
+let lower_fused : :any -> Lowering -> :any;
 let lower_fused p l = {
     let outer = subst l;
     let built = set_subst outer (fused_body p (set_subst (subst_of p) l));
@@ -1222,6 +1281,7 @@ let lower_fused p l = {
                (list.head callee)
 };
 
+let subst_of : :any -> :any;
 let subst_of p =
     list.fold (fn m e -> m.[(list.nth 0 e) => (list.nth 1 e)])
               (%{}) (fuse.Plan.subst p);
@@ -1230,6 +1290,7 @@ let subst_of p =
 /// producer's arguments as they were written; a list as the cursor, with
 /// nothing carried; an array carried, with the cursor at zero. The container
 /// is lowered once, here, where it was always going to be evaluated.
+let fused_inits : :integer -> Lowering -> :any;
 let fused_inits source l = match source {
     // The list as the cursor, and the count from zero.
     [:enumerate, [xs]] => {
@@ -1253,6 +1314,7 @@ let fused_inits source l = match source {
 /// The element a loop over a list or an array is at: the head of what is
 /// left of the list, or the array at the cursor. The loop has already asked
 /// whether there is one.
+let fused_element : :any -> Lowering -> [:any, :any];
 let fused_element tag l = {
     let cur = local_node fuse.cursor_slot l;
     match tag {
@@ -1288,6 +1350,7 @@ let fused_element tag l = {
 };
 
 /// The head of the second list `zip` walks, which it carries.
+let carried_head : Lowering -> [:any, :any];
 let carried_head l = {
     let held = local_node fuse.carried_slot l;
     let zero = const_int 0 (list.head held);
@@ -1297,6 +1360,7 @@ let carried_head l = {
 
 /// The loop itself, emitted into the same arena as everything else -- a
 /// function is a body node and a descriptor, not an arena of its own.
+let fused_body : :any -> Lowering -> :any;
 let fused_body p l = {
     let stag = list.nth 0 (fuse.Plan.source p);
     let replicating = stag == :replicate;
@@ -1388,6 +1452,7 @@ let fused_body p l = {
 /// at twice. The arena is a tree -- a node reached from two parents would be
 /// walked twice by everything that reads it, and would take a flag meant for
 /// one of them in both places.
+let self_turn : :any -> :any -> :any -> Lowering -> :any;
 let self_turn p stag acc_at l = {
     let cur = local_node fuse.cursor_slot l;
     let advanced = match stag {
@@ -1431,6 +1496,7 @@ let self_turn p stag acc_at l = {
 /// predicate asked, and either the answer -- `true` for `any`, `false` for
 /// `all` and `none`, the element for `find` -- or the next turn. Nothing after the deciding element
 /// is asked, as `list.any` asks nothing after it.
+let deciding_turn : :any -> :any -> :any -> Lowering -> [:any, :any];
 let deciding_turn p stag sink l = {
     // A sink that decides early always has its predicate written down.
     let asked = match fuse.Plan.step p {
@@ -1456,6 +1522,7 @@ let deciding_turn p stag sink l = {
 /// for the rest, built as `list.map` builds its cells -- `_list_cons` of the
 /// element and the recursive call -- so the element and the rest are as lazy
 /// as they were there.
+let collecting_turn : :any -> :any -> :any -> Lowering -> :any;
 let collecting_turn p stag sink l = {
     let x = emit_local (fuse.Plan.elem p) l;
     let rest = self_turn p stag (fn l0 -> local_node fuse.acc_slot l0) (list.head x);
@@ -1468,6 +1535,7 @@ let collecting_turn p stag sink l = {
 /// The `filter`s, as one condition. `and` is short-circuiting, which is what
 /// keeps the order right: an element the first filter rejects never reaches
 /// the second, exactly as it never reached the second `filter`'s call.
+let lower_guards : :any -> Lowering -> :any;
 let lower_guards gs l =
     list.fold (fn acc g -> {
         let got = lower_expr g (list.head acc);
@@ -1480,6 +1548,7 @@ let lower_guards gs l =
 /// What the accumulator becomes: the fold's own function, whose parameters
 /// `scope` bound to these very slots, or the operator `sum` and `product`
 /// stand for.
+let fused_step : :any -> Lowering -> :any;
 let fused_step p l =
     match fuse.Plan.step p {
         // `count`: one more when the predicate holds.
@@ -1528,6 +1597,7 @@ let fused_step p l =
 /// A step written at the call site: its body, and -- when the element was
 /// written as a pattern, `fn acc [k, v]` -- the element taken apart in front of
 /// it, checked as the lambda's own parameter would have been (`lower_body`).
+let fused_written : :any -> :any -> :any -> Lowering -> :any;
 let fused_written p body ps l =
     match if list.length ps == 2 { ast.param_pattern (list.head ps) } else { () } {
         () => element_written p body ps l,
@@ -1546,6 +1616,7 @@ let fused_written p body ps l =
 
 /// The step's body with its element taken apart in front of it, when the
 /// element was written as a pattern.
+let element_written : :any -> :any -> :any -> Lowering -> :any;
 let element_written p body ps l =
     match [list.head (fuse.Plan.source p), ast.param_pattern (list.last ps)] {
         [_, ()] => lower_expr body l,
@@ -1587,10 +1658,12 @@ let element_written p body ps l =
     };
 
 /// A name or `_`: a part of a pattern that needs no check of its own.
+let plain_binder : :any -> :bool;
 let plain_binder pat = match pat { [:bind, _, _] => true, [:wildcard, _] => true, _ => false };
 
 /// `[lowering, statements]`: `value` bound to the name `pat` gives, or nothing
 /// for `_`.
+let bound_to : :any -> :any -> Lowering -> [:any, [:any]] | [:any, [:never]];
 let bound_to pat value l = match pat {
     [:bind, _, span] => {
         let made = emit (ir.node :bind (expand macros.coalesce (slot_at span l) 0) value ir.no_node) l;
@@ -1600,6 +1673,7 @@ let bound_to pat value l = match pat {
 };
 
 /// Part `i` of the pair in slot `slot`, or `()`.
+let pair_part : :any -> :any -> Lowering -> [:any, :any];
 let pair_part slot i l = {
     let x = emit_local slot l;
     let at = const_int i (list.head x);
@@ -1620,6 +1694,7 @@ let pair_part slot i l = {
 /// The seed is forced too, on the first turn, as `list.fold` forces it: a
 /// strict fold is strict in its accumulator from the start, and `fold_lazy`
 /// is the fold for a seed that must stay unforced.
+let forced_acc : :any -> Lowering -> [:any, :any];
 let forced_acc call l = {
     let acc = local_node fuse.acc_slot l;
     let forced = emit (ir.node :force (list.nth 1 acc) ir.no_node ir.no_node) (list.head acc);
@@ -1638,6 +1713,7 @@ let forced_acc call l = {
 
 /// `[lowering, test, binds]`, where a bind is `[span, value node]` -- the span
 /// being where the binder was written, which is how the slot is found.
+let pattern_test : :any -> :any -> :any -> Lowering -> :any;
 let rec pattern_test p subject binds l =
     match p {
         [:wildcard, _] => { let t = const_bool true l; [list.head t, list.nth 1 t, binds] },
@@ -1674,6 +1750,7 @@ let rec pattern_test p subject binds l =
 /// which is also how many fields it has -- then the fields by position, as an
 /// array pattern's elements. A name that is no constructor, or the wrong
 /// number of fields, is an error here rather than an arm that never matches.
+let record_test : :any -> :any -> :any -> :any -> ast.Span -> Lowering -> :any;
 let rec record_test ctor fields subject binds span l =
     match constructor_of ctor l {
         () => {
@@ -1706,6 +1783,7 @@ let rec record_test ctor fields subject binds span l =
 /// `let?`'s pattern: the subject is the prelude's `Result.ok` or
 /// `Option.some` -- asked by id, as `record_test` asks -- and `inner` is
 /// matched against the one field both of them hold.
+let success_test : :any -> :any -> :any -> Lowering -> [:any, :any, :any];
 let success_test inner subject binds l = {
     let tests = list.fold (fn acc id -> {
         let k = const_atom id (list.head acc);
@@ -1727,12 +1805,14 @@ let success_test inner subject binds l = {
 /// "the end of a list" look the same from `_match_is_cons` alone. `type_of`
 /// answers `:list` for both the empty list and a cell, so one test covers every
 /// list pattern.
+let is_type : :any -> :any -> Lowering -> :any;
 let rec is_type name subject l = {
     let ty = call_builtin "type_of" [subject] l;
     let want = const_atom name (list.head ty);
     eq_const (list.nth 1 ty) (list.nth 1 want) (list.head want)
 };
 
+let list_test : :any -> :any -> :any -> :any -> Lowering -> [:any, :any, :any];
 let rec list_test items rest subject binds l = {
     let typed = is_type "list" subject l;
     // Walked one cell at a time, so nothing beyond what the pattern names is
@@ -1772,6 +1852,7 @@ let rec list_test items rest subject binds l = {
 
 /// An array knows its own length, so the shape is one comparison rather than a
 /// walk.
+let array_test : :any -> :any -> :any -> :any -> ast.Span -> Lowering -> :any;
 let rec array_test items rest subject binds span l = {
     let typed = is_type "array" subject l;
     let length = call_builtin "len" [subject] (list.head typed);
@@ -1803,6 +1884,7 @@ let rec array_test items rest subject binds span l = {
     }
 };
 
+let map_test : :any -> :any -> :any -> ast.Span -> Lowering -> :any;
 let rec map_test pairs subject binds span l = {
     let typed = is_type "map" subject l;
     list.fold (fn acc kv -> {
@@ -1872,9 +1954,11 @@ let shown_path ld p = {
 let with_places : modules.Loader -> scope.Resolution -> scope.Resolution;
 let with_places ld r = (r |> scope.Resolution.set_places (places_of ld));
 
+let places : scope.Resolution -> :any;
 let places r = scope.Resolution.places r;
 
 /// `[path, line, col]` for a span in the source being lowered.
+let place_of : ast.Span -> Lowering -> [:string, :integer, :integer] | [:any, :any, :any];
 let place_of span l = match (places (res l)).[source l else ()] {
     () => ["?", 0, 0],
     [path, starts, src] => {
@@ -1886,6 +1970,7 @@ let place_of span l = match (places (res l)).[source l else ()] {
 /// What the places of a part's sources come to, for its unit key: a part
 /// lowered against one set of line starts is not the part lowered against
 /// another, even where every span in it is the same.
+let places_key : scope.Resolution -> :any -> :any;
 let places_key r bodies = {
     let srcs = list.unique (map (fn nb -> list.nth 1 (list.nth 1 nb)) bodies);
     map (fn i -> match (places r).[i else ()] {
@@ -1915,6 +2000,7 @@ let match_failure subject span l = {
 
 /// The value if it fits the pattern, and a raise of `:match_error` if it does
 /// not: a `match` whose one arm hands the value back.
+let check_value : :any -> :any -> Lowering -> [:any, :any];
 let check_value pattern value l = {
     let tested = pattern_test pattern value [] l;
     let test = list.nth 1 tested;
@@ -1930,6 +2016,7 @@ let check_value pattern value l = {
 /// `[lowering, binds]`. The first holds the checked value, and each of the rest
 /// binds a name to its part of the first.
 /// A constructor as it was written: `Shape.circle`, `geo.Shape.circle`.
+let written : :any -> :any;
 let rec written e = match e {
     [:name, n, _] => n,
     [:field, obj, n, _] => written obj + "." + n,
@@ -1937,6 +2024,7 @@ let rec written e = match e {
 };
 
 /// The parts at each position of an array or a record, by `_match_at`.
+let extract_at : :any -> :any -> :any -> :any -> Lowering -> :any;
 let extract_at items subject want binds l =
     fold (fn acc pair ->
         if not (wants want (list.nth 0 pair)) { acc }
@@ -1947,6 +2035,7 @@ let extract_at items subject want binds l =
                     (list.head element)
         }) [l, binds] (list.zip items (list.range 0 (list.length items)));
 
+let destructure : :any -> :any -> Lowering -> :any;
 let destructure pattern value l = {
     let checked = check_value pattern value l;
     let slot = expand macros.coalesce (slot_at (scope.checked_span pattern) (list.head checked)) 0;
@@ -1968,6 +2057,7 @@ let destructure pattern value l = {
 ///
 /// These are the accessors a `match` uses. They force the cells on the way,
 /// which the check already forced, and never the part itself.
+let extract : :any -> :any -> :any -> :any -> Lowering -> :any;
 let rec extract p subject want binds l =
     match p {
         [:bind, _, span] =>
@@ -2001,6 +2091,7 @@ let rec extract p subject want binds l =
     };
 
 /// A list a cell at a time, and no further than the last part wanted.
+let extract_list : :any -> :any -> :any -> :any -> :any -> Lowering -> :any;
 let rec extract_list items rest cursor want binds l =
     match items {
         [] =>
@@ -2025,14 +2116,17 @@ let rec extract_list items rest cursor want binds l =
     };
 
 /// Does this pattern bind anything `want` asks for?
+let wants : :any -> :any -> :any;
 let wants want p = list.any (fn b -> want (list.nth 1 b)) (scope.pattern_bindings p);
 
+let rest_wanted : :any -> :any -> :any;
 let rest_wanted want rest = match rest { [_, name_span] => want name_span, _ => false };
 
 /// The hidden global behind a top-level destructuring: the value, held, and then
 /// checked. Shaped as a `match` is -- a strict bind of the subject, then the test
 /// -- because it is only ever forced by a name that needs the check, and a global
 /// remembers what it came to.
+let lower_destructure : :any -> :any -> ast.Span -> Lowering -> [:any, :any];
 let lower_destructure pattern body span l = {
     let value = lower_expr body l;
     let held = expand macros.coalesce (slot_at span (list.head value)) 0;
@@ -2049,6 +2143,7 @@ let lower_destructure pattern body span l = {
 /// One name of a top-level destructuring: its part of the hidden global. The
 /// hidden global is found by name in the module this body was resolved against,
 /// which under `derive` is the deriving module -- whose hidden global it is.
+let lower_destructured : :any -> :any -> :any -> Lowering -> :any;
 let lower_destructured hidden pattern name_span l =
     match scope.global_index (scope.r_env_at (res l) (ctx l)) hidden {
         () => emit_leaf :unit l,
@@ -2066,6 +2161,7 @@ let lower_destructured hidden pattern name_span l =
 
 // --- match --------------------------------------------------------------------
 
+let lower_match : :any -> :any -> ast.Span -> Lowering -> [:any, :any];
 let rec lower_match scrutinee arms span l = {
     let value = lower_expr scrutinee l;
     let held = expand macros.coalesce (slot_at span (list.head value)) 0;
@@ -2133,6 +2229,7 @@ union Key {
 /// so reading it forces nothing the chain would not have. That an atom spelled
 /// like an id gets the same key is harmless: the switch only skips arms that
 /// cannot match, and the arm it lands on still runs its own test.
+let arm_key : :any -> Lowering -> :any;
 let rec arm_key p l = match p {
     [:as_p, inner, _, _, _] => arm_key inner l,
     [:literal, [:atom, n, _], _] => Key.atom n,
@@ -2149,27 +2246,34 @@ let rec arm_key p l = match p {
 };
 
 /// The position of the first element `pred` accepts, or `()`.
+let find_index_from : :any -> :any -> :any -> :any;
 let rec find_index_from !i pred xs = match xs {
     [] => (),
     [x, ..rest] => if pred x { i } else { find_index_from (i + 1) pred rest },
 };
+let find_index : :any -> :any -> :any;
 let find_index pred xs = find_index_from 0 pred xs;
 
 /// Fewer tags than this and the chain is already cheap.
+let min_switch : :integer;
 let min_switch = 3;
 
 /// The distinct tags `pick` finds in the keys, in the order the arms first
 /// name them.
+let tags_of : :any -> :any -> :any;
 let tags_of pick keys = list.fold (fn acc k -> match pick k {
     () => acc,
     n => if list.contains n acc { acc } else { list.append acc [n] },
 }) [] keys;
 
+let head_tag : :any -> :any;
 let head_tag k = match k { Key.head(n) => n, _ => () };
+let atom_tag : :any -> :any;
 let atom_tag k = match k { Key.atom(n) => n, _ => () };
 
 /// The chain suffix of the first arm that could match: the first whose key is
 /// one of `fits`, or `Key.any`. The last suffix is the `match_error` raise.
+let first_fit : :any -> :any -> :any -> :any;
 let first_fit fits keys suffixes =
     match find_index (fn k -> k == Key.any || list.contains k fits) keys {
         () => list.nth (list.length keys) suffixes,
@@ -2178,6 +2282,7 @@ let first_fit fits keys suffixes =
 
 /// A switch node over `tags`, each the `Key` that `keyed` makes of it, with
 /// `default` for everything else.
+let switch_node : :any -> :any -> :any -> :any -> :any -> :any -> :any -> Lowering -> [:any, :any];
 let switch_node op keyed tags keys suffixes held default l = {
     let entries = list.fold (fn acc n -> {
         let key = const_atom n (list.head acc);
@@ -2192,6 +2297,7 @@ let switch_node op keyed tags keys suffixes held default l = {
 
 /// The node a `match` starts at: a switch into `chain` when enough arms name a
 /// tag, and `chain` itself otherwise.
+let dispatch : :any -> :any -> :any -> :any -> Lowering -> :any;
 let dispatch arms suffixes held chain l = {
     let keys = list.map (fn a -> arm_key (ast.arm_pattern a) l) arms;
     let heads = tags_of head_tag keys;
@@ -2225,6 +2331,7 @@ let dispatch arms suffixes held chain l = {
 };
 
 /// Whether a pattern matches whatever it is given: `_`, a name, or either named again.
+let always_matches : :any -> :any;
 let rec always_matches p = match p {
     [:wildcard, _] => true,
     [:bind, _, _] => true,
@@ -2232,6 +2339,7 @@ let rec always_matches p = match p {
     _ => false,
 };
 
+let lower_arms : :any -> :any -> ast.Span -> Lowering -> [:any, :any, [:any]] | [:any, :any, :any];
 let rec lower_arms arms held span l =
     match arms {
         // Nothing matched. Exhaustiveness is checked only where the checker
@@ -2323,6 +2431,7 @@ let rec lower_arms arms held span l =
 /// of growing the stack -- a loop written as recursion 100k deep should not
 /// overflow. Only the positions a function actually finishes in count: the
 /// branches of an `if`, the last statement of a block, and the call itself.
+let mark_tail : :any -> Lowering -> :any;
 let rec mark_tail i l =
     if not (ir.is_node i) { l }
     else {
@@ -2344,6 +2453,7 @@ let rec mark_tail i l =
         }
     };
 
+let mark_targets : :any -> Lowering -> :any;
 let mark_targets n l =
     fold (fn acc k -> if k % 2 == 1 || k == ir.node_c n - 1 {
                                mark_tail (ir.kid_at (ir.node_b n + k) (prog acc)) acc
@@ -2366,6 +2476,7 @@ let strk text l = { let got = ir.intern_str text (prog l); [set_prog (list.head 
 /// went. Captures live in the same pool as call arguments and block statements
 /// because they are the same thing to a loader: a contiguous run of indices
 /// addressed by an offset and a count.
+let place_captures : :any -> Lowering -> :any;
 let place_captures caps l = {
     let encoded = list.map (fn c ->
         match c {
@@ -2441,6 +2552,7 @@ let link_funcs_from r bodies l from = {
     [list.head built, list.reverse (list.nth 1 built)]
 };
 
+let link_globals : scope.Resolution -> Lowering -> :any;
 let link_globals r l = link_globals_from r l 0;
 
 /// `link_globals`, from global record `from` onward, appending to a carried
@@ -2499,6 +2611,7 @@ let link_modules ld r l = {
 /// because it reached it. The *last* `main!` body wins: a session recompiles
 /// its entry point every entry on top of a carried resolution, so the newest
 /// body is the one appended last, and a fresh compile has exactly one anyway.
+let find_entry : :any -> scope.Resolution -> :any;
 let find_entry ld r = {
     let last = modules.module_count ld - 1;
     let hits = filter (fn b -> list.nth 0 b == last
@@ -2523,6 +2636,7 @@ let find_entry ld r = {
 /// still live -- which is how lowering the compiler itself ran the machine out
 /// of memory. Forced here, what is carried from one body to the next is an
 /// arena, and the one before it is garbage.
+let settle_body : Lowering -> :any;
 let settle_body l =
     if lazy.forced (ir.node_count (prog l)) && lazy.forced (ir.kid_count (prog l))
        && lazy.forced (func_bodies l) { l } else { l };
@@ -2570,6 +2684,7 @@ let lower_program r = {
 /// Follow execution-tree references, including called functions and closures,
 /// until another comp placeholder is reached. Stop there: its own dependencies
 /// are settled before it is evaluated. The visited set also bounds recursion.
+let comp_dependencies : :any -> :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec comp_dependencies todo seen found pending p funcs globals = match todo {
     [] => found,
     [index, ..rest] =>
@@ -2605,6 +2720,7 @@ let rec comp_dependencies todo seen found pending p funcs globals = match todo {
 /// Every function a compile-time expression can reach: its own, and whatever
 /// its nodes name -- a function global, a closure, a thunk -- followed the whole
 /// way down. The answer is a set of function indices.
+let comp_reach : :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec comp_reach todo seen fns p funcs globals = match todo {
     [] => fns,
     [index, ..rest] =>
@@ -2655,6 +2771,7 @@ let rec comp_reach todo seen fns p funcs globals = match todo {
 let comp_image : [:integer] -> Lowering -> :string;
 let comp_image fis l = if in_parts l { parts_image fis l } else { whole_image fis l };
 
+let whole_image : :any -> Lowering -> :any;
 let whole_image fis l = {
     let p = prog l;
     let funcs = array.of_list (ir.funcs p);
@@ -2689,6 +2806,7 @@ let whole_image fis l = {
 /// compile-time expressions are independent of each other, which is nearly
 /// all of them, builds exactly one, and the rest are that one with four
 /// bytes of header changed.
+let settle_comp_order! : :any -> :any -> :any -> Lowering -> :any;
 let rec settle_comp_order! rows done built l =
     if list.is_empty rows { l }
     else {
@@ -2739,6 +2857,7 @@ let link! ld r = link_rest! ld r (lower_program (with_places ld r));
 
 /// Everything after the arena is built and its functions linked: the
 /// compile-time expressions, the module table and the entry point.
+let link_rest! : :any -> scope.Resolution -> :any -> :any;
 let link_rest! ld r lowered = {
     // Not when the program has already failed. An expression evaluated now
     // runs the program as it was lowered, and a name that did not resolve was
@@ -2866,6 +2985,7 @@ let lower_part r numbered = {
 /// joining it is a pointer too.
 /// The cache is strict: see `scope.walk_elsewhere!` for what an unforced
 /// argument carried into every part's process.
+let part_elsewhere! : :any -> scope.Resolution -> :any -> :any;
 let part_elsewhere! !cache r slice = spawn! $( vm.share! (lower_unit! cache (lowering_key cache r slice) r slice) );
 
 /// What a part is lowered against besides its own walk: the wrappers it
@@ -2905,6 +3025,7 @@ let lowering_key cache r slice = match cache {
 /// program and the part's bodies -- and of the wrappers of the whole program,
 /// which every part lowers against; `k` is made of those two. Positions are
 /// counted from the part's first body for the reason the walk's are.
+let lower_unit! : :any -> :any -> scope.Resolution -> :any -> :any;
 let lower_unit! cache k r slice = match [cache, slice] {
     [(), _] => lower_part r slice,
     [_, []] => lower_part r slice,
@@ -3026,6 +3147,7 @@ let link_parallel! ld r cache = {
 
 /// The wrappers a part's names reach, and the wrappers those stand for, as
 /// `[global, wrapper]` sorted: what its lowering reads of the table.
+let reached_wrappers : :any -> scope.Resolution -> :any;
 let reached_wrappers all r = {
     let used = fold (fn m [_, meaning] -> match meaning {
         scope.Meaning.global(_, _, gi) if gi != () => m.[gi => true],
@@ -3048,21 +3170,25 @@ let reached_wrappers all r = {
 
 /// Whether this lowering was made in parts, and so has no arena of its own:
 /// only the parts, and a small table of nodes it emitted itself.
+let in_parts : Lowering -> :bool;
 let in_parts l = (Lowering.arenas l) != ();
 
 /// The process sharing this lowering's parts, if it was lowered in parts.
+let sharing : Lowering -> :any;
 let sharing l = Lowering.sharing l;
 
 /// What the sharing process is handed: the linked program's records, as an
 /// image whose functions name their bodies where the parts hold them, the
 /// parts, and where invented globals start. Everything in it is shared before
 /// it crosses, so starting the process is a pointer.
+let for_sharing : scope.Resolution -> :any -> [:any, :any, :any];
 let for_sharing r head = [ir.finish_rest (head.[:prog]), head.[:arenas], scope.invented_from r];
 
 /// A process sharing the parts into one arena while this one settles the
 /// `comp`s and checks the types. The shared image comes back with every `comp`
 /// placeholder still in it, for `patched` to fill. A raise in it answers
 /// `:crashed`, and the image is shared in this process instead.
+let share_parts_elsewhere! : :any -> :any;
 let share_parts_elsewhere! work =
     spawn! $( try! { vm.share! (opt.optimize_parts (list.nth 0 work) (list.nth 1 work) (list.nth 2 work)) }
               catch e { [:crashed, e] } );
@@ -3125,6 +3251,7 @@ let patched l img = {
 /// `xs`, the first `n` entries of an arena, with what a table wrote over them
 /// and after them, up to `count`: the arena `ir.finish` would have flattened
 /// from one table holding both.
+let overlaid : :any -> :any -> :any -> :any -> :any -> :any;
 let overlaid xs written n count fill =
     if len written == 0 { xs }
     else {
@@ -3152,6 +3279,7 @@ let overlaid xs written n count fill =
 // placeholder is.
 
 /// The parts, with part 0 as this lowering's own arena now.
+let current_arenas : Lowering -> :any;
 let current_arenas l = {
     let p = prog l;
     (Lowering.arenas l).[0 => ((Lowering.arenas l).[0] |> ir.Program.set_nodes (ir.nodes p) |> ir.Program.set_kids (ir.kids p))]
@@ -3160,6 +3288,7 @@ let current_arenas l = {
 /// What the functions `todo` start from can reach, walked across the parts:
 /// `[functions, placeholders]`, the second the `comp` placeholders met on the
 /// way, by the function each waits on. A node is `part * opt.part_base + i`.
+let reach_parts : :any -> :any -> :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec reach_parts todo seen fns met arenas funcs globals invented_from = match todo {
     [] => [fns, met],
     [key, ..rest] =>
@@ -3203,6 +3332,7 @@ let rec reach_parts todo seen fns met arenas funcs globals invented_from = match
 };
 
 /// `comp_image` for a lowering made in parts.
+let parts_image : :any -> Lowering -> :any;
 let parts_image fis l = {
     let [l1, one] = const_int 1 l;
     let [l2, zero] = const_int 0 l1;
@@ -3223,6 +3353,7 @@ let parts_image fis l = {
 
 /// The `comp` placeholders the function `fi`'s body can reach: the
 /// expressions that have to be settled before it can be run.
+let parts_dependencies : :integer -> Lowering -> [:any];
 let parts_dependencies fi l = {
     let p = prog l;
     let funcs = array.of_list (ir.funcs p);
@@ -3234,6 +3365,7 @@ let parts_dependencies fi l = {
 /// `settle_comps!` for a lowering made in parts: the same order, the same
 /// images, but a value is written into this lowering's own arena and recorded
 /// against its function (`:filled`) rather than over its placeholder.
+let settle_parts_comps! : Lowering -> :any;
 let settle_parts_comps! l = {
     let pend = pending_comp l;
     let waiting = fold (fn m one -> m.[one.[1] => true]) %{} pend;
@@ -3242,6 +3374,7 @@ let settle_parts_comps! l = {
     settle_parts_order! rows %{} () l
 };
 
+let settle_parts_order! : :any -> :any -> :any -> Lowering -> :any;
 let rec settle_parts_order! rows done built l =
     if list.is_empty rows { l }
     else {
@@ -3274,12 +3407,14 @@ struct Raised { why }
 /// The failure of a `comp`, reported where it is written. It used to be
 /// reported with no span at all, which for a compile-time API is the difference
 /// between "this call is wrong" and "something in the program is".
+let comp_failed : :any -> ast.Span -> :any -> Lowering -> :any;
 let comp_failed src span why l =
     (l |> Lowering.set_diags (list.append (l_diags l)
                     [diag.in_source src (diag.error span
                         ("this compile-time expression could not be evaluated: " + to_string why))]));
 
 /// `settle_comp!` for a lowering made in parts: see `settle_parts_comps!`.
+let settle_part_comp! : :any -> :any -> Lowering -> :any;
 let settle_part_comp! bytes one l = {
     let [_, fi, src, span] = one;
     let value = try! { images.eval! bytes } catch e { Raised.make e };
@@ -3296,6 +3431,7 @@ let settle_part_comp! bytes one l = {
 
 /// Intern every value of a part's pool into the program's: `[program, the
 /// program's index for each of the part's, in order]`.
+let intern_each : :any -> :any -> :any -> [:any, :any];
 let intern_each intern vs p = {
     let got = list.fold (fn acc v -> {
         let one = intern v (list.head acc);
@@ -3306,6 +3442,7 @@ let intern_each intern vs p = {
 
 /// An atom as a part stored it -- the index of its name in the part's string
 /// pool -- interned into the program's atom pool by the name's index there.
+let intern_atom_at : :any -> :any -> :any -> [:any, :any];
 let intern_atom_at strs si p = {
     let got = ir.intern (strs.[si]) (ir.atoms p);
     [ir.Program.set_atoms (list.head got) p, list.nth 1 got]
@@ -3399,6 +3536,7 @@ let rec emit_const v l =
 
 /// A record a compile-time expression made, as the constructor would have
 /// made it: one `record_make` of its fields.
+let const_record : :any -> :any -> :any -> Lowering -> :any;
 let rec const_record id fields variant l = {
     let done = list.fold (fn acc x -> {
         let got = emit_const x (list.head acc);
@@ -3411,6 +3549,7 @@ let rec const_record id fields variant l = {
          (set_prog program (list.head placed))
 };
 
+let const_seq : :any -> :any -> Lowering -> :any;
 let rec const_seq op items l = {
     let done = list.fold (fn acc x -> {
         let got = emit_const x (list.head acc);
@@ -3433,6 +3572,7 @@ let rec const_seq op items l = {
 /// to run. It is a function rather than the image itself so that a caller
 /// which has already serialized the program can hand the same bytes back
 /// with only the entry changed -- see `emit.with_entry`.
+let settle_comp! : :any -> :any -> Lowering -> :any;
 let settle_comp! bytes_of one l = {
     let [node, fi, src, span] = one;
     let value = try! { images.eval! (bytes_of fi) } catch e { Raised.make e };
@@ -3453,6 +3593,7 @@ let settle_comp! bytes_of one l = {
 let image : Lowering -> ir.Image;
 let image l = match Lowering.image l { () => ir.finish ir.program, img => img };
 
+let diags : Lowering -> :any;
 let diags l = l_diags l;
 
 /// Everything the resolver and the lowerer between them had to say.

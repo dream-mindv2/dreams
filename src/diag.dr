@@ -245,9 +245,12 @@ let render_all sources ds = {
 when test {
     import std.test;
 
+    let src : :any;
     let src = source "a.dr" "let x = 1;\nlet y = 2;\n";
+    let sources : [:any];
     let sources = [src];
 
+    let tests : [:any];
     let tests = [
         test.case "an offset in the first line is line 1"
             $( test.eq! [1, 1] (line_col (source_text src) 0) ),

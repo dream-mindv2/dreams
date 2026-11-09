@@ -78,6 +78,7 @@ struct Frame { !block, !anchor, !delta, !stmt_old, !stmt_new, cands, !body, !fal
 
 /// A bracket's only candidate is itself: a closer written under its opener
 /// stays under it, and anywhere else goes back to the line it opened on.
+let group_frame : :any -> :any -> :any -> :any;
 let group_frame new d col = Frame.make false new d () () [[col, col + d]] () () [] false;
 
 /// The file's own level: a block whose statements sit at column zero.
@@ -92,14 +93,17 @@ let root = Frame.make true (0 - step) 0 () () [] 0 0 [] false;
 /// trailing whitespace is a string's.
 struct Line { !start, !stop, !lead, !kind, toks, !keep_end }
 
+let is_opener : :any -> :bool;
 let is_opener k = k == :lbrace || k == :lparen || k == :lbracket || k == :hash_bracket
                   || k == :percent_brace || k == :dollar_paren;
+let is_closer : :any -> :bool;
 let is_closer k = k == :rbrace || k == :rparen || k == :rbracket;
 
 /// Can a line that starts with this token begin a statement? An infix
 /// operator, `|>`, `.`, `else` and `catch` cannot, and continue the statement
 /// above them whatever their indentation ("Line breaks end statements" in
 /// docs/language-spec.md).
+let begins : :any -> :bool;
 let begins t = {
     let k = lexer.kind t;
     if ast.infix_of k != () || k == :pipe_into || k == :dot { false }
@@ -107,11 +111,13 @@ let begins t = {
     else { true }
 };
 
+let at_least_zero : :any -> :any;
 let at_least_zero n = if n < 0 { 0 } else { n };
 
 // --- reading the lines ------------------------------------------------------------
 
 /// `[start, stop]` of every line, in order.
+let line_spans : :string -> :any -> :any -> :any;
 let rec line_spans src !at acc = {
     let stop = str.upto "\n" at src;
     let acc2 = list.cons [at, stop] acc;
@@ -121,6 +127,7 @@ let rec line_spans src !at acc = {
 
 /// Each line, with the tokens that start on it. `inside` is the furthest end
 /// of any token so far: a line that starts before it starts inside that token.
+let classify : :string -> :any -> :any -> :any -> :any -> :any;
 let rec classify src spans toks !inside acc =
     match spans {
         [] => list.reverse acc,
@@ -148,17 +155,21 @@ let rec classify src spans toks !inside acc =
 /// operator, and the words that introduce a block of their own. Any token at
 /// all would be too many: in `let f x = match x {` a body four past the `f`
 /// is a coincidence, not a choice.
+let owners : [:string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string];
 let owners = ["match", "if", "else", "fn", "try!", "catch", "strict!", "receive!", "comp", "comp!",
               "when", "mod"];
+let owns : :any -> :any -> :bool;
 let owns t leads =
     leads || is_opener (lexer.kind t) || (lexer.kind t == :ident && list.contains (lexer.value t) owners);
 
 /// Add a candidate to the frame on top.
+let noted : :any -> :any -> :any;
 let noted c stack = list.cons (Frame.set_seen (list.cons c (Frame.seen (list.head stack))) (list.head stack))
                               (list.tail stack);
 
 /// The candidates a `{` opened now can choose from: what every frame down to
 /// the innermost block has seen, and that block's statement start.
+let candidates : :any -> :any -> :any;
 let rec candidates stack acc =
     match stack {
         [] => acc,
@@ -172,6 +183,7 @@ let rec candidates stack acc =
     };
 
 /// The statement-start column of the innermost block, new, or `()`.
+let statement_at : :any -> :any;
 let rec statement_at stack =
     match stack {
         [] => (),
@@ -182,6 +194,7 @@ let rec statement_at stack =
 /// the candidates it writes noted where they were written. The stack always
 /// keeps `root` at the bottom, so a stray closer cannot empty it. `prev` is
 /// the kind of the token before, and `i` the token's place on the line.
+let brackets : :any -> :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec brackets toks new d prev lead_op i stack =
     match toks {
         [] => stack,
@@ -215,6 +228,7 @@ let rec brackets toks new d prev lead_op i stack =
 /// A `{` with a statement after it on the same line has begun that statement
 /// already, at that token's column, and by default the ones after it line up
 /// with it.
+let opened_block : :any -> :any -> :any -> :any -> :any;
 let opened_block rest new d stack = {
     let at = match statement_at stack { () => new, n => if Frame.block (list.head stack) { n } else { new } };
     let cands = candidates stack [];
@@ -228,6 +242,7 @@ let opened_block rest new d stack = {
 };
 
 /// The new column of the candidate at old column `old`, or `()`.
+let candidate_at : :any -> :any -> :any;
 let candidate_at old cands =
     match list.filter (fn c -> list.head c == old) cands {
         [[_, new], .._] => new,
@@ -235,6 +250,7 @@ let candidate_at old cands =
     };
 
 /// A block's first line of its own settles where the block is anchored.
+let settled : :any -> :any -> :any;
 let settled top old =
     if Frame.body top != () { top }
     else {
@@ -246,6 +262,7 @@ let settled top old =
 
 /// Where a line that starts with `t`, `old` columns in, goes, and the frame it
 /// leaves on top of the stack: `[new, frame]`.
+let place : :any -> :any -> :any -> [:any, :any];
 let place t old top =
     if is_closer (lexer.kind t) {
         // A block with no line of its own may still close at a candidate,
@@ -279,6 +296,7 @@ union Placed {
 }
 
 /// The new indent of every line, forward.
+let walk : [Line] -> :any -> :any -> :any -> :any;
 let rec walk lines stack !last acc =
     match lines {
         [] => list.reverse acc,
@@ -301,6 +319,7 @@ let rec walk lines stack !last acc =
 
 /// The comment lines, backward: each moves as the code after it does, unless
 /// that code closes a bracket, in which case it belongs to what came before.
+let settle_comments : :any -> [Line] -> :any -> :any -> :any;
 let rec settle_comments placed lines next acc =
     match [placed, lines] {
         [[], _] => acc,
@@ -317,6 +336,7 @@ let rec settle_comments placed lines next acc =
 // --- writing it out ---------------------------------------------------------------
 
 /// The offsets where a `,` or `;` is written against the token after it.
+let tight : :any -> :any -> :any;
 let rec tight toks acc =
     match toks {
         [t, n, ..rest] => {
@@ -329,6 +349,7 @@ let rec tight toks acc =
     };
 
 /// Where a line's text ends once its trailing whitespace is gone.
+let trimmed_end : :string -> :any -> :any -> :any;
 let rec trimmed_end src start !stop =
     if stop > start && (str.byte (stop - 1) src == 32 || str.byte (stop - 1) src == 9
                         || str.byte (stop - 1) src == 13) {
@@ -336,12 +357,14 @@ let rec trimmed_end src start !stop =
     } else { stop };
 
 /// `src` from `from` to `stop`, with a space at each of `gaps`.
+let spaced : :string -> :any -> :any -> :any -> :any -> :any;
 let rec spaced src from stop gaps acc =
     match gaps {
         [g, ..rest] if g < stop => spaced src g stop rest (list.cons " " (list.cons (str.slice from (g - from) src) acc)),
         _ => str.join_str "" (list.reverse (list.cons (str.slice from (stop - from) src) acc)),
     };
 
+let render : :string -> :any -> :any -> :any;
 let render src l new =
     match Line.kind l {
         :blank => "",
@@ -354,6 +377,7 @@ let render src l new =
     };
 
 /// Runs of blank lines become one, and none are kept at either end.
+let squeeze : :any -> :any -> :any -> :any -> :any;
 let rec squeeze rendered kinds !blank acc =
     match [rendered, kinds] {
         [[r, ..rs], [k, ..ks]] =>
@@ -370,11 +394,13 @@ let rec squeeze rendered kinds !blank acc =
 
 /// A syntax tree with its positions taken out, which is what two layouts of
 /// the same program have in common.
+let unplaced : :any -> :any;
 let rec unplaced e =
     if syntax.is_span e { () }
     else if type_of e == :list { list.map unplaced e }
     else { e };
 
+let meaning : :string -> :any;
 let meaning src = match parser.parse_module src {
     [:ok, items, _] => Result.ok (unplaced items),
     [:error, message, span] => err [message, ast.span_start span],
@@ -411,8 +437,10 @@ let format src =
 when test {
     import std.test;
 
+    let formatted : :string -> :any;
     let formatted src = match format src { Result.ok(out) => out, other => other };
 
+    let tests : [:any];
     let tests = [
         test.case "a block's statements go four past its opener"
             $( test.eq! "let f x = {\n    let a = 1;\n    a + x\n};\n"

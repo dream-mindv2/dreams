@@ -33,6 +33,7 @@ group Top { !text : :string, !name : :string, kind : :atom, !aliasee : :string, 
 group Part { !text : :string, cached : :bool }
 
 /// The bytes a name of a function or datum is made of.
+let name_bytes : :string;
 let name_bytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.$";
 
 /// The name after the `@` at byte `at` of `s`.
@@ -303,7 +304,9 @@ let plan_of ir units_asked = {
         (list.fold (fn m [u, ms] -> m.[u => list.reverse ms]) %{} (map.pairs members))
 };
 
+let max : :any -> :any -> :any;
 let max a b = if a > b { a } else { b };
+let min : :any -> :any -> :any;
 let min a b = if a < b { a } else { b };
 
 /// Part `u`, whose definitions are the tops at `members`.

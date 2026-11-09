@@ -207,6 +207,7 @@ let span e = list.last e;
 //
 // Named by atom rather than by number so that a dump of the tree reads.
 
+let binops : [[:or_or, :or], [:and_and, :and], [:eq_eq, :eq], [:bang_eq, :ne], [:lt, :lt], [:le, :le], [:gt, :gt], [:ge, :ge], [:colon_colon, :cons], [:bar, :bor], [:caret, :bxor], [:amp, :band], [:lt_lt, :shl], [:gt_gt, :shr], [:plus, :add], [:minus, :sub], [:star, :mul], [:slash, :div], [:percent, :mod], [:at, :matmul]];
 let binops = [
     [:or_or, :or], [:and_and, :and],
     [:eq_eq, :eq], [:bang_eq, :ne], [:lt, :lt], [:le, :le], [:gt, :gt], [:ge, :ge],
@@ -277,6 +278,7 @@ let infix_of token_kind =
 /// `let now! () = ..` uses.
 let param : :string | :unit -> Span -> Param;
 let param name span = [name, span];
+let param_name : :any -> :any;
 let param_name p = list.nth 0 p;
 
 /// A parameter written as a pattern: `let f [a, b] = ..`. It is a slot like any
@@ -543,6 +545,7 @@ let arm_body a    = list.nth 2 a;
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a span keeps its byte endpoints"
             $( test.eq! [2, 7] (span_of 2 7) ),
@@ -723,18 +726,22 @@ let show_params ps =
         }) ps)
 ;
 
+let show_pairs : :any -> :any;
 let show_pairs pairs =
     str.join_str " " (list.map (fn kv -> "[" + show (list.nth 0 kv) + " " + show (list.nth 1 kv) + "]") pairs)
 ;
 
+let show_member : :any -> :any;
 let show_member m =
     if is_member_sig m { "(sig " + member_name m + " " + show (member_body m) + ")" }
     else { "(" + member_name m + " " + show_params (member_params m) + " = " + show (member_body m) + ")" }
 ;
 
+let show_arms : :any -> :any;
 let show_arms arms = str.join_str " " (list.map (fn a -> show_arm a) arms)
 ;
 
+let show_arm : :any -> :any;
 let show_arm a =
     "[" + show_pattern (arm_pattern a)
         + (match arm_guard a { () => "", g => " if " + show g })
@@ -762,6 +769,7 @@ let rec show_pattern p =
     }
 ;
 
+let show_items : :any -> :any -> :any;
 let show_items items rest = {
     let shown = str.join_str " " (list.map (fn i -> show_pattern i) items);
     let tail = match rest {
@@ -776,6 +784,7 @@ let show_items items rest = {
 };
 
 /// `{ map, filter, sum as total }` -- the members an import binds directly.
+let show_import_names : :any -> :any;
 let show_import_names ns =
     str.join_str " " (list.map (fn n ->
         match list.nth 1 n { () => list.nth 0 n, a => list.nth 0 n + " as " + a }) ns);

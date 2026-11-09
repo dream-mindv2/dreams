@@ -92,6 +92,7 @@ let with_local_names img names = {
 
 when test {
     import std.test;
+    let tests : [:any];
     let tests = [
         test.case "a function's locals, by slot"
             $( test.eq! [0, -1] [innermost [[0, scope.Function.new () |> scope.Function.set_span [0, 10]]] 5,

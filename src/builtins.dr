@@ -29,6 +29,7 @@ import std.str;
 import std.map;
 
 /// Effects, and the handful of operations no module could define in Dream.
+let names : [:string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string, :string];
 let names = [
     "spawn!",     // thunk -> process
     "join!",      // process -> value
@@ -157,6 +158,7 @@ let names = [
 /// on a self-compile was 7% of every reduction the compiler made (`--profile`
 /// charged it to `index_of_from`). A list searched more often than it is built
 /// wants to be a map; see "Making it faster" in dream/docs/notes/vm-performance.md for the other four.
+let ids : :any;
 let ids = fold (fn m [i, n] -> m.[n => i]) (%{}) (list.enumerate names);
 
 let is_builtin : :string -> :bool;
@@ -173,6 +175,7 @@ let is_builtin name = map.has name ids;
 ///
 /// These are documentation, not enforced contracts. They say what the runtime
 /// does, in the notation the rest of this codebase uses in its comments.
+let signatures : %{"spawn!" => :string, "join!" => :string, "send!" => :string, "recv!" => :string, "self!" => :string, "raise!" => :string, "type_of" => :string, "to_string" => :string, "len" => :string, "strict!" => :string, "defer!" => :string, "_match_is_cons" => :string, "_match_head" => :string, "_match_tail" => :string, "_match_at" => :string, "_match_key" => :string, "type_assert" => :string, "_list_tail" => :string, "_list_cons" => :string, "_list_is_empty" => :string, "_str_chars" => :string, "_str_of_chars" => :string, "_str_of_bytes" => :string, "_str_concat" => :string, "_error_new" => :string, "_error_kind" => :string, "_error_payload" => :string, "_str_slice" => :string, "_str_find" => :string, "_str_byte" => :string, "_str_le" => :string, "_str_span" => :string, "_str_upto" => :string, "_char_code" => :string, "_char_of_code" => :string, "_to_float" => :string, "_float_bytes" => :string, "_float_of_bytes" => :string, "_to_int" => :string, "_parse_int" => :string, "_parse_float" => :string, "_to_existing_atom" => :string, "_array_new" => :string, "_array_of_list" => :string, "_array_to_list" => :string, "_map_has" => :string, "_map_remove" => :string, "_map_pairs" => :string, "_data_count" => :string, "_data_at" => :string, "compare" => :string, "_sort_keyed" => :string, "_tensor_of_bytes" => :string, "_tensor_matmul" => :string, "_str_interp" => :string, "_mailbox_peek!" => :string, "_mailbox_take!" => :string, "_await_message!" => :string, "_deadline_in!" => :string, "_match_fail" => :string, "_error_trace!" => :string, "_record_is" => :string, "_record_id" => :string, "_record_fields" => :string, "_record_of" => :string, "_pow" => :string, "_str_char_count" => :string, "_str_ascii_case" => :string, "_str_span_back" => :string, "_str_rfind" => :string, "_settled" => :string, "_forced" => :string, "_indexed" => :string, "_append_rev" => :string, "_rev_onto" => :string, "_str_append_rev" => :string, "_set_of" => :string, "_set_add" => :string, "_set_lookup" => :string, "_set_refresh" => :string, "_memo_cells" => :string, "_tally" => :string, "_tally_lookup" => :string, "_list_drop" => :string, "_index_new" => :string, "_index_find" => :string, "_heap_of" => :string, "_heap_push" => :string, "_heap_empty" => :string, "_heap_min" => :string, "_heap_pop" => :string, "_trunk_of" => :string, "_trunk_to_list" => :string, "_trunk_lookup" => :string, "_trunk_at" => :string, "_trunk_push" => :string, "_trunk_set" => :string, "_trunk_recall" => :string};
 let signatures = %{
     "spawn!"    => "thunk -> process",
     "join!"     => "process -> value",
@@ -281,6 +284,7 @@ let signatures = %{
 /// a different order from the primitive, and the warning is no help if it
 /// sends somebody to `str.byte s i`. A primitive missing here has no wrapper:
 /// the `match` ones are lowering's alone, and the rest are `std`'s own.
+let wrappers : %{"_list_tail" => :string, "_list_cons" => :string, "_list_is_empty" => :string, "_str_chars" => :string, "_str_of_chars" => :string, "_str_of_bytes" => :string, "_str_concat" => :string, "_error_new" => :string, "_error_kind" => :string, "_error_payload" => :string, "_str_slice" => :string, "_str_find" => :string, "_str_byte" => :string, "_str_le" => :string, "_str_span" => :string, "_str_upto" => :string, "_char_code" => :string, "_char_of_code" => :string, "_to_float" => :string, "_float_bytes" => :string, "_float_of_bytes" => :string, "_to_int" => :string, "_parse_int" => :string, "_parse_float" => :string, "_to_existing_atom" => :string, "_array_new" => :string, "_array_of_list" => :string, "_array_to_list" => :string, "_map_has" => :string, "_map_remove" => :string, "_map_pairs" => :string, "_data_count" => :string, "_data_at" => :string, "_sort_keyed" => :string, "_error_trace!" => :string, "_pow" => :string, "_str_char_count" => :string, "_str_ascii_case" => :string, "_str_span_back" => :string, "_str_rfind" => :string, "_settled" => :string, "_forced" => :string};
 let wrappers = %{
     "_list_tail" => "list.tail xs",
     "_list_cons" => "list.cons x xs",
@@ -373,6 +377,7 @@ let is_primitive name = str.starts_with "_" name;
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "a builtin is known by name"
             $( test.eq! [true, true, false]

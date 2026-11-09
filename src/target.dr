@@ -261,13 +261,17 @@ let from_reads cfg reads = {
 
 /// How many leading bytes `sniff` wants. A PE file keeps its machine field
 /// behind an offset in the DOS header, which is nearly always under this.
+let sniff_length : :integer;
 let sniff_length = 4096;
 
 let byte : :string -> :integer -> :integer;
 let byte s i = str.byte i s;
 
+let le16 : :any -> :any -> :any;
 let le16 s i = byte s i + byte s (i + 1) * 256;
+let le32 : :any -> :any -> :any;
 let le32 s i = le16 s i + le16 s (i + 2) * 65536;
+let be32 : :any -> :any -> :any;
 let be32 s i = ((byte s i * 256 + byte s (i + 1)) * 256 + byte s (i + 2)) * 256 + byte s (i + 3);
 
 let starts_with : [:integer] -> :string -> :bool;
@@ -276,16 +280,21 @@ let starts_with prefix s =
 
 // Each answers the architectures a machine field names: one, or none for a
 // machine this does not know, which leaves the binary's architecture open.
+let elf_arch : :any -> [:x86_64] | [:aarch64] | [:never];
 let elf_arch m = match m { 62 => [:x86_64], 183 => [:aarch64], _ => [] };
+let pe_arch : :any -> [:x86_64] | [:aarch64] | [:never];
 let pe_arch m = match m { 34404 => [:x86_64], 43620 => [:aarch64], _ => [] };
 /// Mach-O's CPU types are the 64-bit flag, `0x01000000`, over a family.
+let macho_arch : :any -> [:x86_64] | [:aarch64] | [:never];
 let macho_arch m = match m { 16777223 => [:x86_64], 16777228 => [:aarch64], _ => [] };
 
+let one : :any -> :any -> :any;
 let one os archs = make [os] archs;
 
 /// A universal binary: a big-endian count, then twenty bytes per slice with
 /// the CPU type first. Java class files share the magic, and are told apart by
 /// the count, which in a class file is a version in the forties or above.
+let fat : :any -> :any;
 let fat s = {
     let n = be32 s 4;
     if n < 1 || n > 20 || str.byte_length s < 8 + n * 20 { () }
@@ -297,6 +306,7 @@ let fat s = {
 
 /// A Windows image: `MZ`, then at 0x3C the offset of the `PE\0\0` header,
 /// whose machine field follows it.
+let pe : :any -> :any;
 let pe s = {
     let at = le32 s 60;
     if byte s (at + 5) < 0 || not (starts_with [80, 69, 0, 0] (str.slice at 4 s)) { one :windows [] }
@@ -357,19 +367,28 @@ let decide said carried pinned =
 when test {
     import std.test;
 
+    let bytes : :any -> :any -> :any;
     let bytes n xs = str.concat_all [str.of_bytes xs, str.repeat (n - list.length xs) (str.of_bytes [0])];
+    let with_at : :any -> :any -> :any -> :any;
     let with_at s i xs = str.concat_all [str.slice 0 i s, str.of_bytes xs,
                                          str.slice (i + list.length xs) (str.byte_length s - i - list.length xs) s];
 
+    let elf64 : :any;
     let elf64 = with_at (bytes 64 [127, 69, 76, 70, 2, 1, 1]) 18 [62, 0];
+    let elf_arm : :any;
     let elf_arm = with_at elf64 18 [183, 0];
+    let macho : :any;
     let macho = bytes 64 [207, 250, 237, 254, 12, 0, 0, 1];
+    let pe_x64 : :any;
     let pe_x64 = with_at (with_at (bytes 256 [77, 90]) 60 [128, 0, 0, 0]) 128 [80, 69, 0, 0, 100, 134];
+    let universal : :any;
     let universal = bytes 64 [202, 254, 186, 190, 0, 0, 0, 2,
                               1, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                               1, 0, 0, 12];
+    let java : :any;
     let java = bytes 64 [202, 254, 186, 190, 0, 0, 0, 52];
 
+    let tests : [:any];
     let tests = [
         test.case "Android has its own stable OS bit and Unix family"
             $( test.eq! [2048, Result.ok (make [:android] [:aarch64]), "unix"]

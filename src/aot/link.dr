@@ -30,60 +30,107 @@ import std.list;
 import std.map;
 import std.str;
 
+let base : :integer;
 let base = 4194304;
+let page : :integer;
 let page = 4096;
+let ehdr_size : :integer;
 let ehdr_size = 64;
+let phdr_size : :integer;
 let phdr_size = 56;
+let phdr_count : :integer;
 let phdr_count = 6;
+let dynsym_size : :integer;
 let dynsym_size = 24;
+let rela_size : :integer;
 let rela_size = 24;
+let stub_size : :integer;
 let stub_size = 16;
 /// `ff 25 rel32`, `jmp *slot(%rip)`, is six bytes of each stub.
+let stub_jump_size : :integer;
 let stub_jump_size = 6;
 
+let sht_symtab : :integer;
 let sht_symtab = 2;
+let sht_rela : :integer;
 let sht_rela = 4;
+let sht_nobits : :integer;
 let sht_nobits = 8;
+let shf_write : :integer;
 let shf_write = 1;
+let shf_alloc : :integer;
 let shf_alloc = 2;
+let shf_exec : :integer;
 let shf_exec = 4;
+let shn_abs : :integer;
 let shn_abs = 65521;
 
 /// The address of the program's large data, in the object.
+let payload_symbol : :string;
 let payload_symbol = "i_payload";
 
+let em_x86_64 : :integer;
 let em_x86_64 = 62;
+let em_aarch64 : :integer;
 let em_aarch64 = 183;
 
 // aarch64's relocations: most patch a field of an instruction, so are written into the word that is
 // there rather than over it.
+let ra_abs64 : :integer;
 let ra_abs64 = 257;
+let ra_prel64 : :integer;
 let ra_prel64 = 260;
+let ra_prel32 : :integer;
 let ra_prel32 = 261;
+let ra_adr_prel_lo21 : :integer;
 let ra_adr_prel_lo21 = 274;
+let ra_adr_prel_pg_hi21 : :integer;
 let ra_adr_prel_pg_hi21 = 275;
+let ra_adr_prel_pg_hi21_nc : :integer;
 let ra_adr_prel_pg_hi21_nc = 276;
+let ra_add_abs_lo12_nc : :integer;
 let ra_add_abs_lo12_nc = 277;
+let ra_ldst8_abs_lo12_nc : :integer;
 let ra_ldst8_abs_lo12_nc = 278;
+let ra_tstbr14 : :integer;
 let ra_tstbr14 = 279;
+let ra_condbr19 : :integer;
 let ra_condbr19 = 280;
+let ra_jump26 : :integer;
 let ra_jump26 = 282;
+let ra_call26 : :integer;
 let ra_call26 = 283;
+let ra_ldst16_abs_lo12_nc : :integer;
 let ra_ldst16_abs_lo12_nc = 284;
+let ra_ldst32_abs_lo12_nc : :integer;
 let ra_ldst32_abs_lo12_nc = 285;
+let ra_ldst64_abs_lo12_nc : :integer;
 let ra_ldst64_abs_lo12_nc = 286;
+let ra_ldst128_abs_lo12_nc : :integer;
 let ra_ldst128_abs_lo12_nc = 299;
+let ra_adr_got_page : :integer;
 let ra_adr_got_page = 311;
+let ra_ld64_got_lo12_nc : :integer;
 let ra_ld64_got_lo12_nc = 312;
+let ra_glob_dat : :integer;
 let ra_glob_dat = 1025;
+let r_64 : :integer;
 let r_64 = 1;
+let r_pc32 : :integer;
 let r_pc32 = 2;
+let r_gotpcrel : :integer;
 let r_gotpcrel = 9;
+let r_plt32 : :integer;
 let r_plt32 = 4;
+let r_32 : :integer;
 let r_32 = 10;
+let r_32s : :integer;
 let r_32s = 11;
+let r_gotpcrelx : :integer;
 let r_gotpcrelx = 41;
+let r_rex_gotpcrelx : :integer;
 let r_rex_gotpcrelx = 42;
+let r_glob_dat : :integer;
 let r_glob_dat = 6;
 
 /// What the program needs of the machine it will run on, and the object's own
@@ -302,14 +349,18 @@ group MergedPart {
 let no_part : MergedPart;
 let no_part = MergedPart.make 0 (array.of_list []) (array.of_list []) %{} %{} %{} [] 0 0;
 
+let shn_loreserve : :integer;
 let shn_loreserve = 65280;
+let shn_xindex : :integer;
 let shn_xindex = 65535;
+let sht_symtab_shndx : :integer;
 let sht_symtab_shndx = 18;
 
 /// What a reserved section number of an object -- `SHN_ABS`, `SHN_COMMON` -- is once merged: moved
 /// past every real one. The objects of a native program have more sections between them than
 /// a section number of one object can say, and left as it was, `SHN_ABS` was section 65,521 of
 /// the program and the sections from 65,280 on were taken for reserved ones and never laid out.
+let reserved_base : :integer;
 let reserved_base = 1099511627776;
 
 /// The merged number of `SHN_ABS`.

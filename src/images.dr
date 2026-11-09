@@ -8,17 +8,25 @@
 when not native {
     import std.vm;
 
+    let eval! : :any -> :any;
     let eval! bytes = vm.eval_image! bytes;
+    let open! : :any -> :any;
     let open! bytes = vm.open_image! bytes;
+    let call! : :any -> :any -> :any -> :any -> :any;
     let call! handle module_name name args = vm.call_image! handle module_name name args;
+    let close! : :any -> :any;
     let close! handle = vm.close_image! handle;
 }
 
 when native {
     import dre.images as dre_images;
 
+    let eval! : :any -> :any;
     let eval! bytes = dre_images.eval! bytes;
+    let open! : :any -> :any;
     let open! bytes = dre_images.open! bytes;
+    let call! : :any -> :any -> :any -> :any -> :any;
     let call! handle module_name name args = dre_images.call! handle module_name name args;
+    let close! : :any -> :any;
     let close! handle = dre_images.close! handle;
 }

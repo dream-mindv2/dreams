@@ -29,6 +29,7 @@ import std.str;
 import dreams.aot.image;
 
 /// `tailcc` passes this many in registers on x86-64.
+let max_params : :integer;
 let max_params = 6;
 
 /// What generating one function has so far: its lines newest first, the block

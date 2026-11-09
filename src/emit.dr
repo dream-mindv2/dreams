@@ -36,15 +36,21 @@ import dreams.ir;
 import std.num;
 
 /// `DAGNCAAF`, as the loader looks for it.
+let magic : :any;
 let magic = str.of_bytes [68, 65, 71, 78, 67, 65, 65, 70];
 
+let version_major : :integer;
 let version_major = 0;
+let version_minor : :integer;
 let version_minor = 1;
 
+let header_size : :integer;
 let header_size = 32;
+let section_entry_size : :integer;
 let section_entry_size = 16;
 
 /// The span section is present.
+let flag_debug : :integer;
 let flag_debug = 1;
 
 // --- numbers as bytes ------------------------------------------------------------
@@ -104,6 +110,7 @@ let u64 : :integer -> :string;
 let u64 v = u32 (v % 4294967296) + u32 ((v / 4294967296) % 4294967296);
 
 /// A node index, or the all-ones word that means there is none.
+let index : :any -> :any;
 let index i = if ir.is_node i { u32 i } else { u32 4294967295 };
 
 /// A `float`, by its bit pattern, so that what comes back is exactly the value
@@ -112,6 +119,7 @@ let index i = if ir.is_node i { u32 i } else { u32 4294967295 };
 /// because getting that wrong is silent.
 /// The VM hands over the eight bytes as a string already, so there is nothing
 /// left to do to them.
+let f64 : :any -> :any;
 let f64 v = num.float_bytes v;
 
 // --- sections ---------------------------------------------------------------------
@@ -126,11 +134,16 @@ mapping Section {
     len = 0
 }
 
+let section : :any -> :any -> :any -> :any;
 let section kind body count = Section.make kind body count (str.byte_length body);
 
+let sec_kind : :any -> :any;
 let sec_kind s = Section.kind s;
+let sec_body : :any -> :any;
 let sec_body s = Section.body s;
+let sec_count : :any -> :any;
 let sec_count s = Section.count s;
+let sec_len : :any -> :any;
 let sec_len s = Section.len s;
 
 /// A four-character tag, read as a little-endian word the way the loader reads
@@ -139,29 +152,50 @@ let sec_len s = Section.len s;
 let tag : :integer -> :integer -> :integer -> :integer -> :integer;
 let tag a b c d = a + b * 256 + c * 65536 + d * 16777216;
 
+let t_kint : :any;
 let t_kint = tag 75 73 78 84;   // KINT
+let t_kflt : :any;
 let t_kflt = tag 75 70 76 84;   // KFLT
+let t_kstr : :any;
 let t_kstr = tag 75 83 84 82;   // KSTR
+let t_sblb : :any;
 let t_sblb = tag 83 66 76 66;   // SBLB
+let t_katm : :any;
 let t_katm = tag 75 65 84 77;   // KATM
+let t_node : :any;
 let t_node = tag 78 79 68 69;   // NODE
+let t_kids : :any;
 let t_kids = tag 75 73 68 83;   // KIDS
+let t_func : :any;
 let t_func = tag 70 85 78 67;   // FUNC
+let t_glbl : :any;
 let t_glbl = tag 71 76 66 76;   // GLBL
+let t_impt : :any;
 let t_impt = tag 73 77 80 84;   // IMPT
+let t_span : :any;
 let t_span = tag 83 80 65 78;   // SPAN
+let t_mods : :any;
 let t_mods = tag 77 79 68 83;   // MODS
+let t_ldat : :any;
 let t_ldat = tag 76 68 65 84;   // LDAT
+let t_payl : :any;
 let t_payl = tag 80 65 89 76;   // PAYL
+let t_lnam : :any;
 let t_lnam = tag 76 78 65 77;   // LNAM
+let t_ityp : :any;
 let t_ityp = tag 73 84 89 80;   // ITYP
+let t_type : :any;
 let t_type = tag 84 89 80 69;   // TYPE
+let t_vmop : :any;
 let t_vmop = tag 86 77 79 80;   // VMOP
+let t_locl : :any;
 let t_locl = tag 76 79 67 76;   // LOCL
 
 /// The keys of `VMOP` records. The VM ignores a key it does not know, so a
 /// setting added here is one an older VM runs without.
+let vm_nursery_max : :integer;
 let vm_nursery_max = 1;
+let vm_max_heap : :integer;
 let vm_max_heap = 2;
 
 // --- the records ---------------------------------------------------------------------
@@ -169,8 +203,10 @@ let vm_max_heap = 2;
 /// Every record of a section, joined once. The joining is what keeps this
 /// linear: a fold of `+` over fifty thousand records would copy the section so
 /// far on each one.
+let concat_map : :any -> :any -> :any;
 let concat_map f xs = str.concat_all (map f xs);
 
+let node_bytes : :any -> :any;
 let node_bytes n =
     str.concat_all [
         u8 (match ir.opcode (ir.node_op n) { () => 0, code => code }),
@@ -188,14 +224,19 @@ let node_bytes n =
 ///
 /// Built native, there is no VM to write them, and they are written here.
 when not native {
+    let node_section : :any -> :any;
     let node_section nodes = vm.node_section [nodes, ir.op_codes];
+    let kids_section : :any -> :any;
     let kids_section kids = vm.index_section kids;
 }
 when native {
+    let node_section : :any -> :any;
     let node_section nodes = concat_map (fn n -> node_bytes n) nodes;
+    let kids_section : :any -> :any;
     let kids_section kids = concat_map (fn k -> index k) kids;
 }
 
+let func_bytes : :any -> :any;
 let func_bytes f =
     str.concat_all [
         u32 (f.[:name else 0]),
@@ -212,6 +253,7 @@ let func_bytes f =
         u32 (f.[:source else 0]),
     ];
 
+let global_bytes : :any -> :any;
 let global_bytes g =
     str.concat_all [
         u32 (g.[:name else 0]),
@@ -220,8 +262,10 @@ let global_bytes g =
         u32 (g.[:flags else 0]),
     ];
 
+let import_bytes : :any -> :any;
 let import_bytes i = u32 (i.[:path else 0]) + u32 (i.[:alias else 0]);
 
+let module_bytes : :any -> :any;
 let module_bytes m =
     str.concat_all [
         u32 (m.[:name else 0]),
@@ -234,6 +278,7 @@ let module_bytes m =
 
 /// Strings are an offset-and-length table into one contiguous blob, so that a
 /// loader can point at a string rather than copy it.
+let string_table : :any -> :any;
 let string_table strs = {
     let offsets = list.reverse (list.nth 1 (fold (fn acc s ->
         [list.head acc + str.byte_length s,
@@ -244,6 +289,7 @@ let string_table strs = {
 
 // --- the whole image ------------------------------------------------------------------
 
+let align8 : :any -> :any;
 let align8 n = (n + 7) - ((n + 7) % 8);
 
 /// `n` zero bytes. Sections are eight-byte aligned so a loader can point a
@@ -266,6 +312,7 @@ let zeros n = str.repeat n (str.of_bytes [0]);
 /// Consecutive and unpadded: a datum is found by the offset the table records
 /// and nothing about the next one depends on where this one ended up, so there
 /// is nothing for alignment to buy.
+let data_offsets : :any -> :any;
 let data_offsets lens =
     list.reverse (list.nth 1 (fold (fn acc n ->
         [list.head acc + n, list.cons (list.head acc) (list.nth 1 acc)])
@@ -282,6 +329,7 @@ let data_offsets lens =
 /// and unpadded. It is additive -- a reader that does not know it skips it --
 /// and it is what lets a program ask for a datum by what it is (`[:payload,
 /// "sqlite"]`) rather than by where it happened to fall on the command line.
+let data_sections : :any -> :any -> :any;
 let data_sections lens names =
     if list.is_empty lens { [] }
     else {
@@ -305,6 +353,7 @@ let data_sections lens names =
 /// declares a parameter of the corresponding type -- the function, a reserved word, and a 64-bit
 /// mask of which parameters. A program with no such signature writes the bytes
 /// it wrote before the section existed, for the reason `data_sections` gives.
+let type_sections : :any -> :any -> [:never] | [:any];
 let type_sections kind hints =
     if list.is_empty hints { [] }
     else {
@@ -316,6 +365,7 @@ let type_sections kind hints =
 /// manifest made in `[vm]` -- the key (`vm_nursery_max`), a reserved word,
 /// and the value. Nothing at all for a program that made none, so its image
 /// is the bytes it was before the section existed.
+let vm_sections : :any -> [:never] | [:any];
 let vm_sections options =
     if list.is_empty options { [] }
     else {
@@ -326,6 +376,7 @@ let vm_sections options =
 /// `LOCL`, or nothing: one 12-byte record per local a debug build names --
 /// the function, the slot and the name's string -- and nothing at all for a
 /// build that asked for none (`--debug-info`, `dreams/src/debuginfo.dr`).
+let locl_section : :any -> [:never] | [:any];
 let locl_section locals =
     if list.is_empty locals { [] }
     else {
@@ -334,6 +385,7 @@ let locl_section locals =
     };
 
 /// Every section, in the order a reader meets them.
+let sections_of : ir.Image -> :any;
 let sections_of img = {
     let strs = ir.Image.strs img;
     // The blob is the strings, one after another: nothing has to be done to a
@@ -425,6 +477,7 @@ let to_binary img = emit img;
 /// Where the header keeps `entry`. Fixed by the format -- see the header
 /// table in [dream/docs/bytecode-format.md](../docs/bytecode-format.md) -- which is
 /// what makes the next function possible at all.
+let entry_offset : :integer;
 let entry_offset = 24;
 
 /// The same image, entered at a different function.
@@ -449,11 +502,15 @@ let with_entry bytes fi = str.concat_all [
 when test {
     import std.test;
 
+    let none : :any;
     let none = ir.no_node;
+    let nodes : [[:apply, :integer, :integer, :integer, :integer], [:local, :integer, :integer, :any, :any], [:const_int, :integer, :integer, :any, :any], [:if, :integer, :integer, :integer, :integer], [:not_an_opcode, :integer, :any, :any, :any]];
     let nodes = [[:apply, 3, 1, 0, 2], [:local, 0, 7, none, none], [:const_int, 0, 4294967294, none, none],
                  [:if, 1, 0, 1, 2], [:not_an_opcode, 255, none, none, none]];
+    let kids : [:integer, :integer, :any, :integer, :integer];
     let kids = [0, 1, none, 4294967294, 3];
 
+    let tests : [:any];
     let tests = [
         test.case "the VM writes nodes as node_bytes does"
             $( test.eq! (concat_map (fn n -> node_bytes n) nodes) (node_section nodes) ),

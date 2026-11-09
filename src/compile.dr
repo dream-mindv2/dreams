@@ -313,6 +313,7 @@ let build! l0 o = {
 /// A raise in the child is not the child's to report: it answers `:crashed`,
 /// and the image is shared again where it always was, where the raise happens
 /// as it did before.
+let share_elsewhere! : :any -> :any;
 let share_elsewhere! p = {
     strict! p
     spawn! $( try! { strict! (optimizer.optimize_program p) } catch e { [:crashed, e] } )
@@ -398,6 +399,7 @@ let checked_in_parts! how cache ks r keep = {
 /// A process checking some bodies against a shared checker. Its own function
 /// for the reason `share_elsewhere!` is, and its cache and key strict for the
 /// reason `lower.part_elsewhere!`'s are.
+let check_elsewhere! : :any -> :any -> :any -> :any -> :any -> :any;
 let check_elsewhere! how !cache !key ks slice = spawn! $( vm.share! (check_unit! how cache key ks slice) );
 
 /// What some bodies said, or what they said the last time they were checked
@@ -642,6 +644,7 @@ let bytes b = emit.to_binary (image b);
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         test.case "remapped source paths are relative and written with /, and nothing else changes"
             $( {

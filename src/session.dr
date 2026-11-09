@@ -62,6 +62,7 @@ import dreams.typecheck;
 /// `true` if the file was written. The REPL's scratch files live wherever the
 /// system puts temporary files, and a session that cannot write one has nowhere
 /// to compile to, which is worth saying rather than crashing on.
+let write_file! : :integer -> :string -> :bool;
 let write_file! path text =
     match try! { io.open! path :write } catch e { () } {
         () => false,
@@ -76,6 +77,7 @@ let write_file! path text =
 /// names it is telling the reader about the REPL rather than about their
 /// program. The line and column are worth keeping -- they point into the
 /// session as `:list` prints it -- so only the path is replaced.
+let as_session : :any -> :string -> :any;
 let as_session path text = str.replace path "session" text;
 
 // --- what is carried ---------------------------------------------------------------
@@ -86,32 +88,53 @@ let as_session path text = str.replace path "session" text;
 // here rather than inside `low.prog` because each entry links only its own
 // additions and appends them to what came before.
 
+let engine : :any -> :any -> :any -> :unit -> :any -> :any -> :any -> :any -> :any -> :any -> :any -> %{:loader => :any, :state => :any, :resolver => :any, :low => :any, :base => :any, :root_globals_from => :any, :funcs => :any, :globals => :any, :imports => :any, :modules => :any, :base_text => :any};
 let engine loader state resolver low base root_globals_from funcs globals imports modules base_text =
     %{ :loader => loader, :state => state, :resolver => resolver, :low => low,
        :base => base, :root_globals_from => root_globals_from,
        :funcs => funcs, :globals => globals, :imports => imports,
        :modules => modules, :base_text => base_text };
 
+let engine_loader : :any -> :any;
 let engine_loader e    = e.[:loader else ()];
+let engine_state : :any -> :any;
 let engine_state e     = e.[:state else scope.state];
+let engine_resolver : :any -> :any;
 let engine_resolver e  = e.[:resolver else ()];
+let engine_low : :any -> :any;
 let engine_low e       = e.[:low else ()];
+let engine_base : :any -> :any;
 let engine_base e      = e.[:base else 0];
+let engine_root_from : :any -> :any;
 let engine_root_from e = e.[:root_globals_from else 0];
+let engine_funcs : :any -> :any;
 let engine_funcs e     = e.[:funcs else []];
+let engine_globals : :any -> :any;
 let engine_globals e   = e.[:globals else []];
+let engine_imports : :any -> :any;
 let engine_imports e   = e.[:imports else []];
+let engine_modules : :any -> :any;
 let engine_modules e   = e.[:modules else []];
+let engine_base_text : :any -> :any;
 let engine_base_text e = e.[:base_text else ""];
 
+let pre_s_pre : :any -> :any;
 let pre_s_pre e    = e.[:s_pre else scope.state];
+let pre_resolver : :any -> :any;
 let pre_resolver e = e.[:resolver else ()];
+let pre_low : :any -> :any;
 let pre_low e      = e.[:low else ()];
+let pre_root_from : :any -> :any;
 let pre_root_from e = e.[:root_globals_from else 0];
+let pre_funcs : :any -> :any;
 let pre_funcs e    = e.[:funcs else []];
+let pre_globals : :any -> :any;
 let pre_globals e  = e.[:globals else []];
+let pre_imports : :any -> :any;
 let pre_imports e  = e.[:imports else []];
+let pre_modules : :any -> :any;
 let pre_modules e  = e.[:modules else []];
+let pre_booted : :any -> :any;
 let pre_booted e   = e.[:booted else false];
 
 // --- the shape of an entry ---------------------------------------------------------
@@ -122,6 +145,7 @@ let pre_booted e   = e.[:booted else false];
 /// the last item, which is the transient `main!`. An empty slice is the shape
 /// of an expression entry -- the defs are unchanged, only the entry point is
 /// new.
+let entry_partition : :any -> :any -> [:any, :any];
 let entry_partition items base = {
     let count = list.length items;
     [list.take (count - 1 - base) (list.drop base items), list.last items]
@@ -133,6 +157,7 @@ let entry_partition items base = {
 /// entry gets this far, and the rest -- `mod`, `when`, `virtual`, `derive` --
 /// can change which modules exist or what one exports, so they start a fresh
 /// build rather than being guessed at.
+let carried_ok : :any -> :any;
 let carried_ok slice =
     list.all (fn item ->
         match item {
@@ -145,6 +170,7 @@ let carried_ok slice =
             _ => false,
         }) slice;
 
+let ast_record : :any -> :bool;
 let ast_record item = match item { [:record, _, _, _, _, _, _] => true, _ => false };
 
 /// Which way to compile an entry, decided before anything is loaded.
@@ -162,6 +188,7 @@ union Route {
     fresh
 }
 
+let route : :string -> :any -> :any -> :any -> :any;
 let route text base_text engine base =
     match parser.parse_module text {
         [:error, _, _] => Route.fresh,
@@ -188,6 +215,7 @@ let route text base_text engine base =
 /// `resolve_from!` can say which globals the new declarations added. `booted`
 /// distinguishes the two ways in: a boot's module records must be linked from
 /// the fresh resolution, while a carried session's travel in the engine.
+let pre : :any -> :any -> lower.Lowering -> :any -> :any -> :any -> :any -> :any -> :any -> %{:s_pre => :any, :resolver => :any, :low => :any, :root_globals_from => :any, :funcs => :any, :globals => :any, :imports => :any, :modules => :any, :booted => :any};
 let pre s_pre resolver low root_globals_from funcs globals imports modules booted =
     %{ :s_pre => s_pre, :resolver => resolver, :low => low,
        :root_globals_from => root_globals_from, :funcs => funcs,
@@ -199,6 +227,7 @@ let pre s_pre resolver low root_globals_from funcs globals imports modules boote
 /// to but not including the transient `main!` -- which is why `base_next` and
 /// `base_text` arrive from the caller: the engine records them for the next
 /// entry.
+let compile_slice! : modules.Loader -> :integer -> :any -> :any -> :any -> :any -> :integer -> :any;
 let rec compile_slice! l mi state1 pre base_next base_text source = {
     let from = scope.pending_count (pre_s_pre pre);
     let r1 = typecheck.select_overloads l (scope.resolve_from! l state1 (pre_resolver pre) from (pre_s_pre pre));
@@ -249,6 +278,7 @@ let rec compile_slice! l mi state1 pre base_next base_text source = {
 /// deliberately not part of what is carried -- it is new every entry, and its
 /// global and function indices are retained only long enough to be this image's
 /// own.
+let main_step! : modules.Loader -> :integer -> :any -> :any -> :integer -> :any -> :any;
 let rec main_step! l mi main_item en source image = {
     let state2 = scope.declare_items! l mi [main_item] (engine_state en);
     let r2 = typecheck.select_overloads l (scope.resolve_from! l state2 (engine_resolver en)
@@ -278,6 +308,7 @@ let rec main_step! l mi main_item en source image = {
 /// `root_globals_from` and has only ever grown, so an image records it as a
 /// start and a count; everything before it belongs to the carried modules,
 /// whose records are already linked.
+let finalize! : modules.Loader -> :integer -> :any -> :any -> :any -> :any -> :any -> :integer -> :any -> :any;
 let finalize! l mi en low2 r2 funcs2 globals2 source image = {
     let root = modules.module_at l mi;
     let named = lower.strk (modules.module_name root) low2;
@@ -300,6 +331,7 @@ let finalize! l mi en low2 r2 funcs2 globals2 source image = {
 /// A first entry, or one whose header changed. The whole text is loaded and
 /// declared from scratch -- nothing is relied on from an earlier parse -- and
 /// everything up to the transient `main!` becomes the carried engine.
+let boot! : :any -> :any -> :any -> :any -> :string -> :any -> :any -> :any -> [:any, :any, :any];
 let boot! roots cfg source image text base_text engine base = {
     let l = expansion.expand! (modules.load! source roots cfg false);
     let mi = modules.module_count l - 1;
@@ -335,6 +367,7 @@ let boot! roots cfg source image text base_text engine base = {
 
 /// An entry on top of a carried engine: the header is unchanged, so the root is
 /// re-read in place and only the new `let`s are compiled.
+let proceed! : :any -> :any -> :any -> :any -> :any -> :any -> [:any, :any, :any];
 let proceed! source image items engine base_text base = {
     let l = modules.reload_root! (engine_loader engine) source false;
     let mi = modules.module_count l - 1;
@@ -359,6 +392,7 @@ let proceed! source image items engine base_text base = {
 /// A full build that carries nothing: the text will not parse, or its slice is
 /// not `let`s. Whatever mission there was, the whole of it is compiled the
 /// ordinary way, and the session re-boots on the next entry.
+let fresh_build! : :any -> :any -> :any -> :any -> :string -> :any -> :any -> [:any, :any, :any] | [:any, :unit, :integer];
 let fresh_build! roots cfg source image text engine base = {
     let b = compile.build! (expansion.expand! (modules.load! source roots cfg false))
                            compile.scratch;
@@ -372,6 +406,7 @@ let fresh_build! roots cfg source image text engine base = {
 /// Answers `[[:ok, image], engine', base']` on success and
 /// `[[:error, rendered], engine, base]` on failure, the engine and base
 /// unchanged so the session they stand for is unchanged too.
+let compile! : :any -> :any -> :any -> :any -> :string -> :any -> :any -> :any -> :any;
 let compile! roots cfg source image text base_text engine base =
     match write_file! source text {
         false => [Result.error ("dreams: cannot write " + source), engine, base],
@@ -388,6 +423,7 @@ let compile! roots cfg source image text base_text engine base =
 when test {
     import std.test;
 
+    let tests : [:any];
     let tests = [
         // --- the shape of an entry ---
         test.case "an empty partition is an empty slice and one main"

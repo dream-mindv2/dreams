@@ -165,9 +165,13 @@ let fixnum_word : :integer -> :string;
 let fixnum_word n = to_string (n * 2 + 1);
 let immediate_word : :integer -> :integer -> :string;
 let immediate_word kind payload = to_string (payload * 256 + kind * 8 + 2);
+let unit_word : :any;
 let unit_word = immediate_word 0 0;
+let false_word : :any;
 let false_word = immediate_word 1 0;
+let true_word : :any;
 let true_word = immediate_word 1 1;
+let nil_word : :any;
 let nil_word = immediate_word 4 0;
 let char_word : :integer -> :string;
 let char_word c = immediate_word 2 c;
@@ -569,6 +573,7 @@ let closure_calls img = list.fold (fn cs f -> {
 
 /// Whether a function may perform effects: named so, or with a body the compiler marked. A lambda
 /// has no name to be impure by, and is held to the second, as the VM does (`callee_is_impure`).
+let flag_impure : :integer;
 let flag_impure = 2;
 
 let may_effect : image.Image -> :integer -> :bool;
@@ -673,6 +678,7 @@ let capture_descriptors img f = image.kids img (image.func_captures_at img f) (i
 // atom, because what comes next may be in a frame or may be the next instruction, and
 // only the node being translated knows which.
 
+let names_of_builtins : :any;
 let names_of_builtins = builtins.names;
 
 let symbol_of : :string -> :integer -> :string;
@@ -2253,6 +2259,7 @@ let block cx statements env s = match statements {
     [first, ..rest] => statement cx first rest env s,
 };
 
+let flag_strict : :integer;
 let flag_strict = 1;
 
 let statement : :any -> :integer -> [:integer] -> Env -> St -> [Expr, St];

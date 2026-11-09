@@ -29,8 +29,11 @@ import dreams.ast;
 /// and whether anything else touches it. `other` is what clears it.
 group Uses { grows = false, other = false }
 
+let no_uses : :any;
 let no_uses = Uses.new ();
+let grown : :any -> :any;
 let grown u = Uses.set_grows true u;
+let touched : :any -> :any;
 let touched u = Uses.set_other true u;
 
 /// The operators that build a chain when their result is handed on unforced.
@@ -41,6 +44,7 @@ let grows_through op = op == :add || op == :sub || op == :mul;
 
 /// A saturated call of the function itself: `f a b` for an `f` of two
 /// parameters. Partial applications and calls through a pipe are not counted.
+let self_args : :any -> :any -> :any -> :any;
 let self_args f k e = match e {
     [:apply, [:name, g, _], args, _] if g == f && list.length args == k => args,
     _ => (),
@@ -53,6 +57,7 @@ let self_args f k e = match e {
 /// cannot miss a form: any string equal to `n` that is not a plain `[:name, n,
 /// _]` -- a binder, a pattern, a field, a parameter of a lambda -- counts as
 /// touching it, which is the conservative answer.
+let uses : :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec uses f k i n e u =
     if Uses.other u { u }
     else { match e {
@@ -67,6 +72,7 @@ let rec uses f k i n e u =
         },
     } };
 
+let call_uses : :any -> :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec call_uses f k i n args j u =
     match args {
         [] => u,
@@ -76,6 +82,7 @@ let rec call_uses f k i n args j u =
 
 /// The argument in the parameter's own position: handed back as it is, grown
 /// by an operator, or anything else.
+let step_uses : :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let step_uses f k i n a u =
     match a {
         [:name, m, _] if m == n => u,
@@ -87,6 +94,7 @@ let step_uses f k i n a u =
 
 /// Uses in answer position, where the parameter being the answer is not a use
 /// at all: the caller gets the chain and forces it, and that is the overflow.
+let answer_uses : :any -> :any -> :any -> :any -> :any -> :any -> :any;
 let rec answer_uses f k i n e u =
     match e {
         [:name, m, _] if m == n => u,
@@ -142,11 +150,13 @@ let lazy_accumulators f ps body = {
 // a literal is never anything but stored.
 
 /// Is this `strict! e`?
+let is_force : :any -> :bool;
 let is_force e = match e {
     [:apply, [:name, "strict!", _], [_], _] => true,
     _ => false,
 };
 
+let element_force : :any -> :any -> :any;
 let element_force acc x = if is_force x { list.cons (ast.span x) acc } else { acc };
 
 /// The spans of every `strict!` written as an element of a literal in `e`, in
@@ -154,6 +164,7 @@ let element_force acc x = if is_force x { list.cons (ast.span x) acc } else { ac
 let suspended_forces : :any -> [:any];
 let suspended_forces e = list.reverse (forces_in e []);
 
+let forces_in : :any -> :any -> :any;
 let rec forces_in e acc =
     if type_of e != :list { acc }
     else {
@@ -187,6 +198,7 @@ let literal_key e = match e {
     _ => (),
 };
 
+let catches_all : :any -> :any;
 let rec catches_all p = match p {
     [:wildcard, _] => true,
     [:bind, _, _] => true,
@@ -194,6 +206,7 @@ let rec catches_all p = match p {
     _ => false,
 };
 
+let pattern_key : :any -> :any;
 let pattern_key p = match p {
     [:literal, e, _] => literal_key e,
     _ => (),
@@ -201,6 +214,7 @@ let pattern_key p = match p {
 
 /// `seen` is a map, not a list: a generated map literal or `match` can run to
 /// thousands of entries, and a list searched once per entry is quadratic.
+let duplicate_keys : :any -> :any -> :any -> :any;
 let rec duplicate_keys pairs seen acc = match pairs {
     [] => acc,
     [[k, _], ..rest] => {
@@ -214,6 +228,7 @@ let rec duplicate_keys pairs seen acc = match pairs {
     _ => acc,
 };
 
+let unreachable_arms : :any -> :any -> :any -> :any -> :any;
 let rec unreachable_arms arms covered seen acc = match arms {
     [] => acc,
     [[p, guard, _, span], ..rest] => {
@@ -229,6 +244,7 @@ let rec unreachable_arms arms covered seen acc = match arms {
     _ => acc,
 };
 
+let literal_zero : :any -> :any;
 let rec literal_zero e = match e {
     [:int, v, _] => v == 0,
     [:float, v, _] => v == 0.0,
@@ -238,6 +254,7 @@ let rec literal_zero e = match e {
 
 /// `file.read! P`, `read_bytes!` or `lines!`, anywhere in `e`, of the file
 /// `target` names -- the same expression, spans aside.
+let reads_from : :any -> :any -> :bool;
 let rec reads_from target e = type_of e == :list && match e {
     [:apply, [:field, [:name, "file", _], r, _], [arg, .._], _]
         if (r == "read!" || r == "read_bytes!" || r == "lines!") && ast.show arg == ast.show target => true,
@@ -249,6 +266,7 @@ let rec reads_from target e = type_of e == :list && match e {
 let pitfalls : :any -> [:any];
 let pitfalls e = list.reverse (pitfalls_in e []);
 
+let pitfalls_in : :any -> :any -> :any;
 let rec pitfalls_in e acc =
     if type_of e != :list { acc }
     else {
@@ -279,6 +297,7 @@ when test {
     import dreams.parser;
 
     /// The names `lazy_accumulators` reports for the first declaration of `src`.
+    let flagged : :string -> :any;
     let flagged src = match parser.parse_module src {
         [:ok, [[:let, f, ps, body, _, _], .._], _] =>
             list.map (fn p -> list.head p) (lazy_accumulators f ps body),
@@ -286,20 +305,25 @@ when test {
     };
 
     /// How many suspended forces the first declaration of `src` has.
+    let forces : :string -> :any;
     let forces src = match parser.parse_module src {
         [:ok, [[:let, _, _, body, _, _], .._], _] => list.length (suspended_forces body),
         other => other,
     };
 
     /// The messages `pitfalls` reports for the first declaration of `src`.
+    let pitfalls_of : :string -> :any;
     let pitfalls_of src = match parser.parse_module src {
         [:ok, [[:let, _, _, body, _, _], .._], _] => list.map Hit.message (pitfalls body),
         other => other,
     };
 
+    let duplicate : :string;
     let duplicate = "duplicate literal map key: the earlier value is overwritten";
+    let unreachable : :string;
     let unreachable = "unreachable match arm: an earlier unguarded arm already matches it";
 
+    let tests : [:any];
     let tests = [
         test.case "a repeated literal key is found, built apart or not"
             $( test.eq! [duplicate, duplicate] (pitfalls_of "let f = %{ :a => 1, \"a\" => 2, :a => 3, :a => 4 };") ),

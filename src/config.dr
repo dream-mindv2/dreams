@@ -243,8 +243,10 @@ let describe c = {
 when test {
     import std.test;
 
+    let with_flags : :any;
     let with_flags = empty |> define "test" |> set "os" "linux";
 
+    let tests : [:any];
     let tests = [
         test.case "a flag is defined once it is named"
             $( test.eq! [true, false]

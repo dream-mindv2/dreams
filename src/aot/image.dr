@@ -26,9 +26,12 @@ group Func {
 group Global { name : :integer, kind : :integer, target : :integer }
 
 /// The sentinel for an absent edge, the entry included.
+let no_node : :integer;
 let no_node = 4294967295;
 
+let func_impure : :integer;
 let func_impure = 1;
+let func_global_value : :integer;
 let func_global_value = 8;
 
 let u32_at : :string -> :integer -> :integer;
