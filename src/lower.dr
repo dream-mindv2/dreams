@@ -2636,7 +2636,7 @@ let find_entry ld r = {
 /// still live -- which is how lowering the compiler itself ran the machine out
 /// of memory. Forced here, what is carried from one body to the next is an
 /// arena, and the one before it is garbage.
-let settle_body : Lowering -> :any;
+let settle_body : Lowering -> Lowering;
 let settle_body l =
     if lazy.forced (ir.node_count (prog l)) && lazy.forced (ir.kid_count (prog l))
        && lazy.forced (func_bodies l) { l } else { l };

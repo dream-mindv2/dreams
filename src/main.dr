@@ -180,11 +180,14 @@ let parse_only! file src =
 let check_program! : modules.Loader -> :map -> :any;
 let check_program! l o = print_diags! (modules.files l) (compile.check! l o);
 
-/// `--suggest-signatures`: every declaration with no signature, as `FILE:LINE|TYPE`, the type
+/// `--suggest-signatures`: every declaration with no signature, as `FILE:LINE|TYPE|NAME`, the type
 /// what its body says it answers (`typecheck.suggestions`), for a person to make a signature of.
 let suggest_signatures! : modules.Loader -> :map -> :integer;
-let suggest_signatures! l o = {
-    let r = compile.resolve! l o;
+let suggest_signatures! l o = printed_places! l (typecheck.suggestions l (compile.resolve! l o));
+
+/// Each `[source, span, name, shown]` as `FILE:LINE|SHOWN|NAME`, the line the span starts on.
+let printed_places! : modules.Loader -> [[:any]] -> :integer;
+let printed_places! l found = {
     let files = modules.file_map l;
     list.each! (fn! [source, span, name, shown] -> match files.[source else ()] {
         () => (),
@@ -192,9 +195,14 @@ let suggest_signatures! l o = {
             let [line, _] = diag.line_col (diag.source_text src) (list.head span);
             console.print! (str.concat_all [diag.source_path src, ":", to_string line, "|", shown, "|", name])
         },
-    }) (typecheck.suggestions l r)
+    }) found
     0
 };
+
+/// `--tighten-signatures`: every signature answering `:any` whose body answers something more
+/// definite, as `FILE:LINE|TYPE|NAME` with that answer (`typecheck.tightenings`).
+let tighten_signatures! : modules.Loader -> :map -> :integer;
+let tighten_signatures! l o = printed_places! l (typecheck.tightenings l (compile.resolve! l o));
 
 /// The build options the command line asked for. The payload sizes are not
 /// here: they are measured, which takes the files, and only a build does that.
@@ -913,9 +921,9 @@ let defaults = %{ :command => :check, :file => (), :roots => [], :includes => []
 
 let opt : :any -> :any -> :any;
 let opt o k = o.[k else ()];
-let with_opt : :any -> :any -> :map -> :any;
+let with_opt : :any -> :any -> :map -> :map;
 let with_opt k v o = o.[k => v];
-let append_opt : :any -> :any -> :map -> :any;
+let append_opt : :any -> :any -> :map -> :map;
 let append_opt k v o = o.[k => (list.append (o.[k else []]) [v])];
 
 /// `LINE:COL`, as `--at` takes it.
@@ -947,6 +955,7 @@ let rec parse_args args o =
         ["--fmt-check", ..rest] => parse_args rest (with_opt :command :fmt_check o),
         ["--check", ..rest]     => parse_args rest (with_opt :command :check o),
         ["--suggest-signatures", ..rest] => parse_args rest (with_opt :command :suggest o),
+        ["--tighten-signatures", ..rest] => parse_args rest (with_opt :command :tighten o),
         // `--no-emit` is kept as an alias for `--check`: a build tool that
         // learned the one spelling should not have to learn the other.
         ["--no-emit", ..rest]   => parse_args rest (with_opt :command :check o),
@@ -1259,6 +1268,7 @@ let run_command! o file =
         :fmt_check => format_files! (list.cons file (o.[:more_files else []])) true,
         :check     => check_program! (load! o file) (compile_options o),
         :suggest   => suggest_signatures! (load! o file) (compile_options o),
+        :tighten   => tighten_signatures! (load! o file) (compile_options o),
         :build     => if opt o :aot == true { native_build! o file } else { cached_build! o file },
         :modules   => show_modules! (load! o file),
         :packages  => show_packages! (package.discover! file (opt o :roots)),

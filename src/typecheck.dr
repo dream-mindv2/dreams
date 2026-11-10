@@ -3513,6 +3513,34 @@ let suggestions l r = {
     }) bodies)
 };
 
+/// Every signed declaration whose signature says it answers `:any` and whose
+/// body says something more definite, with that signature and the answer the
+/// body gives: what `dreams --tighten-signatures` prints. The parameters are
+/// the signature's, so the walk knows what it was handed, and the answer is
+/// widened as `loosen` widens any, its `()` kept. `[source, span, name,
+/// shown]` each, the span the declaration's.
+let tightenings : modules.Loader -> scope.Resolution -> [[:any]];
+let tightenings l r = {
+    let [k, _] = prepared l r %{};
+    Option.values (list.map (fn b -> {
+        let [mi, source, d, _] = b;
+        let n = scope.decl_name d;
+        let sig = match gi_of k mi n { () => (), gi => (Checker.sigs k).[gi else ()] };
+        if sig == () || scope.is_hidden_name n || named_body (scope.decl_body d) != () || result_of sig != :any { Option.none }
+        else {
+            let h = here mi source n;
+            let ps = scope.decl_params d;
+            let [t, _] = if list.is_empty ps { infer k h (scope.decl_body d) [] }
+                         else { lambda k h ps (scope.decl_body d) sig (scope.decl_span d) [] };
+            // Not `answer_type`, which leaves out an answer's `()` because a
+            // use of an unsigned function is not held to it: a signature is.
+            let r = loosen (result_of t);
+            if r == :any || has_unknowns r { Option.none }
+            else { Option.some [source, scope.decl_span d, n, show (with_result r sig)] }
+        }
+    }) (scope.bodies r))
+};
+
 /// The checker for the second check: every unsigned global the first check
 /// learnt something about, used as what its body answers. A global already
 /// in `uses` keeps what is there -- a signature, or what its `comp` came to
